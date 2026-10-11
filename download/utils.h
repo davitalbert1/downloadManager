@@ -22,6 +22,10 @@ int para_int(const std::string& s, int padrao);
 double para_double(const std::string& s, double padrao);
 bool para_bool(const std::string& s, bool padrao);
 
+// Sanitização de nomes de arquivos para qualquer SO (Windows/Linux)
+std::string sanitizar_nome_arquivo(const std::string& nome, size_t tam_max = 180);
+std::string obter_nome_arquivo_da_url(const std::string& url);
+
 // Utilitários de Data e Hora (Howard Hinnant civil days)
 struct Data {
     int ano = 0, mes = 0, dia = 0;
@@ -38,3 +42,6 @@ std::vector<std::string> expandir_periodo(const std::string& inicio, const std::
 
 // Thread-safe logger
 void log(const std::string& msg);
+
+// Extração genérica de links e mídias de documentos HTML, texto e playlists M3U/M3U8
+std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, const std::string& base_url, const std::string& modo);

@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -234,4 +235,155 @@ std::vector<std::string> expandir_periodo(const std::string& inicio, const std::
         log(std::string("[WARNING] Erro ao expandir datas: ") + e.what());
         return {inicio, fim};
     }
+}
+
+std::string sanitizar_nome_arquivo(const std::string& nome, size_t tam_max) {
+    std::string safe = nome;
+    const std::string invalidChars = "\\/:*?\"<>|";
+    for (char& c : safe) {
+        if (invalidChars.find(c) != std::string::npos || static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) == 127) {
+            c = '_';
+        }
+    }
+    // Remove múltiplos espaços/sublinhados repetidos
+    std::string limpo;
+    bool ultimo_esp = false;
+    for (char c : safe) {
+        if (c == ' ' || c == '\t') {
+            if (!ultimo_esp) limpo += ' ';
+            ultimo_esp = true;
+        } else {
+            limpo += c;
+            ultimo_esp = false;
+        }
+    }
+    limpo = cortar(limpo);
+    if (limpo.empty()) limpo = "arquivo";
+
+    // Evitar nomes de dispositivos reservados no Windows
+    static const std::set<std::string> reservados = {
+        "con", "prn", "aux", "nul",
+        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
+    };
+    std::string check = minusculas(limpo);
+    size_t dotPos = check.find('.');
+    std::string base = (dotPos == std::string::npos) ? check : check.substr(0, dotPos);
+    if (reservados.count(base)) limpo = "_" + limpo;
+    if (limpo.size() > tam_max) limpo = limpo.substr(0, tam_max);
+    return limpo;
+}
+
+std::string obter_nome_arquivo_da_url(const std::string& url) {
+    std::string clean = url;
+    size_t q = clean.find('?');
+    if (q != std::string::npos) clean = clean.substr(0, q);
+    size_t h = clean.find('#');
+    if (h != std::string::npos) clean = clean.substr(0, h);
+
+    size_t slash = clean.find_last_of("/\\");
+    std::string name = (slash != std::string::npos) ? clean.substr(slash + 1) : clean;
+    if (name.empty()) name = "arquivo.bin";
+    return sanitizar_nome_arquivo(name);
+}
+
+#include <regex>
+#include <sstream>
+
+std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, const std::string& base_url, const std::string& modo) {
+    std::vector<std::string> urls;
+    std::set<std::string> vistas;
+    std::string m = minusculas(modo);
+
+    auto resolver_url = [&](const std::string& rel) -> std::string {
+        if (rel.empty()) return "";
+        if (rel.rfind("http://", 0) == 0 || rel.rfind("https://", 0) == 0) return rel;
+        if (rel.rfind("//", 0) == 0) return "https:" + rel;
+        if (base_url.empty()) return rel;
+
+        std::string base = base_url;
+        size_t query_pos = base.find('?');
+        if (query_pos != std::string::npos) base = base.substr(0, query_pos);
+
+        if (rel.front() == '/') {
+            size_t proto_end = base.find("://");
+            if (proto_end != std::string::npos) {
+                size_t host_end = base.find('/', proto_end + 3);
+                std::string host = (host_end != std::string::npos) ? base.substr(0, host_end) : base;
+                return host + rel;
+            }
+        }
+        size_t last_slash = base.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            return base.substr(0, last_slash + 1) + rel;
+        }
+        return base + "/" + rel;
+    };
+
+    if (m == "m3u" || m == "m3u8" || m == "playlist") {
+        std::istringstream stream(conteudo);
+        std::string line;
+        while (std::getline(stream, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            std::string u = resolver_url(line);
+            if (!u.empty() && vistas.insert(u).second) urls.push_back(u);
+        }
+        return urls;
+    }
+
+    if (m == "html_imgs" || m == "imgs" || m == "imagens") {
+        // 1. Extração de tags <img ... src="...">
+        std::regex img_regex(R"(<img[^>]+src=["']([^"']+)["'])", std::regex::icase);
+        auto b = std::sregex_iterator(conteudo.begin(), conteudo.end(), img_regex);
+        auto e = std::sregex_iterator();
+        for (auto it = b; it != e; ++it) {
+            std::string src = (*it)[1].str();
+            std::string u = resolver_url(src);
+            if (!u.empty() && vistas.insert(u).second) urls.push_back(u);
+        }
+
+        // 2. Extração de srcset
+        std::regex srcset_regex(R"(srcset=["']([^"']+)["'])", std::regex::icase);
+        b = std::sregex_iterator(conteudo.begin(), conteudo.end(), srcset_regex);
+        for (auto it = b; it != e; ++it) {
+            std::string ss = (*it)[1].str();
+            for (auto& parte : dividir(ss, ',')) {
+                auto pedacos = dividir(cortar(parte), ' ');
+                if (!pedacos.empty()) {
+                    std::string u = resolver_url(pedacos[0]);
+                    if (!u.empty() && vistas.insert(u).second) urls.push_back(u);
+                }
+            }
+        }
+        return urls;
+    }
+
+    if (m == "html_links" || m == "links" || m == "hrefs") {
+        std::regex link_regex(R"(<a[^>]+href=["']([^"']+)["'])", std::regex::icase);
+        auto b = std::sregex_iterator(conteudo.begin(), conteudo.end(), link_regex);
+        auto e = std::sregex_iterator();
+        for (auto it = b; it != e; ++it) {
+            std::string href = (*it)[1].str();
+            if (href.rfind("javascript:", 0) == 0 || href.rfind("mailto:", 0) == 0 || href == "#") continue;
+            std::string u = resolver_url(href);
+            if (!u.empty() && vistas.insert(u).second) urls.push_back(u);
+        }
+        return urls;
+    }
+
+    // Modo regex customizado
+    try {
+        std::regex custom_regex(modo, std::regex::icase);
+        auto b = std::sregex_iterator(conteudo.begin(), conteudo.end(), custom_regex);
+        auto e = std::sregex_iterator();
+        for (auto it = b; it != e; ++it) {
+            std::string match = (it->size() > 1) ? (*it)[1].str() : (*it)[0].str();
+            std::string u = resolver_url(match);
+            if (!u.empty() && vistas.insert(u).second) urls.push_back(u);
+        }
+    } catch (...) {}
+
+    return urls;
 }

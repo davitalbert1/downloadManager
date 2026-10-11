@@ -56,7 +56,7 @@ ou especificando o arquivo `.ini`:
 ./download.exe download.ini
 ```
 
-#### 2. Executar apenas uma seção/dataset específico (ex: `[dataset:era5]`)
+#### 2. Executar apenas uma seção/dataset específico
 Você pode passar diretamente o nome da seção do dataset (com ou sem o prefixo `dataset:`):
 ```cmd
 ./download.exe era5
@@ -78,7 +78,7 @@ Com o caminho do arquivo `.ini` explícito:
 ```
 
 #### 4. Baixar múltiplos datasets específicos
-Você pode especificar múltiplos datasets separados por vírgula ou por argumentos distintos:
+múltiplos datasets separados por vírgula ou por argumentos distintos:
 ```cmd
 ./download.exe era5,clima_diario
 ```
@@ -90,11 +90,6 @@ Você pode especificar múltiplos datasets separados por vírgula ou por argumen
 ```
 
 #### 5. Modos de Saída (Definidos no `download.ini`)
-- **`tipo_saida = db`** (padrão): Descobre dinamicamente os campos JSON e popula tabelas no banco de dados SQLite (`clima.db`).
-- **`tipo_saida = arquivo`** (ex: `[dataset:era5]`): Baixa diretamente os arquivos (GRIB / NetCDF) para a pasta informada (`pasta_saida = dados_era5`), sem criar tabelas `.db`.
-
-Test (precisa de `download.ini` na raiz do projeto):
-
 ```sh
 ./build/clima_auditor.exe
 ```

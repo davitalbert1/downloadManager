@@ -18,8 +18,6 @@
 
 using json = nlohmann::json;
 
-static std::mutex g_file_print_mtx;
-
 struct RespostaHttpAvancada {
     long status = 0;
     bool erro_rede = false;
@@ -194,6 +192,7 @@ static std::string extrair_url_download(const json& j) {
 struct DownloadProgressContext {
     std::string tag;
     std::chrono::steady_clock::time_point ult_log;
+    double ultimo_pct = -1.0;
 };
 
 static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) {
@@ -201,20 +200,27 @@ static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow
     auto* ctx = static_cast<DownloadProgressContext*>(clientp);
     auto agora = std::chrono::steady_clock::now();
     double dec = std::chrono::duration<double>(agora - ctx->ult_log).count();
-    if (dec >= 0.5 || dlnow == dltotal) {
+    bool concluido = (dlnow == dltotal);
+
+    double baixado_mb = static_cast<double>(dlnow) / (1024.0 * 1024.0);
+    double total_mb = static_cast<double>(dltotal) / (1024.0 * 1024.0);
+    double pct = (total_mb > 0.0) ? (baixado_mb / total_mb * 100.0) : 0.0;
+
+    // Vários workers baixam ao mesmo tempo. Em vez de sobrescrever a mesma linha
+    // com '\r' (o que empilhava os itens uns sobre os outros), cada atualização é
+    // impressa em sua própria linha via log(), que serializa a saída com mutex.
+    // Assim os workers aparecem empilhados e em ordem, sem se sobreporem.
+    // Reduz a frequência: imprime no início, a cada ~1s quando o % avança >= 2,
+    // e sempre na conclusão (100%).
+    bool inicio = (ctx->ultimo_pct < 0.0);
+    if (concluido || (dec >= 1.0 && (inicio || pct - ctx->ultimo_pct >= 2.0))) {
         ctx->ult_log = agora;
-        double baixado_mb = static_cast<double>(dlnow) / (1024.0 * 1024.0);
-        double total_mb = static_cast<double>(dltotal) / (1024.0 * 1024.0);
-        double pct = (total_mb > 0.0) ? (baixado_mb / total_mb * 100.0) : 0.0;
+        ctx->ultimo_pct = pct;
 
         char buf[200];
-        std::snprintf(buf, sizeof(buf), "\r  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%)",
+        std::snprintf(buf, sizeof(buf), "  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%)",
                       ctx->tag.c_str(), baixado_mb, total_mb, pct);
-        std::lock_guard<std::mutex> lk(g_file_print_mtx);
-        std::cout << buf << std::flush;
-        if (dlnow == dltotal) {
-            std::cout << std::endl;
-        }
+        log(buf);
     }
     return 0;
 }
@@ -575,6 +581,85 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
     return false;
 }
 
+bool baixar_arquivo_seguro(const std::string& url,
+                           const std::string& caminho_destino,
+                           const std::string& api_key,
+                           int tamanho_min,
+                           const std::map<std::string, std::string>& headers,
+                           double timeout_sec) {
+    std::filesystem::path dest(caminho_destino);
+    std::filesystem::create_directories(dest.parent_path());
+
+    // Se já existe e é válido
+    std::error_code ec;
+    if (std::filesystem::exists(dest, ec)) {
+        auto sz = std::filesystem::file_size(dest, ec);
+        if (!ec && sz > 0 && (tamanho_min <= 0 || sz >= static_cast<unsigned long long>(tamanho_min))) {
+            return true;
+        }
+        std::filesystem::remove(dest, ec);
+    }
+
+    std::filesystem::path temp_dest = dest;
+    temp_dest += ".temp";
+    std::filesystem::remove(temp_dest, ec);
+
+    std::ofstream arq(temp_dest, std::ios::binary);
+    if (!arq) return false;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    struct curl_slist* hdr = nullptr;
+    hdr = curl_slist_append(hdr, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+    for (const auto& kv : headers) {
+        std::string l = kv.first + ": " + kv.second;
+        hdr = curl_slist_append(hdr, l.c_str());
+    }
+
+    if (!api_key.empty()) {
+        if (api_key.find(':') != std::string::npos) {
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
+        } else {
+            std::string auth = "Authorization: Bearer " + api_key;
+            hdr = curl_slist_append(hdr, auth.c_str());
+        }
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (hdr) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &arq);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+    if (hdr) curl_slist_free_all(hdr);
+    curl_easy_cleanup(curl);
+    arq.close();
+
+    if (rc != CURLE_OK || status < 200 || status >= 300) {
+        std::filesystem::remove(temp_dest, ec);
+        return false;
+    }
+
+    auto sz = std::filesystem::file_size(temp_dest, ec);
+    if (ec || sz == 0 || (tamanho_min > 0 && sz < static_cast<unsigned long long>(tamanho_min))) {
+        std::filesystem::remove(temp_dest, ec);
+        return false;
+    }
+
+    std::filesystem::rename(temp_dest, dest, ec);
+    return !ec;
+}
+
 void executar_dataset_arquivo(const DatasetCfg& ds) {
     std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_arquivos");
     std::filesystem::path pasta_saida(pasta_saida_str);
@@ -594,11 +679,70 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
         }
     }
 
-    std::string api_url = ds.url.empty() ? obter_env_ou_config("API_URL", "", "https://cds.climate.copernicus.eu/api") : ds.url;
+    std::string api_url = ds.url.empty() ? obter_env_ou_config("API_URL", "", "") : ds.url;
     std::string api_key = ds.api_keys.empty() ? obter_env_ou_config("API_KEY", obter_env_ou_config("CDSAPI_KEY", "", ""), "") : ds.api_keys;
 
+    // Caso 1: Se o dataset contém uma lista direta de URLs (modo lista direta ou extração web)
+    if (!ds.lista_urls.empty() || (!ds.padrao_extracao.empty() && !api_url.empty())) {
+        std::vector<std::string> urls_para_baixar = ds.lista_urls;
+
+        if (!ds.padrao_extracao.empty() && !api_url.empty()) {
+            log("[EXTRAÇÃO] Acessando " + api_url + " para extrair links (" + ds.padrao_extracao + ")...");
+            RespostaHttpAvancada r = http_get_headers(api_url, api_key, CFG.http_timeout);
+            if (r.status >= 200 && r.status < 300 && !r.corpo.empty()) {
+                auto extraidas = extrair_urls_de_conteudo(r.corpo, api_url, ds.padrao_extracao);
+                log("[EXTRAÇÃO] " + std::to_string(extraidas.size()) + " links/arquivos encontrados.");
+                urls_para_baixar.insert(urls_para_baixar.end(), extraidas.begin(), extraidas.end());
+            } else {
+                log("[ERRO] Falha ao ler página para extração: HTTP " + std::to_string(r.status));
+            }
+        }
+
+        if (urls_para_baixar.empty()) {
+            log("[INFO] Nenhuma URL encontrada para download em " + ds.id);
+            return;
+        }
+
+        int n_workers = CFG.download_workers;
+        if (n_workers < 1) n_workers = 1;
+        std::atomic<size_t> idx_url{0};
+        std::atomic<size_t> baixados{0};
+        std::atomic<size_t> falhas{0};
+        std::vector<std::thread> workers;
+
+        log("============================================================");
+        log("BAIXANDO ARQUIVOS DIRETOS: " + ds.id + " (" + std::to_string(urls_para_baixar.size()) + " itens)");
+        log("Diretório de saída: " + pasta_saida.string());
+        log("============================================================");
+
+        for (int i = 0; i < n_workers; ++i) {
+            workers.emplace_back([&] {
+                while (true) {
+                    size_t k = idx_url.fetch_add(1);
+                    if (k >= urls_para_baixar.size()) break;
+                    const std::string& u = urls_para_baixar[k];
+                    std::string nome_arq = obter_nome_arquivo_da_url(u);
+                    std::filesystem::path dest = pasta_saida / nome_arq;
+
+                    bool ok = baixar_arquivo_seguro(u, dest.string(), api_key, ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                    if (ok) {
+                        ++baixados;
+                        log("  [ARQUIVO " + std::to_string(baixados.load()) + "/" + std::to_string(urls_para_baixar.size()) + "] " + nome_arq);
+                    } else {
+                        ++falhas;
+                        log("  [FALHA] " + u);
+                    }
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+        log("[CONCLUÍDO] " + std::to_string(baixados.load()) + " baixados, " + std::to_string(falhas.load()) + " falhas.");
+        return;
+    }
+
+    // Caso 2: Dataset temporal (ERA5 ou APIs de reanálise por períodos/meses)
     int ano_inicial = para_int(obter_env_ou_config("ANO_INICIAL", "", std::to_string(ds.ano_inicial)), 1940);
-    int dias_atraso = para_int(obter_env_ou_config("DIAS_ATRASO", "", std::to_string(ds.dias_atraso)), 7);
+    int dias_atraso = para_int(obter_env_ou_config("DIAS_ATRASO", "", std::to_string(ds.dias_atraso)), 0);
 
     Data data_limite = civil_de_dias(dias_de_civil(agora_local().tm_year + 1900, agora_local().tm_mon + 1, agora_local().tm_mday) - dias_atraso);
 
@@ -634,7 +778,7 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
                 try {
                     processar_dataset_era5_mes(ds, meses[k].first, meses[k].second, api_url, api_key);
                 } catch (const std::exception& e) {
-                    log(std::string("[ERROR] ERA5 MES ") + std::to_string(meses[k].first) + "-" +
+                    log(std::string("[ERROR] MES ") + std::to_string(meses[k].first) + "-" +
                         std::to_string(meses[k].second) + ": " + e.what());
                 }
             }

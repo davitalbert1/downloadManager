@@ -1,4 +1,5 @@
 #include "engine_generico.h"
+#include "file_dataset.h"
 #include "http_client.h"
 #include "json_parser.h"
 #include "rate_limit.h"
@@ -229,6 +230,31 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
         std::lock_guard<std::mutex> lk(g_write_mtx);
         salvar_dataset(ds, r.registros);
     }
+
+    // Se o dataset tiver baixar_arquivos_vinculados ativado (como imagens de pokemons, assets, etc.)
+    if (ds.baixar_arquivos_vinculados && !ds.campo_url_arquivo.empty()) {
+        std::string pasta = ds.pasta_saida.empty() ? ("arquivos_" + ds.id) : ds.pasta_saida;
+        for (const auto& reg : r.registros) {
+            auto it_u = reg.find(ds.campo_url_arquivo);
+            if (it_u != reg.end() && std::holds_alternative<std::string>(it_u->second)) {
+                std::string file_url = std::get<std::string>(it_u->second);
+                if (file_url.rfind("http", 0) == 0) {
+                    std::string nome_local;
+                    if (!ds.campo_nome_arquivo.empty()) {
+                        auto it_n = reg.find(ds.campo_nome_arquivo);
+                        if (it_n != reg.end() && std::holds_alternative<std::string>(it_n->second)) {
+                            nome_local = sanitizar_nome_arquivo(std::get<std::string>(it_n->second));
+                        }
+                    }
+                    if (nome_local.empty()) {
+                        nome_local = obter_nome_arquivo_da_url(file_url);
+                    }
+                    std::filesystem::path dest = std::filesystem::path(pasta) / nome_local;
+                    baixar_arquivo_seguro(file_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                }
+            }
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lk(g_mtx_existentes);
         auto& conj = existentes[r.dataset_idx][r.chave_existentes];
@@ -246,7 +272,8 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
 }
 
 int executar_generico(const std::vector<std::string>& datas, double tempo_load,
-                      const ExistentesGen& existentes_inicial) {
+                      const ExistentesGen& existentes_inicial,
+                      size_t dataset_idx) {
     ExistentesGen existentes = existentes_inicial;
     struct TarefaGen {
         size_t ds;
@@ -257,7 +284,10 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
     std::vector<TarefaGen> tarefas;
     long long falt = 0;
 
-    for (size_t di = 0; di < CFG.datasets.size(); ++di) {
+    size_t di_inicio = (dataset_idx < CFG.datasets.size()) ? dataset_idx : 0;
+    size_t di_fim = (dataset_idx < CFG.datasets.size()) ? (dataset_idx + 1) : CFG.datasets.size();
+
+    for (size_t di = di_inicio; di < di_fim; ++di) {
         const DatasetCfg& ds = CFG.datasets[di];
         if (ds.tipo_saida == "arquivo") continue;
 
@@ -404,12 +434,11 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
 
     double tt = std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();
     std::cout << "\n\n============================================================\n"
-              << "DOWNLOAD CONCLUIDO!\n"
+              << "DOWNLOAD CONCLUIDO: " << CFG.datasets[di_inicio].id << "\n"
               << "============================================================\n"
-              << "Tempo total: " << tt << "s\n"
-              << "Carga inicial DB: " << tempo_load << "s\n"
+              << "Tempo: " << tt << "s\n"
               << "Blocos processados: " << concluidos.load() << "/" << total << "\n--- RESUMO ---\n";
-    for (size_t di = 0; di < CFG.datasets.size(); ++di) {
+    for (size_t di = di_inicio; di < di_fim; ++di) {
         if (CFG.datasets[di].tipo_saida == "arquivo") continue;
         std::cout << CFG.datasets[di].id << " (" << CFG.datasets[di].db << "."
                   << CFG.datasets[di].tabela << "): " << baixados[di]

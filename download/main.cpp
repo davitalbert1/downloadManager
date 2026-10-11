@@ -67,27 +67,24 @@ int main(int argc, char** argv) {
     iniciar_rate_limit();
 
     try {
-        std::vector<DatasetCfg> datasets_db;
-        std::vector<DatasetCfg> datasets_arquivo;
+        // Executa rigorosamente na ordem declarada em download.ini (de cima para baixo)
+        bool tem_db = false;
         for (const auto& ds : CFG.datasets) {
-            if (ds.tipo_saida == "arquivo") {
-                datasets_arquivo.push_back(ds);
-            } else {
-                datasets_db.push_back(ds);
+            if (ds.tipo_saida != "arquivo") {
+                tem_db = true;
+                break;
             }
         }
 
-        // 1) Executa datasets em arquivo
-        for (const auto& ds : datasets_arquivo) {
-            executar_dataset_arquivo(ds);
-        }
+        std::vector<std::string> datas;
+        ExistentesGen existentes;
+        double tload = 0.0;
 
-        // 2) Executa datasets em banco SQLite
-        if (!datasets_db.empty()) {
-            std::vector<std::string> datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
+        if (tem_db) {
+            datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
             if (!datas.empty()) {
                 std::cout << "============================================================\n"
-                          << "DOWNLOAD GENERICO DE DADOS E APIS (BANCO SQLITE)\n"
+                          << "DOWNLOAD GENERICO DE DADOS E APIS\n"
                           << "============================================================\n"
                           << "Configuracao: " << caminho_ini << "\n"
                           << "Fuso horario: " << CFG.fuso_horario << "\n"
@@ -99,17 +96,27 @@ int main(int argc, char** argv) {
 
                 std::cout << "\n[DB] Carregando registros existentes...\n";
                 auto t0 = std::chrono::steady_clock::now();
-                ExistentesGen existentes = carregar_existentes_generico(datas);
-                double tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                existentes = carregar_existentes_generico(datas);
+                tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t di = 0; di < CFG.datasets.size(); ++di) {
                     if (CFG.datasets[di].tipo_saida == "arquivo") continue;
                     long long tot = 0;
                     auto it = existentes.find(di);
                     if (it != existentes.end())
                         for (const auto& kv : it->second) tot += (long long)kv.second.size();
-                    std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias\n";
+                    std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias existentes\n";
                 }
-                executar_generico(datas, tload, existentes);
+            }
+        }
+
+        for (size_t di = 0; di < CFG.datasets.size(); ++di) {
+            const auto& ds = CFG.datasets[di];
+            if (ds.tipo_saida == "arquivo") {
+                executar_dataset_arquivo(ds);
+            } else {
+                if (!datas.empty()) {
+                    executar_generico(datas, tload, existentes, di);
+                }
             }
         }
 

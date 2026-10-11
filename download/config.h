@@ -65,6 +65,15 @@ struct DatasetCfg {
     std::string modo_api = "auto";
     bool auto_importar_banco = false; // Importa para o banco SQLite se suportado
     bool evitar_download_se_no_banco = false; // Não baixa se dados já existirem no banco
+
+    // Suporte genérico a extração de mídias, links e arquivos em cascata (HTML, regex, JSON assets, M3U/M3U8)
+    bool baixar_arquivos_vinculados = false; // Baixa URLs encontradas no corpo ou nos campos
+    std::string campo_url_arquivo; // Nome do campo JSON que contém a URL do arquivo a baixar
+    std::string campo_nome_arquivo; // Nome do campo JSON para o nome do arquivo local
+    std::vector<std::string> lista_urls; // URLs diretas listadas na seção
+    std::string padrao_extracao; // Regex para extrair URLs em páginas HTML/texto (ou "html_imgs", "html_links", "m3u")
+    bool usar_yt_dlp = false; // Se true e for stream/video suportado, usa yt-dlp como fallback
+    int tamanho_min_bytes = 0; // Se > 0, descarta arquivos menores que isso (evita imagens corrompidas/placeholders)
 };
 
 struct DimensaoCfg {

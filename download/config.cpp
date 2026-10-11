@@ -311,6 +311,20 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.auto_importar_banco = para_bool(ini.obter_ou(secao, "auto_importar_banco", "0"), false);
         d.evitar_download_se_no_banco = para_bool(ini.obter_ou(secao, "evitar_download_se_no_banco", "0"), false);
 
+        d.baixar_arquivos_vinculados = para_bool(ini.obter_ou(secao, "baixar_arquivos_vinculados", "0"), false);
+        d.campo_url_arquivo = cortar(ini.obter_ou(secao, "campo_url_arquivo"));
+        d.campo_nome_arquivo = cortar(ini.obter_ou(secao, "campo_nome_arquivo"));
+        d.padrao_extracao = cortar(ini.obter_ou(secao, "padrao_extracao"));
+        d.usar_yt_dlp = para_bool(ini.obter_ou(secao, "usar_yt_dlp", "0"), false);
+        d.tamanho_min_bytes = para_int(ini.obter_ou(secao, "tamanho_min_bytes", "0"), 0);
+
+        std::string urls_str = ini.obter_ou(secao, "urls");
+        if (!urls_str.empty()) {
+            for (auto& u : dividir(urls_str, ',')) {
+                if (!u.empty()) d.lista_urls.push_back(cortar(u));
+            }
+        }
+
         std::string hrs_str = ini.obter_ou(secao, "horarios");
         if (!hrs_str.empty()) {
             d.horarios = dividir(hrs_str, ',');
