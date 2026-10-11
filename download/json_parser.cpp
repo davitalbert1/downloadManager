@@ -89,13 +89,6 @@ static void achatar_objeto(const json& obj, const std::string& prefix, Registro&
         auto ovi = ov.find(it.key());
         std::string bruto = prefix.empty() ? it.key() : prefix + "_" + it.key();
         std::string col = ovi != ov.end() ? ovi->second.coluna : normalizar_nome(bruto);
-        if (coluna_reservada(col) && col != ds.chave_data && col != ds.chave_hora) {
-            if (ds.usar_coordenadas && (col == "latitude" || col == "longitude")) {
-                // permite sobrescrever lat/lon se retornado pelo JSON
-            } else if (col != ds.chave_data && col != ds.chave_hora && col != "timezone") {
-                continue;
-            }
-        }
         if (col == "created_at") continue;
         if (reg.find(col) == reg.end()) reg[col] = json_para_valor(it.value());
     }
@@ -161,9 +154,6 @@ std::vector<Registro> parse_series(const json& bloco_json, const json& raiz,
             std::string col =
                 ov != overrides.end() ? ov->second.coluna : normalizar_nome(it.key());
             if (col == "created_at" || col == ds.chave_data || col == ds.chave_hora) continue;
-            if (coluna_reservada(col) && !(ds.usar_coordenadas &&
-                                           (col == "latitude" || col == "longitude")))
-                continue;
             reg[col] = pegar(bloco_json, it.key(), i);
         }
         regs.push_back(std::move(reg));

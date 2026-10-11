@@ -51,7 +51,7 @@ private:
 
 struct ResultadoGenerico {
     size_t dataset_idx = 0;
-    double lat = 0.0, lon = 0.0;
+    std::string chave_existentes;
     Contexto ctx;
     std::vector<std::string> datas_pedidas;
     std::vector<Registro> registros;

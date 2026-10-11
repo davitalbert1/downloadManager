@@ -11,3 +11,4 @@ dados_era5/
 *.part.grib
 *.part.nc
 *.exe
+config.ini

@@ -85,8 +85,7 @@ void iniciar_rate_limit() {
 }
 
 void dormir(double segundos) {
-    if (segundos > 0)
-        std::this_thread::sleep_for(std::chrono::duration<double>(segundos));
+    if (segundos > 0) std::this_thread::sleep_for(std::chrono::duration<double>(segundos));
 }
 
 void esperar_envio(const std::string& grupo, double custo) {
@@ -98,8 +97,7 @@ void esperar_envio(const std::string& grupo, double custo) {
         {
             std::lock_guard<std::mutex> lk(g_rate_mtx);
             auto agora = std::chrono::steady_clock::now();
-            if (agora < g_cooldown_fim)
-                espera = std::chrono::duration<double>(g_cooldown_fim - agora).count();
+            if (agora < g_cooldown_fim) espera = std::chrono::duration<double>(g_cooldown_fim - agora).count();
             if (espera <= 0.0) {
                 auto& orc = g_orcamento[grupo];
                 orc.limpar(agora);
@@ -112,8 +110,7 @@ void esperar_envio(const std::string& grupo, double custo) {
                 std::uniform_real_distribution<double> jit(0.9, 1.1);
                 g_proximo_slot = slot + std::chrono::duration_cast<
                     std::chrono::steady_clock::duration>(
-                                     std::chrono::duration<double>(
-                                         g_intervalo * jit(rng())));
+                                     std::chrono::duration<double>(g_intervalo * jit(rng())));
                 orc.reservar(slot, custo);
                 espera = std::chrono::duration<double>(slot - agora).count();
                 reservado = true;
@@ -181,8 +178,7 @@ void restaurar_taxa() {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
     g_429_consecutivos = 0;
     double intervalo_min = 1.0 / CFG.requests_per_second;
-    if (g_intervalo > intervalo_min)
-        g_intervalo = std::max(intervalo_min, g_intervalo * 0.85);
+    if (g_intervalo > intervalo_min) g_intervalo = std::max(intervalo_min, g_intervalo * 0.85);
 }
 
 double backoff_exponencial(int tentativa) {

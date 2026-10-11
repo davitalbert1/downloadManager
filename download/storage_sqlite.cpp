@@ -127,7 +127,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
     }
     for (const auto& r : amostra) {
         for (const auto& kv : r) {
-            if (coluna_reservada(kv.first)) continue;
+            if (kv.first == "created_at") continue;
             if (std::find(ordem.begin(), ordem.end(), kv.first) == ordem.end())
                 ordem.push_back(kv.first);
         }
@@ -282,35 +282,97 @@ ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas
         bool tem_data =
             !ds.chave_data.empty() &&
             std::find(cols.begin(), cols.end(), ds.chave_data) != cols.end();
-        bool tem_lat = std::find(cols.begin(), cols.end(), "latitude") != cols.end();
-        bool tem_lon = std::find(cols.begin(), cols.end(), "longitude") != cols.end();
         auto& mapa = out[di];
-        for (const auto& c : CFG.coordenadas) mapa[c] = ConjuntoDatas();
-        if (!tem_data || !tem_lat || !tem_lon || datas.empty()) continue;
-        std::string sql = "SELECT latitude, longitude, \"" + ds.chave_data + "\" FROM \"" +
-                          ds.tabela + "\" WHERE \"" + ds.chave_data +
-                          "\" BETWEEN ? AND ?";
-        sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+
+        if (ds.usar_coordenadas || CFG.coordenadas.empty()) {
+            std::vector<std::pair<double, double>> lista_coords = CFG.coordenadas;
+            if (lista_coords.empty()) lista_coords.push_back({0.0, 0.0});
+            for (const auto& c : lista_coords) {
+                mapa[num_str(c.first) + "," + num_str(c.second)] = ConjuntoDatas();
+            }
+
+            bool tem_lat = std::find(cols.begin(), cols.end(), "latitude") != cols.end();
+            bool tem_lon = std::find(cols.begin(), cols.end(), "longitude") != cols.end();
+            if (!tem_data || !tem_lat || !tem_lon || datas.empty()) continue;
+
+            std::string sql = "SELECT latitude, longitude, \"" + ds.chave_data + "\" FROM \"" +
+                              ds.tabela + "\" WHERE \"" + ds.chave_data +
+                              "\" BETWEEN ? AND ?";
+            sqlite3_stmt* st = nullptr;
+            if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+                sqlite3_finalize(st);
+                continue;
+            }
+            sqlite3_bind_text(st, 1, datas.front().c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, datas.back().c_str(), -1, SQLITE_TRANSIENT);
+            ConjuntoDatas periodo(datas.begin(), datas.end());
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                double la = sqlite3_column_double(st, 0);
+                double lo = sqlite3_column_double(st, 1);
+                const unsigned char* tx = sqlite3_column_text(st, 2);
+                if (!tx) continue;
+                std::string dt(reinterpret_cast<const char*>(tx));
+                if (!periodo.count(dt)) continue;
+                std::string k = num_str(la) + "," + num_str(lo);
+                auto it = mapa.find(k);
+                if (it != mapa.end()) {
+                    it->second.insert(dt);
+                }
+            }
             sqlite3_finalize(st);
-            continue;
+        } else {
+            // Eixos/Dimensões genéricas
+            auto contextos = expandir_contextos(ds);
+            for (const auto& ctx : contextos) {
+                std::string k_repr;
+                for (const auto& kv : ctx) {
+                    if (chave_ctx_interna(kv.first)) continue;
+                    if (!k_repr.empty()) k_repr += "|";
+                    k_repr += kv.first + "=" + kv.second;
+                }
+                mapa[k_repr] = ConjuntoDatas();
+            }
+
+            if (!tem_data || datas.empty()) continue;
+
+            // Determinar quais colunas de dimensão estão na tabela
+            std::vector<std::string> cols_dim;
+            for (const auto& e : ds.eixos) {
+                std::string c_norm = normalizar_nome(e);
+                if (std::find(cols.begin(), cols.end(), c_norm) != cols.end()) {
+                    cols_dim.push_back(c_norm);
+                }
+            }
+
+            std::string sql = "SELECT ";
+            for (const auto& c : cols_dim) sql += "\"" + c + "\", ";
+            sql += "\"" + ds.chave_data + "\" FROM \"" + ds.tabela + "\" WHERE \"" + ds.chave_data + "\" BETWEEN ? AND ?";
+            sqlite3_stmt* st = nullptr;
+            if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+                sqlite3_finalize(st);
+                continue;
+            }
+            sqlite3_bind_text(st, 1, datas.front().c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, datas.back().c_str(), -1, SQLITE_TRANSIENT);
+            ConjuntoDatas periodo(datas.begin(), datas.end());
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                std::string k_repr;
+                for (size_t ci = 0; ci < cols_dim.size(); ++ci) {
+                    const unsigned char* val = sqlite3_column_text(st, static_cast<int>(ci));
+                    if (!k_repr.empty()) k_repr += "|";
+                    k_repr += cols_dim[ci] + "=" + (val ? reinterpret_cast<const char*>(val) : "");
+                }
+                const unsigned char* tx = sqlite3_column_text(st, static_cast<int>(cols_dim.size()));
+                if (!tx) continue;
+                std::string dt(reinterpret_cast<const char*>(tx));
+                if (!periodo.count(dt)) continue;
+                auto it = mapa.find(k_repr);
+                if (it != mapa.end()) {
+                    it->second.insert(dt);
+                }
+            }
+            sqlite3_finalize(st);
         }
-        sqlite3_bind_text(st, 1, datas.front().c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, datas.back().c_str(), -1, SQLITE_TRANSIENT);
-        std::set<Chave> alvos(CFG.coordenadas.begin(), CFG.coordenadas.end());
-        ConjuntoDatas periodo(datas.begin(), datas.end());
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            double la = sqlite3_column_double(st, 0);
-            double lo = sqlite3_column_double(st, 1);
-            const unsigned char* tx = sqlite3_column_text(st, 2);
-            if (!tx) continue;
-            std::string dt(reinterpret_cast<const char*>(tx));
-            if (!periodo.count(dt)) continue;
-            Chave ch{la, lo};
-            if (!alvos.count(ch)) continue;
-            mapa[ch].insert(dt);
-        }
-        sqlite3_finalize(st);
     }
     return out;
 }

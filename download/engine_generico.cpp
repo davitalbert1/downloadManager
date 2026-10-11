@@ -80,19 +80,7 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         std::string chave_req = ds.params_chave;
         std::vector<std::string> vars = ds.vars;
 
-        // Suporte genérico: caso de fallback do Open-Meteo Pollen (se url contiver pollen)
-        bool eh_polen = (lista.find("pollen") != std::string::npos);
-        if (eh_polen) {
-            lista = "https://air-quality-api.open-meteo.com/v1/air-quality";
-            bloco_req = "hourly";
-            chave_req = "hourly";
-            for (auto& v : vars) {
-                const std::string suf = "_mean";
-                if (v.size() > suf.size() &&
-                    v.compare(v.size() - suf.size(), suf.size(), suf) == 0)
-                    v = v.substr(0, v.size() - suf.size());
-            }
-        }
+        // Casos opcionais de exclusão de variáveis em URLs históricas
         if (lista == ds.url_passado && !ds.url_passado.empty() && !ds.vars_excluir.empty()) {
             vars.erase(std::remove_if(vars.begin(), vars.end(),
                                       [&](const std::string& v) {
@@ -173,11 +161,11 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         std::string url_req = aplicar_ctx(escolher_url(lista), ctx);
         std::string corpo = aplicar_ctx(ds.corpo, ctx);
         auto dados = baixar_com_retry(url_req, params, CFG.max_retries, custo, chave_api,
-                                      ds.metodo, hdrs, corpo);
+                                      ds.metodo, hdrs, corpo, ds.api_key_em);
         if (dados) {
             std::set<std::string> filtro(grupo.begin(), grupo.end());
             const std::set<std::string>* pf = ds.iterar_datas ? &filtro : nullptr;
-            auto regs = parse_json_generico(*dados, ds, ctx, pf, eh_polen, bloco_req);
+            auto regs = parse_json_generico(*dados, ds, ctx, pf, false, bloco_req);
             todos.insert(todos.end(), std::make_move_iterator(regs.begin()),
                          std::make_move_iterator(regs.end()));
         }
@@ -187,20 +175,20 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
 }
 
 static std::optional<ResultadoGenerico> baixar_bloco_generico(
-    size_t dataset_idx, const std::vector<std::string>& datas, double lat, double lon,
+    size_t dataset_idx, const std::vector<std::string>& datas, const std::string& chave_existentes,
     const Contexto& ctx_tarefa, const ExistentesGen& existentes) {
     std::uniform_real_distribution<double> jitter(0.0, CFG.jitter_inicial_max);
     dormir(jitter(rng()));
     const DatasetCfg& ds = CFG.datasets[dataset_idx];
-    Chave chave{lat, lon};
     std::vector<std::string> faltantes;
     {
         std::shared_lock lk(g_mtx_existentes);
         auto it = existentes.find(dataset_idx);
-        const ConjuntoDatas* tem =
-            (it == existentes.end()) ? nullptr : &(it->second.find(chave) == it->second.end()
-                                                       ? datas_vazias()
-                                                       : it->second.at(chave));
+        const ConjuntoDatas* tem = nullptr;
+        if (it != existentes.end()) {
+            auto jt = it->second.find(chave_existentes);
+            if (jt != it->second.end()) tem = &jt->second;
+        }
         for (const auto& d : datas) {
             if (!data_no_intervalo(d, ds)) continue;
             if (!tem || !tem->count(d)) faltantes.push_back(d);
@@ -208,8 +196,7 @@ static std::optional<ResultadoGenerico> baixar_bloco_generico(
     }
     ResultadoGenerico r;
     r.dataset_idx = dataset_idx;
-    r.lat = lat;
-    r.lon = lon;
+    r.chave_existentes = chave_existentes;
     r.ctx = ctx_tarefa;
     r.datas_pedidas = faltantes;
     if (!faltantes.empty()) {
@@ -244,7 +231,7 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
     }
     {
         std::unique_lock<std::shared_mutex> lk(g_mtx_existentes);
-        auto& conj = existentes[r.dataset_idx][Chave{r.lat, r.lon}];
+        auto& conj = existentes[r.dataset_idx][r.chave_existentes];
         std::string col = ds.chave_data.empty() ? "data" : ds.chave_data;
         for (const auto& reg : r.registros) {
             auto it = reg.find(col);
@@ -264,7 +251,7 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
     struct TarefaGen {
         size_t ds;
         std::vector<std::string> datas;
-        double lat = 0.0, lon = 0.0;
+        std::string chave_existentes;
         Contexto ctx;
     };
     std::vector<TarefaGen> tarefas;
@@ -281,7 +268,7 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
                 lista_coords.push_back({0.0, 0.0});
             }
             for (const auto& coord : lista_coords) {
-                Chave ch{coord.first, coord.second};
+                std::string ch = num_str(coord.first) + "," + num_str(coord.second);
                 std::vector<std::string> f;
                 {
                     std::shared_lock lk(g_mtx_existentes);
@@ -310,23 +297,39 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
                 for (size_t i = 0; i < f.size(); i += (size_t)CFG.chunk_dias) {
                     size_t e = std::min(i + (size_t)CFG.chunk_dias, f.size());
                     tarefas.push_back({di, std::vector<std::string>(f.begin() + i, f.begin() + e),
-                                       coord.first, coord.second, ctx});
+                                       ch, ctx});
                 }
             }
         } else {
             // Expansão por eixos de dimensão arbitrários
             auto contextos = expandir_contextos(ds);
             for (const auto& ctx : contextos) {
+                std::string ch;
+                for (const auto& kv : ctx) {
+                    if (chave_ctx_interna(kv.first)) continue;
+                    if (!ch.empty()) ch += "|";
+                    ch += kv.first + "=" + kv.second;
+                }
                 std::vector<std::string> f;
-                for (const auto& d : datas) {
-                    if (data_no_intervalo(d, ds)) f.push_back(d);
+                {
+                    std::shared_lock lk(g_mtx_existentes);
+                    auto it = existentes.find(di);
+                    const ConjuntoDatas* tem = nullptr;
+                    if (it != existentes.end()) {
+                        auto jt = it->second.find(ch);
+                        if (jt != it->second.end()) tem = &jt->second;
+                    }
+                    for (const auto& d : datas) {
+                        if (!data_no_intervalo(d, ds)) continue;
+                        if (!tem || !tem->count(d)) f.push_back(d);
+                    }
                 }
                 if (f.empty()) continue;
                 falt += (long long)f.size();
                 for (size_t i = 0; i < f.size(); i += (size_t)CFG.chunk_dias) {
                     size_t e = std::min(i + (size_t)CFG.chunk_dias, f.size());
                     tarefas.push_back({di, std::vector<std::string>(f.begin() + i, f.begin() + e),
-                                       0.0, 0.0, ctx});
+                                       ch, ctx});
                 }
             }
         }
@@ -385,7 +388,7 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
                     size_t k = idx_t.fetch_add(1);
                     if (k >= tarefas.size()) break;
                     const TarefaGen& t = tarefas[k];
-                    auto res = baixar_bloco_generico(t.ds, t.datas, t.lat, t.lon, t.ctx, existentes);
+                    auto res = baixar_bloco_generico(t.ds, t.datas, t.chave_existentes, t.ctx, existentes);
                     if (res) fila.put(std::move(*res));
                     if (feitas.fetch_add(1) + 1 >= total) fila.close();
                 }

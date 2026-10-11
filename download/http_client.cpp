@@ -41,8 +41,7 @@ std::string escapar_url(const std::string& s) {
     return r;
 }
 
-std::string montar_url(const std::string& base,
-                       const std::map<std::string, std::string>& params) {
+std::string montar_url(const std::string& base, const std::map<std::string, std::string>& params) {
     std::string url = base;
     bool primeiro = true;
     for (const auto& [k, v] : params) {
@@ -56,7 +55,9 @@ std::string montar_url(const std::string& base,
 RespostaHttp http_requisicao(const std::string& url,
                              const std::string& metodo,
                              const std::map<std::string, std::string>& headers,
-                             const std::string& corpo) {
+                             const std::string& corpo,
+                             const std::string& auth_modo,
+                             const std::string& auth_valor) {
     RespostaHttp r;
     CURL* curl = curl_da_thread();
     if (!curl) {
@@ -77,6 +78,11 @@ RespostaHttp http_requisicao(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "download-generico/2.0");
 
+    if (!auth_valor.empty() && auth_modo == "basic") {
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERPWD, auth_valor.c_str());
+    }
+
     struct curl_slist* hdr = nullptr;
     std::string metodo_u = minusculas(metodo);
     bool tem_corpo = !corpo.empty() && metodo_u != "get" && metodo_u != "head";
@@ -87,8 +93,7 @@ RespostaHttp http_requisicao(const std::string& url,
         std::string linha = kv.first + ": " + kv.second;
         hdr = curl_slist_append(hdr, linha.c_str());
     }
-    if (tem_json && !tem_ct)
-        hdr = curl_slist_append(hdr, "Content-Type: application/json");
+    if (tem_json && !tem_ct) hdr = curl_slist_append(hdr, "Content-Type: application/json");
     if (hdr) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
 
     if (metodo_u == "post") {
@@ -123,13 +128,14 @@ std::optional<json> baixar_com_retry(const std::string& url,
                                      const std::string& chave_api,
                                      const std::string& metodo,
                                      const std::map<std::string, std::string>& headers,
-                                     const std::string& corpo) {
+                                     const std::string& corpo,
+                                     const std::string& api_key_em) {
     std::string url_completa = montar_url(url, params);
     std::string grupo = chave_api.empty() ? std::string("anonymous") : chave_api;
     for (int tentativa = 1; tentativa <= max_tentativas; ++tentativa) {
         esperar_envio(grupo, custo);
 
-        RespostaHttp r = http_requisicao(url_completa, metodo, headers, corpo);
+        RespostaHttp r = http_requisicao(url_completa, metodo, headers, corpo, api_key_em, chave_api);
 
         if (!r.erro_rede && r.status < 400) {
             try {
@@ -170,8 +176,7 @@ std::optional<json> baixar_com_retry(const std::string& url,
 
             tratar_429(espera, quota ? "cota da API excedida" : "HTTP 429", url);
             if (tentativa == max_tentativas) {
-                log("  [ERROR] 429 persistente apos " +
-                    std::to_string(max_tentativas) + " tentativas");
+                log("  [ERROR] 429 persistente apos " + std::to_string(max_tentativas) + " tentativas");
                 return std::nullopt;
             }
             char buf[220];

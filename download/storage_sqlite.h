@@ -11,7 +11,9 @@ using Valor = std::variant<std::monostate, double, std::string>;
 using Registro = std::map<std::string, Valor>;
 using Chave = std::pair<double, double>;
 using ConjuntoDatas = std::set<std::string>;
-using ExistentesGen = std::map<size_t, std::map<Chave, ConjuntoDatas>>;
+// ExistentesGen mapeia: dataset_idx -> (chave_contexto -> conjunto de datas)
+// A chave_contexto pode ser "lat,lon" para coordenadas ou uma string composta para quaisquer eixos/dimensoes
+using ExistentesGen = std::map<size_t, std::map<std::string, ConjuntoDatas>>;
 
 void executar_sql(sqlite3* conn, const char* sql);
 void executar_sql(sqlite3* conn, const std::string& sql);

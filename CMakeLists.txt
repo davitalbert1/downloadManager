@@ -22,6 +22,9 @@ add_executable(clima_viewer WIN32 app/main.cpp)
 set_target_properties(clima_viewer PROPERTIES AUTOMOC ON)
 target_link_libraries(clima_viewer PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Sql)
 
+# era5_import.exe - importador de arquivos GRIB / ERA5 para SQLite
+find_package(GDAL REQUIRED)
+
 # download.exe - download de dados genericos/climaticos
 find_package(CURL REQUIRED)
 find_package(SQLite3 REQUIRED)
@@ -37,12 +40,24 @@ add_executable(download
     download/json_parser.cpp
     download/file_dataset.cpp
     download/engine_generico.cpp
+    download/era5_importer.cpp
 )
 target_include_directories(download PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 Threads::Threads)
+target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 GDAL::GDAL Threads::Threads)
 
+# clima_auditor app/test.cpp
 add_executable(clima_auditor app/test.cpp)
 target_link_libraries(clima_auditor PRIVATE SQLite3::SQLite3)
+
+# era5_import.exe - importador de arquivos GRIB / ERA5 para SQLite
+find_package(GDAL REQUIRED)
+
+add_executable(era5_import
+    download/era5_main.cpp
+    download/era5_importer.cpp
+)
+target_include_directories(era5_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(era5_import PRIVATE GDAL::GDAL SQLite3::SQLite3 Threads::Threads)
 
 # nlohmann/json (header-only): usa o pacote CMake se existir,
 # senão procura o include padrão nlohmann/json.hpp

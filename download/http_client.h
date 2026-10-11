@@ -19,7 +19,9 @@ std::string montar_url(const std::string& base, const std::map<std::string, std:
 RespostaHttp http_requisicao(const std::string& url,
                              const std::string& metodo = "GET",
                              const std::map<std::string, std::string>& headers = {},
-                             const std::string& corpo = "");
+                             const std::string& corpo = "",
+                             const std::string& auth_modo = "",
+                             const std::string& auth_valor = "");
 
 std::optional<json> baixar_com_retry(const std::string& url,
                                      const std::map<std::string, std::string>& params,
@@ -27,4 +29,5 @@ std::optional<json> baixar_com_retry(const std::string& url,
                                      const std::string& chave_api,
                                      const std::string& metodo = "GET",
                                      const std::map<std::string, std::string>& headers = {},
-                                     const std::string& corpo = "");
+                                     const std::string& corpo = "",
+                                     const std::string& api_key_em = "query");

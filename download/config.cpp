@@ -286,26 +286,30 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.url_futuro = cortar(ini.obter_ou(secao, "url_futuro"));
         d.api_keys = cortar(ini.obter_ou(secao, "api_keys"));
 
-        // Campos para dataset do tipo arquivo / ERA5
+        // Campos para dataset do tipo arquivo / assíncronos
         d.tipo_saida = cortar(ini.obter_ou(secao, "tipo_saida"));
         if (d.tipo_saida.empty()) d.tipo_saida = cortar(ini.obter_ou(secao, "output_type"));
         if (d.tipo_saida.empty()) {
             std::string temp_val;
-            if (ini.obter(secao, "pasta_saida", temp_val) || ini.obter(secao, "dataset_api", temp_val) || secao.find("era5") != std::string::npos) {
+            if (ini.obter(secao, "pasta_saida", temp_val) || ini.obter(secao, "dataset_api", temp_val) ||
+                ini.obter(secao, "extensao", temp_val) || ini.obter(secao, "padrao_arquivo", temp_val)) {
                 d.tipo_saida = "arquivo";
             } else {
                 d.tipo_saida = "db";
             }
         }
-        d.pasta_saida = cortar(ini.obter_ou(secao, "pasta_saida", "dados_era5"));
-        d.extensao = cortar(ini.obter_ou(secao, "extensao", "grib"));
-        if (d.extensao.empty()) d.extensao = cortar(ini.obter_ou(secao, "format", "grib"));
-        d.dataset_api = cortar(ini.obter_ou(secao, "dataset_api", "reanalysis-era5-single-levels"));
-        d.product_type = cortar(ini.obter_ou(secao, "product_type", "reanalysis"));
+        d.pasta_saida = cortar(ini.obter_ou(secao, "pasta_saida", "dados_arquivos"));
+        d.extensao = cortar(ini.obter_ou(secao, "extensao", "bin"));
+        if (d.extensao.empty()) d.extensao = cortar(ini.obter_ou(secao, "format", "bin"));
+        d.dataset_api = cortar(ini.obter_ou(secao, "dataset_api"));
+        d.product_type = cortar(ini.obter_ou(secao, "product_type"));
         d.data_format = cortar(ini.obter_ou(secao, "data_format", d.extensao));
         d.download_format = cortar(ini.obter_ou(secao, "download_format", "unarchived"));
+        d.padrao_arquivo = cortar(ini.obter_ou(secao, "padrao_arquivo"));
         d.ano_inicial = para_int(ini.obter_ou(secao, "ano_inicial", "1940"), 1940);
-        d.dias_atraso = para_int(ini.obter_ou(secao, "dias_atraso", "7"), 7);
+        d.dias_atraso = para_int(ini.obter_ou(secao, "dias_atraso", "0"), 0);
+        d.auto_importar_banco = para_bool(ini.obter_ou(secao, "auto_importar_banco", "0"), false);
+        d.evitar_download_se_no_banco = para_bool(ini.obter_ou(secao, "evitar_download_se_no_banco", "0"), false);
 
         std::string hrs_str = ini.obter_ou(secao, "horarios");
         if (!hrs_str.empty()) {
@@ -453,7 +457,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         }
 
         if (d.tipo_saida == "arquivo" && d.url.empty()) {
-            d.url = obter_env_ou_config("CDSAPI_URL", "", "https://cds.climate.copernicus.eu/api");
+            d.url = obter_env_ou_config("API_URL", "", "");
         }
 
         if (d.url.empty()) {
@@ -478,37 +482,39 @@ void carregar_config(const std::string& caminho) {
     auto le_texto = [&](const char* /*sec*/, const char* chave, std::string& alvo) {
         if (obter_geral(chave)) alvo = v;
     };
-    auto le_int = [&](const char* chave, const char* env, int& alvo) {
+    auto le_int = [&](const char* chave, const char* env, const char* env_legado, int& alvo) {
         if (obter_geral(chave)) alvo = para_int(v, alvo);
+        if (env_legado) alvo = env_int(env_legado, alvo);
         if (env) alvo = env_int(env, alvo);
     };
-    auto le_dbl = [&](const char* chave, const char* env, double& alvo) {
+    auto le_dbl = [&](const char* chave, const char* env, const char* env_legado, double& alvo) {
         if (obter_geral(chave)) alvo = para_double(v, alvo);
+        if (env_legado) alvo = env_double(env_legado, alvo);
         if (env) alvo = env_double(env, alvo);
     };
 
     le_texto("geral", "db_path", CFG.db_path);
-    le_int("max_sql_dates_por_lote", nullptr, CFG.max_sql_dates_por_lote);
-    le_int("download_workers", "OPENMETEO_DOWNLOAD_WORKERS", CFG.download_workers);
-    le_int("process_workers", "OPENMETEO_PROCESS_WORKERS", CFG.process_workers);
-    le_int("chunk_dias", "OPENMETEO_CHUNK_DIAS", CFG.chunk_dias);
-    le_dbl("requests_per_second", "OPENMETEO_RPS", CFG.requests_per_second);
-    le_int("max_retries", "OPENMETEO_RETRIES", CFG.max_retries);
-    le_dbl("http_timeout", "OPENMETEO_TIMEOUT", CFG.http_timeout);
-    le_dbl("jitter_inicial_max", "OPENMETEO_JITTER", CFG.jitter_inicial_max);
-    le_dbl("backoff_inicial", "OPENMETEO_BACKOFF", CFG.backoff_inicial);
-    le_dbl("backoff_maximo", "OPENMETEO_BACKOFF_MAX", CFG.backoff_maximo);
-    le_dbl("min_rps", "OPENMETEO_MIN_RPS", CFG.min_rps);
-    le_dbl("cooldown_429", "OPENMETEO_COOLDOWN_429", CFG.cooldown_429);
-    le_int("circuit_limit_429", "OPENMETEO_429_CIRCUIT_LIMIT", CFG.circuit_limit_429);
-    le_dbl("espera_min_429", "OPENMETEO_429_ESPERA_MIN", CFG.espera_min_429);
-    le_dbl("limite_minuto", "OPENMETEO_LIMITE_MINUTO", CFG.limite_minuto);
-    le_dbl("limite_hora", "OPENMETEO_LIMITE_HORA", CFG.limite_hora);
-    le_dbl("limite_dia", "OPENMETEO_LIMITE_DIA", CFG.limite_dia);
-    le_dbl("custo_vars_ref", nullptr, CFG.custo_vars_ref);
-    le_dbl("custo_dias_ref", nullptr, CFG.custo_dias_ref);
-    le_dbl("custo_dias_fator", nullptr, CFG.custo_dias_fator);
-    le_dbl("cooldown_quota", "OPENMETEO_COOLDOWN_QUOTA", CFG.cooldown_quota);
+    le_int("max_sql_dates_por_lote", "DOWNLOAD_MAX_SQL_DATES", nullptr, CFG.max_sql_dates_por_lote);
+    le_int("download_workers", "DOWNLOAD_WORKERS", "OPENMETEO_DOWNLOAD_WORKERS", CFG.download_workers);
+    le_int("process_workers", "PROCESS_WORKERS", "OPENMETEO_PROCESS_WORKERS", CFG.process_workers);
+    le_int("chunk_dias", "CHUNK_DIAS", "OPENMETEO_CHUNK_DIAS", CFG.chunk_dias);
+    le_dbl("requests_per_second", "REQUESTS_PER_SECOND", "OPENMETEO_RPS", CFG.requests_per_second);
+    le_int("max_retries", "MAX_RETRIES", "OPENMETEO_RETRIES", CFG.max_retries);
+    le_dbl("http_timeout", "HTTP_TIMEOUT", "OPENMETEO_TIMEOUT", CFG.http_timeout);
+    le_dbl("jitter_inicial_max", "JITTER_INICIAL_MAX", "OPENMETEO_JITTER", CFG.jitter_inicial_max);
+    le_dbl("backoff_inicial", "BACKOFF_INICIAL", "OPENMETEO_BACKOFF", CFG.backoff_inicial);
+    le_dbl("backoff_maximo", "BACKOFF_MAXIMO", "OPENMETEO_BACKOFF_MAX", CFG.backoff_maximo);
+    le_dbl("min_rps", "MIN_RPS", "OPENMETEO_MIN_RPS", CFG.min_rps);
+    le_dbl("cooldown_429", "COOLDOWN_429", "OPENMETEO_COOLDOWN_429", CFG.cooldown_429);
+    le_int("circuit_limit_429", "CIRCUIT_LIMIT_429", "OPENMETEO_429_CIRCUIT_LIMIT", CFG.circuit_limit_429);
+    le_dbl("espera_min_429", "ESPERA_MIN_429", "OPENMETEO_429_ESPERA_MIN", CFG.espera_min_429);
+    le_dbl("limite_minuto", "LIMITE_MINUTO", "OPENMETEO_LIMITE_MINUTO", CFG.limite_minuto);
+    le_dbl("limite_hora", "LIMITE_HORA", "OPENMETEO_LIMITE_HORA", CFG.limite_hora);
+    le_dbl("limite_dia", "LIMITE_DIA", "OPENMETEO_LIMITE_DIA", CFG.limite_dia);
+    le_dbl("custo_vars_ref", "CUSTO_VARS_REF", nullptr, CFG.custo_vars_ref);
+    le_dbl("custo_dias_ref", "CUSTO_DIAS_REF", nullptr, CFG.custo_dias_ref);
+    le_dbl("custo_dias_fator", "CUSTO_DIAS_FATOR", nullptr, CFG.custo_dias_fator);
+    le_dbl("cooldown_quota", "COOLDOWN_QUOTA", "OPENMETEO_COOLDOWN_QUOTA", CFG.cooldown_quota);
     le_texto("general", "api_keys", CFG.api_keys);
     le_texto("general", "api_key_param", CFG.api_key_param);
     le_texto("general", "fuso_horario", CFG.fuso_horario);

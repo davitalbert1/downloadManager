@@ -50,18 +50,21 @@ struct DatasetCfg {
     std::string api_key_header = "Authorization";
     std::string api_key_prefix = "Bearer";
 
-    // Campos para salvamento em arquivos (ex: Copernicus CDS / ERA5)
+    // Campos para salvamento em arquivos (APIs de arquivos/jobs assíncronos)
     std::string tipo_saida = "db"; // "db" (sqlite) ou "arquivo" (pasta)
-    std::string pasta_saida = "dados_era5";
-    std::string extensao = "grib";
-    std::string dataset_api = "reanalysis-era5-single-levels";
-    std::string product_type = "reanalysis";
-    std::string data_format = "grib";
-    std::string download_format = "unarchived";
-    std::vector<std::string> horarios = {"00:00", "12:00"};
+    std::string pasta_saida = "dados_arquivos";
+    std::string extensao = "bin";
+    std::string dataset_api;
+    std::string product_type;
+    std::string data_format;
+    std::string download_format;
+    std::string padrao_arquivo; // template do nome do arquivo final, ex: "{id}_{ano}_{mes}.{extensao}"
+    std::vector<std::string> horarios;
     int ano_inicial = 1940;
-    int dias_atraso = 7;
+    int dias_atraso = 0;
     std::string modo_api = "auto";
+    bool auto_importar_banco = false; // Importa para o banco SQLite se suportado
+    bool evitar_download_se_no_banco = false; // Não baixa se dados já existirem no banco
 };
 
 struct DimensaoCfg {

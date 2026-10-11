@@ -77,17 +77,17 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 1) Executa datasets em arquivo (ex: ERA5 -> dados_era5/)
+        // 1) Executa datasets em arquivo
         for (const auto& ds : datasets_arquivo) {
             executar_dataset_arquivo(ds);
         }
 
-        // 2) Executa datasets em banco SQLite (ex: Open-Meteo -> clima.db)
+        // 2) Executa datasets em banco SQLite
         if (!datasets_db.empty()) {
             std::vector<std::string> datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
             if (!datas.empty()) {
                 std::cout << "============================================================\n"
-                          << "DOWNLOAD DE DADOS CLIMATICOS / GENERICOS (BANCO SQLITE)\n"
+                          << "DOWNLOAD GENERICO DE DADOS E APIS (BANCO SQLITE)\n"
                           << "============================================================\n"
                           << "Configuracao: " << caminho_ini << "\n"
                           << "Fuso horario: " << CFG.fuso_horario << "\n"

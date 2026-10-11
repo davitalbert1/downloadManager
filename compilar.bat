@@ -17,22 +17,33 @@ if not exist "%GXX%" (
     exit /b 1
 )
 
-echo Compilando download.cpp com:
+echo Compilando download.exe com:
 echo    %GXX%
 echo.
 
 for %%I in ("%GXX%") do set "GXX_DIR=%%~dpI"
 set "PATH=%GXX_DIR%;%PATH%"
 
-"%GXX%" -std=c++17 -O2 -Wall -I. -o download.exe download.cpp download/utils.cpp download/config.cpp download/rate_limit.cpp download/storage_sqlite.cpp download/http_client.cpp download/json_parser.cpp download/file_dataset.cpp download/engine_generico.cpp -lcurl -lsqlite3 -pthread
+"%GXX%" -std=c++17 -O2 -Wall -I. -o download.exe download/main.cpp download/utils.cpp download/config.cpp download/rate_limit.cpp download/storage_sqlite.cpp download/http_client.cpp download/json_parser.cpp download/file_dataset.cpp download/engine_generico.cpp download/era5_importer.cpp -lcurl -lsqlite3 -lgdal -pthread
 
 if errorlevel 1 (
     echo.
-    echo Falha na compilacao.
+    echo Falha na compilacao do download.exe.
+    exit /b 1
+)
+
+echo Compilando era5_import.exe com GDAL e SQLite3...
+"%GXX%" -std=c++17 -O2 -Wall -I. -o era5_import.exe download/era5_main.cpp download/era5_importer.cpp -lgdal -lsqlite3 -pthread
+
+if errorlevel 1 (
+    echo.
+    echo Falha na compilacao do era5_import.exe.
     exit /b 1
 )
 
 echo.
-echo OK: download.exe gerado.
-echo Uso: download.exe [caminho_do_ini]   ^(padrao: download.ini^)
+echo OK: download.exe e era5_import.exe gerados.
+echo Uso:
+echo   download.exe [caminho_do_ini]
+echo   era5_import.exe [--pasta dados_era5] [--db clima.db] [--tabela era5_horario]
 endlocal

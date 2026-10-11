@@ -1,5 +1,7 @@
 #include "file_dataset.h"
+#include "era5_importer.h"
 #include "rate_limit.h"
+#include "storage_sqlite.h"
 #include "utils.h"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -39,9 +41,7 @@ static size_t ler_headers_cb(char* buffer, size_t tam, size_t n, void* ud) {
     std::transform(baixo.begin(), baixo.end(), baixo.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    if (baixo.rfind("location:", 0) == 0) {
-        resp->header_location = cortar(linha.substr(9));
-    }
+    if (baixo.rfind("location:", 0) == 0) resp->header_location = cortar(linha.substr(9));
     return tam * n;
 }
 
@@ -171,29 +171,19 @@ static std::string extrair_url_download_bruto(const json& j) {
         const auto& a = j["asset"];
         if (a.contains("value") && a["value"].is_object()) {
             const auto& v = a["value"];
-            if (v.contains("href") && v["href"].is_string()) {
-                return v["href"].get<std::string>();
-            }
+            if (v.contains("href") && v["href"].is_string()) return v["href"].get<std::string>();
         }
-        if (a.contains("href") && a["href"].is_string()) {
-            return a["href"].get<std::string>();
-        }
+        if (a.contains("href") && a["href"].is_string()) return a["href"].get<std::string>();
     }
     if (j.contains("location") && j["location"].is_string()) {
         return j["location"].get<std::string>();
     }
-    if (j.contains("href") && j["href"].is_string()) {
-        return j["href"].get<std::string>();
-    }
-    if (j.contains("url") && j["url"].is_string()) {
-        return j["url"].get<std::string>();
-    }
+    if (j.contains("href") && j["href"].is_string()) return j["href"].get<std::string>();
+    if (j.contains("url") && j["url"].is_string()) return j["url"].get<std::string>();
     if (j.contains("download_url") && j["download_url"].is_string()) {
         return j["download_url"].get<std::string>();
     }
-    if (j.contains("result") && j["result"].is_object()) {
-        return extrair_url_download_bruto(j["result"]);
-    }
+    if (j.contains("result") && j["result"].is_object()) return extrair_url_download_bruto(j["result"]);
     return "";
 }
 
@@ -263,9 +253,7 @@ static bool http_download_stream(const std::string& url,
     DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now()};
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    if (headers) {
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &arq);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -331,20 +319,65 @@ static std::string extrair_asset_de_arquivo(const std::filesystem::path& arq) {
 }
 
 static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, const std::string& base_url, const std::string& api_key) {
-    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_era5");
+    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_arquivos");
     std::filesystem::path pasta_saida(pasta_saida_str);
     std::filesystem::create_directories(pasta_saida);
 
-    std::string extensao = obter_env_ou_config("FORMATO", ds.extensao, "grib");
+    std::string extensao = obter_env_ou_config("FORMATO", ds.extensao, "bin");
     if (extensao == "netcdf") extensao = "nc";
 
     char nome_final[128];
-    std::snprintf(nome_final, sizeof(nome_final), "era5_%04d_%02d.%s", ano, mes, extensao.c_str());
+    if (!ds.padrao_arquivo.empty()) {
+        Contexto fctx;
+        fctx["id"] = ds.id;
+        fctx["ano"] = std::to_string(ano);
+        char mes_buf[8];
+        std::snprintf(mes_buf, sizeof(mes_buf), "%02d", mes);
+        fctx["mes"] = mes_buf;
+        fctx["extensao"] = extensao;
+        std::string fn = aplicar_ctx(ds.padrao_arquivo, fctx);
+        std::snprintf(nome_final, sizeof(nome_final), "%s", fn.c_str());
+    } else {
+        std::snprintf(nome_final, sizeof(nome_final), "%s_%04d_%02d.%s", ds.id.c_str(), ano, mes, extensao.c_str());
+    }
     std::filesystem::path destino = pasta_saida / nome_final;
+
+    std::string db_alvo = ds.db.empty() ? CFG.db_path : ds.db;
+    std::string tab_alvo = ds.tabela.empty() ? "clima_horario" : ds.tabela;
+
+    // 0) Se configurado para evitar download quando já estiver no banco, checa diretamente no SQLite
+    if (ds.evitar_download_se_no_banco && !db_alvo.empty()) {
+        sqlite3* conn = nullptr;
+        try {
+            conn = get_connection_para(db_alvo);
+        } catch (...) {
+            conn = nullptr;
+        }
+
+        if (conn) {
+            std::vector<std::string> hrs = ds.horarios;
+            if (hrs.empty()) {
+                std::string h_str = obter_env_ou_config("HORARIOS", "", "00:00,12:00");
+                hrs = dividir(h_str, ',');
+            }
+            if (era5_mes_ja_no_banco(conn, tab_alvo, ano, mes, CFG.coordenadas, hrs)) {
+                log("[NO BANCO] " + std::string(nome_final) + " ja importado em " + db_alvo + "." + tab_alvo + " - pulando download.");
+                return true;
+            }
+        }
+    }
 
     if (std::filesystem::exists(destino)) {
         if (std::filesystem::file_size(destino) > 100000) {
             log("[JÁ EXISTE] " + std::string(nome_final));
+            // Se o arquivo existe em disco mas os dados ainda não foram pro banco e auto_importar_banco está ligado:
+            if (ds.auto_importar_banco && (extensao == "grib" || extensao == "grb")) {
+                Era5ImportConfig imp_cfg;
+                imp_cfg.db_path = db_alvo;
+                imp_cfg.tabela = tab_alvo;
+                imp_cfg.coordenadas = CFG.coordenadas;
+                importar_arquivo_era5(destino.string(), imp_cfg);
+            }
             return true;
         } else {
             log("[REMOVENDO ARQUIVO INVÁLIDO/INCOMPLETO] " + std::string(nome_final));
@@ -406,9 +439,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
     solicitacao_cads["inputs"] = solicitacao_direct;
 
     std::string endpoint_post = base_url;
-    if (endpoint_post.rfind("http", 0) != 0) {
-        endpoint_post = "https://cds.climate.copernicus.eu/api";
-    }
+    if (endpoint_post.rfind("http", 0) != 0) endpoint_post = "https://cds.climate.copernicus.eu/api";
     if (endpoint_post.back() == '/') endpoint_post.pop_back();
 
     std::string url_execute = endpoint_post + "/resources/" + dataset_name;
@@ -498,7 +529,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
     }
 
     char nome_temp[128];
-    std::snprintf(nome_temp, sizeof(nome_temp), "era5_%04d_%02d.temp", ano, mes);
+    std::snprintf(nome_temp, sizeof(nome_temp), "%s_%04d_%02d.temp", ds.id.c_str(), ano, mes);
     std::filesystem::path temporario = pasta_saida / nome_temp;
 
     std::string url_atual = download_url;
@@ -509,9 +540,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
         if (!ok) break;
 
         std::string asset_url = extrair_asset_de_arquivo(temporario);
-        if (asset_url.empty()) {
-            break;
-        }
+        if (asset_url.empty()) break;
 
         std::filesystem::remove(temporario);
         if (asset_url.rfind("http", 0) != 0) {
@@ -527,6 +556,16 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
         std::filesystem::rename(temporario, destino, ec);
         if (!ec) {
             log("[CONCLUÍDO] " + std::string(nome_final));
+
+            // Importação automática imediata para o SQLite se configurado
+            if (ds.auto_importar_banco && (extensao == "grib" || extensao == "grb")) {
+                Era5ImportConfig imp_cfg;
+                imp_cfg.db_path = db_alvo;
+                imp_cfg.tabela = tab_alvo;
+                imp_cfg.coordenadas = CFG.coordenadas;
+                importar_arquivo_era5(destino.string(), imp_cfg);
+            }
+
             return true;
         } else {
             log("[ERRO] Falha ao renomear arquivo final: " + ec.message());
@@ -537,7 +576,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
 }
 
 void executar_dataset_arquivo(const DatasetCfg& ds) {
-    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_era5");
+    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_arquivos");
     std::filesystem::path pasta_saida(pasta_saida_str);
     std::filesystem::create_directories(pasta_saida);
 
@@ -555,8 +594,8 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
         }
     }
 
-    std::string api_url = ds.url.empty() ? obter_env_ou_config("CDSAPI_URL", "", "https://cds.climate.copernicus.eu/api") : ds.url;
-    std::string api_key = ds.api_keys.empty() ? obter_env_ou_config("CDSAPI_KEY", "") : ds.api_keys;
+    std::string api_url = ds.url.empty() ? obter_env_ou_config("API_URL", "", "https://cds.climate.copernicus.eu/api") : ds.url;
+    std::string api_key = ds.api_keys.empty() ? obter_env_ou_config("API_KEY", obter_env_ou_config("CDSAPI_KEY", "", ""), "") : ds.api_keys;
 
     int ano_inicial = para_int(obter_env_ou_config("ANO_INICIAL", "", std::to_string(ds.ano_inicial)), 1940);
     int dias_atraso = para_int(obter_env_ou_config("DIAS_ATRASO", "", std::to_string(ds.dias_atraso)), 7);
@@ -593,8 +632,7 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
                 size_t k = idx_mes.fetch_add(1);
                 if (k >= meses.size()) break;
                 try {
-                    processar_dataset_era5_mes(ds, meses[k].first, meses[k].second, api_url,
-                                               api_key);
+                    processar_dataset_era5_mes(ds, meses[k].first, meses[k].second, api_url, api_key);
                 } catch (const std::exception& e) {
                     log(std::string("[ERROR] ERA5 MES ") + std::to_string(meses[k].first) + "-" +
                         std::to_string(meses[k].second) + ": " + e.what());
