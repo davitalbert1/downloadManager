@@ -49,44 +49,44 @@ O `download.exe` é totalmente universal e controlado pelo `download.ini` ou arq
 
 #### 1. Executar todos os datasets do `download.ini`
 ```cmd
-./download.exe
+./build/download.exe
 ```
 ou especificando o arquivo `.ini`:
 ```cmd
-./download.exe download.ini
+./build/download.exe download.ini
 ```
 
 #### 2. Executar apenas uma seção/dataset específico
 Você pode passar diretamente o nome da seção do dataset (com ou sem o prefixo `dataset:`):
 ```cmd
-./download.exe era5
+./build/download.exe era5
 ```
 ```cmd
-./download.exe dataset:era5
+./build/download.exe dataset:era5
 ```
 Com o caminho do arquivo `.ini` explícito:
 ```cmd
-./download.exe download.ini era5
+./build/download.exe download.ini era5
 ```
 
 #### 3. Usar flags de seleção de dataset (`-d`, `--dataset`, `-s`, `--secao`)
 ```cmd
-./download.exe -d era5
+./build/download.exe -d era5
 ```
 ```cmd
-./download.exe download.ini --dataset era5
+./build/download.exe download.ini --dataset era5
 ```
 
 #### 4. Baixar múltiplos datasets específicos
 múltiplos datasets separados por vírgula ou por argumentos distintos:
 ```cmd
-./download.exe era5,clima_diario
+./build/download.exe era5,clima_diario
 ```
 ```cmd
-./download.exe download.ini era5 clima_diario
+./build/download.exe download.ini era5 clima_diario
 ```
 ```cmd
-./download.exe -d era5 -d clima_diario
+./build/download.exe -d era5 -d clima_diario
 ```
 
 #### 5. Modos de Saída (Definidos no `download.ini`)
@@ -97,7 +97,7 @@ múltiplos datasets separados por vírgula ou por argumentos distintos:
 No PowerShell/VS Code (raiz do projeto):
 
 ```powershell
-.\download.exe era5
-.\build\clima_viewer.exe   # execute a partir de app\ para achar clima.db
+./build/download.exe era5
+./build/clima_viewer.exe   # execute a partir de app\ para achar clima.db
 ```
 

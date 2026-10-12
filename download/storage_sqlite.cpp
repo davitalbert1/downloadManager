@@ -22,6 +22,9 @@ sqlite3* get_connection_para(const std::string& db_path) {
     static thread_local std::map<std::string, sqlite3*> conns;
     auto it = conns.find(db_path);
     if (it != conns.end() && it->second) return it->second;
+    // Cria a pasta-pai especificada no .ini (ex: "dados/pokemon.db" -> "dados/").
+    // Sem isso o sqlite3_open falha com "unable to open database file".
+    garantir_pasta_pai(db_path);
     sqlite3* conn = nullptr;
     if (sqlite3_open(db_path.c_str(), &conn) != SQLITE_OK) {
         std::string msg = conn ? sqlite3_errmsg(conn) : "falha ao abrir";

@@ -418,6 +418,13 @@ bool importar_arquivo_era5(const std::string& grib_path, const Era5ImportConfig&
     std::vector<std::string> lista_colunas(todas_colunas_set.begin(), todas_colunas_set.end());
 
     // 2) Conectar ao banco SQLite e garantir tabela
+    try {
+        fs::path pai = fs::path(cfg.db_path).parent_path();
+        if (!pai.empty()) {
+            std::error_code ec_dir;
+            fs::create_directories(pai, ec_dir);
+        }
+    } catch (...) {}
     sqlite3* db = nullptr;
     if (sqlite3_open(cfg.db_path.c_str(), &db) != SQLITE_OK) {
         std::cerr << "[ERRO SQLite] Falha ao abrir banco: " << cfg.db_path << "\n";

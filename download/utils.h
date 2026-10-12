@@ -43,5 +43,9 @@ std::vector<std::string> expandir_periodo(const std::string& inicio, const std::
 // Thread-safe logger
 void log(const std::string& msg);
 
+// Garante que a pasta-pai de um arquivo exista (cria `a/b/` para `a/b/c.db`).
+// Retorna true se OK ou se nao ha pasta a criar; false se falhou.
+bool garantir_pasta_pai(const std::string& caminho_arquivo);
+
 // Extração genérica de links e mídias de documentos HTML, texto e playlists M3U/M3U8
 std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, const std::string& base_url, const std::string& modo);

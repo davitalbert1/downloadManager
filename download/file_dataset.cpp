@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <vector>
 
@@ -48,6 +50,92 @@ static size_t escrever_arquivo_cb(char* ptr, size_t tam, size_t nmemb, void* ud)
     out->write(ptr, tam * nmemb);
     return tam * nmemb;
 }
+
+// Escritor assíncrono de disco
+// O curl empurra blocos de dados para uma fila limitada; uma thread separada
+// consome e grava em disco, desacoplando rede e I/O de disco.
+class AsyncFileWriter {
+public:
+    explicit AsyncFileWriter(const std::string& caminho, size_t max_blocos = 64)
+        : arq_(caminho, std::ios::binary), max_(max_blocos), ok_(arq_.good()) {
+        if (ok_) {
+            writer_ = std::thread([this] {
+                loop_escrita();
+            });
+        }
+    }
+
+    ~AsyncFileWriter() {
+        close();
+    }
+
+    AsyncFileWriter(const AsyncFileWriter&) = delete;
+    AsyncFileWriter& operator=(const AsyncFileWriter&) = delete;
+
+    bool good() const {
+        return ok_.load();
+    }
+
+    // Chamado pelo callback do curl (thread de rede)
+    bool push(const char* dados, size_t n) {
+        if (!ok_.load()) return false;
+        std::vector<char> bloco(dados, dados + n);
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_cheia_.wait(lk, [&] {
+                return fila_.size() < max_ || fechada_;
+            });
+            if (fechada_) return false;
+            fila_.push(std::move(bloco));
+        }
+        cv_vazia_.notify_one();
+        return true;
+    }
+
+    // Sinaliza que não há mais dados e espera a thread terminar
+    void close() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            fechada_ = true;
+        }
+        cv_vazia_.notify_one();
+        cv_cheia_.notify_all();
+        if (writer_.joinable()) writer_.join();
+        if (arq_.is_open()) arq_.close();
+    }
+
+private:
+    void loop_escrita() {
+        while (true) {
+            std::vector<char> bloco;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_vazia_.wait(lk, [&] {
+                    return !fila_.empty() || fechada_;
+                });
+                if (fila_.empty()) break; // fechada_ e vazia
+                bloco = std::move(fila_.front());
+                fila_.pop();
+            }
+            cv_cheia_.notify_one();
+            arq_.write(bloco.data(), static_cast<std::streamsize>(bloco.size()));
+            if (!arq_.good()) {
+                ok_.store(false);
+                break;
+            }
+        }
+    }
+
+    std::ofstream arq_;
+    size_t max_;
+    std::atomic<bool> ok_;
+    bool fechada_ = false;
+    std::queue<std::vector<char>> fila_;
+    std::mutex mtx_;
+    std::condition_variable cv_cheia_;
+    std::condition_variable cv_vazia_;
+    std::thread writer_;
+};
 
 static RespostaHttpAvancada http_post_json(const std::string& url,
                                            const std::string& json_body,
@@ -193,6 +281,7 @@ struct DownloadProgressContext {
     std::string tag;
     std::chrono::steady_clock::time_point ult_log;
     double ultimo_pct = -1.0;
+    int ultimo_marco = -1; // último marco de 10% impresso (0,1,...,10)
 };
 
 static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) {
@@ -206,16 +295,18 @@ static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow
     double total_mb = static_cast<double>(dltotal) / (1024.0 * 1024.0);
     double pct = (total_mb > 0.0) ? (baixado_mb / total_mb * 100.0) : 0.0;
 
-    // Vários workers baixam ao mesmo tempo. Em vez de sobrescrever a mesma linha
-    // com '\r' (o que empilhava os itens uns sobre os outros), cada atualização é
-    // impressa em sua própria linha via log(), que serializa a saída com mutex.
-    // Assim os workers aparecem empilhados e em ordem, sem se sobreporem.
-    // Reduz a frequência: imprime no início, a cada ~1s quando o % avança >= 2,
-    // e sempre na conclusão (100%).
+    // Com vários workers, cada atualização é impressa em sua própria linha via
+    // log(), que serializa a saída com mutex. Para não inundar o terminal,
+    // imprime apenas em marcos de 10% (0%, 10%, 20% ... 100%) ou a cada 10s.
+    int marco_atual = static_cast<int>(pct / 10.0);
     bool inicio = (ctx->ultimo_pct < 0.0);
-    if (concluido || (dec >= 1.0 && (inicio || pct - ctx->ultimo_pct >= 2.0))) {
+    bool novo_marco = (marco_atual > ctx->ultimo_marco);
+    bool tempo_suficiente = (dec >= 10.0);
+
+    if (concluido || inicio || novo_marco || tempo_suficiente) {
         ctx->ult_log = agora;
         ctx->ultimo_pct = pct;
+        ctx->ultimo_marco = marco_atual;
 
         char buf[200];
         std::snprintf(buf, sizeof(buf), "  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%)",
@@ -225,13 +316,20 @@ static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow
     return 0;
 }
 
+static size_t escrever_async_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
+    auto* writer = static_cast<AsyncFileWriter*>(ud);
+    size_t total = tam * nmemb;
+    if (!writer->push(ptr, total)) return 0; // aborta curl se escrita falhou
+    return total;
+}
+
 static bool http_download_stream(const std::string& url,
                                  const std::string& caminho_destino,
                                  const std::string& api_key,
                                  const std::string& tag,
                                  double timeout_sec = 1800.0) {
-    std::ofstream arq(caminho_destino, std::ios::binary);
-    if (!arq) return false;
+    AsyncFileWriter writer(caminho_destino);
+    if (!writer.good()) return false;
 
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -260,8 +358,8 @@ static bool http_download_stream(const std::string& url,
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &arq);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_async_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &writer);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_xfer_info_cb);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &prog_ctx);
@@ -275,10 +373,10 @@ static bool http_download_stream(const std::string& url,
 
     if (headers) curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    arq.close();
+    writer.close(); // drena a fila pendente e fecha o arquivo
 
-    if (rc != CURLE_OK || status < 200 || status >= 300) {
-        log("\n[ERRO] Download HTTP " + std::to_string(status) + " para " + tag);
+    if (rc != CURLE_OK || status < 200 || status >= 300 || !writer.good()) {
+        log("[ERRO] Download HTTP " + std::to_string(status) + " para " + tag);
         return false;
     }
 
@@ -294,7 +392,7 @@ static bool http_download_stream(const std::string& url,
     if (inicio_str.rfind("<?xml", 0) == 0 || inicio_str.rfind("<html", 0) == 0 ||
         inicio_str.rfind("<!DOCTYPE", 0) == 0 || inicio_str.rfind("{\"error\"", 0) == 0 ||
         inicio_str.rfind("{\"code\"", 0) == 0) {
-        log("\n[ERRO] Servidor retornou mensagem de erro para " + tag + ": " + inicio_str.substr(0, 150));
+        log("[ERRO] Servidor retornou mensagem de erro para " + tag + ": " + inicio_str.substr(0, 150));
         return false;
     }
 

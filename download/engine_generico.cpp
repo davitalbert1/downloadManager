@@ -365,10 +365,10 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
         }
     }
 
-    std::cout << "[DB] Tarefas: " << tarefas.size() << " blocos, " << falt
-              << " dia x chave pendentes.\n";
+    log("[DB] Tarefas: " + std::to_string(tarefas.size()) + " blocos, " +
+        std::to_string(falt) + " dia x chave pendentes.");
     if (tarefas.empty()) {
-        std::cout << "[DB] Nada a fazer.\n";
+        log("[DB] Nada a fazer.");
         return 0;
     }
 
@@ -380,8 +380,9 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
     std::atomic<size_t> idx_t{0};
     std::atomic<long long> feitas{0};
 
-    std::cout << "\nIniciando " << total << " tarefas (" << CFG.download_workers
-              << " download_workers, " << CFG.process_workers << " process_workers)...\n\n";
+    log("\nIniciando " + std::to_string(total) + " tarefas (" +
+        std::to_string(CFG.download_workers) + " download_workers, " +
+        std::to_string(CFG.process_workers) + " process_workers)...\n");
 
     std::vector<std::thread> consumidores;
     for (int i = 0; i < CFG.process_workers; ++i) {
@@ -398,10 +399,9 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
                                          .count();
                         char buf[160];
                         std::snprintf(buf, sizeof(buf),
-                                      "\r[PROGRESSO] %lld/%lld blocos (%.1f%%) - %.0fs", c,
+                                      "[PROGRESSO] %lld/%lld blocos (%.1f%%) - %.0fs", c,
                                       total, pct, dec);
-                        std::lock_guard<std::mutex> lk(g_print_mtx);
-                        std::cout << buf << std::flush;
+                        log(buf);
                     }
                 }
             } catch (const std::exception& e) {
@@ -433,17 +433,20 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
     for (auto& t : consumidores) t.join();
 
     double tt = std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();
-    std::cout << "\n\n============================================================\n"
-              << "DOWNLOAD CONCLUIDO: " << CFG.datasets[di_inicio].id << "\n"
-              << "============================================================\n"
-              << "Tempo: " << tt << "s\n"
-              << "Blocos processados: " << concluidos.load() << "/" << total << "\n--- RESUMO ---\n";
+    char tt_buf[32];
+    std::snprintf(tt_buf, sizeof(tt_buf), "%.1f", tt);
+    log("\n\n============================================================");
+    log("DOWNLOAD CONCLUIDO: " + CFG.datasets[di_inicio].id);
+    log("============================================================");
+    log("Tempo: " + std::string(tt_buf) + "s");
+    log("Blocos processados: " + std::to_string(concluidos.load()) + "/" +
+        std::to_string(total) + "\n--- RESUMO ---");
     for (size_t di = di_inicio; di < di_fim; ++di) {
         if (CFG.datasets[di].tipo_saida == "arquivo") continue;
-        std::cout << CFG.datasets[di].id << " (" << CFG.datasets[di].db << "."
-                  << CFG.datasets[di].tabela << "): " << baixados[di]
-                  << " registros novos | " << pulados[di] << " ja existentes\n";
+        log(CFG.datasets[di].id + " (" + CFG.datasets[di].db + "." +
+            CFG.datasets[di].tabela + "): " + std::to_string(baixados[di]) +
+            " registros novos | " + std::to_string(pulados[di]) + " ja existentes");
     }
-    std::cout << "============================================================\n";
+    log("============================================================");
     return 0;
 }

@@ -44,11 +44,11 @@ void carregar_env(const std::string& caminho) {
         }
         if (!k.empty()) {
             g_env_map[k] = v;
-#ifdef _WIN32
-            _putenv_s(k.c_str(), v.c_str());
-#else
-            setenv(k.c_str(), v.c_str(), 0);
-#endif
+            #ifdef _WIN32
+                _putenv_s(k.c_str(), v.c_str());
+            #else
+                setenv(k.c_str(), v.c_str(), 0);
+            #endif
         }
     }
 }
@@ -91,8 +91,7 @@ bool Ini::obter(const std::string& sec, const std::string& chave, std::string& s
     return true;
 }
 
-std::string Ini::obter_ou(const std::string& sec, const std::string& chave,
-                          const std::string& padrao) const {
+std::string Ini::obter_ou(const std::string& sec, const std::string& chave, const std::string& padrao) const {
     std::string v;
     return obter(sec, chave, v) ? v : padrao;
 }
@@ -129,8 +128,7 @@ Ini ler_ini(const std::string& caminho) {
     }
     auto registrar_secao = [&](const std::string& secao) {
         if (!secao.empty() &&
-            std::find(ini.ordem_secoes.begin(), ini.ordem_secoes.end(), secao) ==
-                ini.ordem_secoes.end())
+            std::find(ini.ordem_secoes.begin(), ini.ordem_secoes.end(), secao) == ini.ordem_secoes.end())
             ini.ordem_secoes.push_back(secao);
     };
     std::string linha, secao;
@@ -193,8 +191,9 @@ Ini ler_ini(const std::string& caminho) {
 }
 
 static const DimensaoCfg* achar_dim(const std::string& nome) {
-    for (const auto& d : CFG.dimensoes)
+    for (const auto& d : CFG.dimensoes) {
         if (d.nome == nome) return &d;
+    }
     return nullptr;
 }
 
@@ -225,8 +224,9 @@ std::vector<Contexto> contextos_do_eixo(const std::string& eixo) {
         } else if (linha.size() == 1) {
             ctx[dim->nome] = linha[0];
         } else {
-            for (size_t i = 0; i < linha.size(); ++i)
+            for (size_t i = 0; i < linha.size(); ++i) {
                 ctx[dim->nome + "_" + std::to_string(i)] = linha[i];
+            }
         }
         out.push_back(std::move(ctx));
     }
@@ -326,9 +326,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         }
 
         std::string hrs_str = ini.obter_ou(secao, "horarios");
-        if (!hrs_str.empty()) {
-            d.horarios = dividir(hrs_str, ',');
-        }
+        if (!hrs_str.empty()) d.horarios = dividir(hrs_str, ',');
 
         d.bloco = cortar(ini.obter_ou(secao, "bloco"));
         if (d.bloco.empty()) d.bloco = cortar(ini.obter_ou(secao, "block"));
@@ -353,12 +351,9 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
             std::map<std::string, std::string> defs;
             for (const auto& kv : it_sec->second) {
                 std::string resto;
-                if (kv.first.rfind("coluna.", 0) == 0)
-                    resto = kv.first.substr(7);
-                else if (kv.first.rfind("column.", 0) == 0)
-                    resto = kv.first.substr(7);
-                else
-                    continue;
+                if (kv.first.rfind("coluna.", 0) == 0) resto = kv.first.substr(7);
+                else if (kv.first.rfind("column.", 0) == 0) resto = kv.first.substr(7);
+                else continue;
                 resto = cortar(resto);
                 if (!resto.empty()) defs[resto] = kv.second;
             }
@@ -458,29 +453,25 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
 
         std::string idatas = cortar(ini.obter_ou(secao, "iterar_datas"));
         if (idatas.empty()) idatas = cortar(ini.obter_ou(secao, "iterate_dates"));
-        if (!idatas.empty())
-            d.iterar_datas = para_bool(idatas, true);
-        else
-            d.iterar_datas = (d.granularidade != "nenhuma");
+        if (!idatas.empty()) d.iterar_datas = para_bool(idatas, true);
+        else d.iterar_datas = (d.granularidade != "nenhuma");
 
         if (d.usar_coordenadas) {
             bool tem_coord = false;
-            for (const auto& e : d.eixos)
+            for (const auto& e : d.eixos) {
                 if (e == "coordenadas" || e == "coordinates") tem_coord = true;
+            }
             if (!tem_coord) d.eixos.insert(d.eixos.begin(), "coordenadas");
         }
 
-        if (d.tipo_saida == "arquivo" && d.url.empty()) {
-            d.url = obter_env_ou_config("API_URL", "", "");
-        }
+        if (d.tipo_saida == "arquivo" && d.url.empty()) d.url = obter_env_ou_config("API_URL", "", "");
 
         if (d.url.empty()) {
             std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
         if (d.vars.empty() && d.tipo_saida != "arquivo")
-            std::cerr << "[WARNING] Dataset '" << d.id
-                      << "': sem 'vars' - a API decide o que retorna.\n";
+            std::cerr << "[WARNING] Dataset '" << d.id << "': sem 'vars' - a API decide o que retorna.\n";
         out.push_back(std::move(d));
     }
     return out;

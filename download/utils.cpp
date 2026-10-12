@@ -4,18 +4,27 @@
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+
+namespace fs = std::filesystem;
 
 static std::mutex g_print_mtx;
 
 void log(const std::string& msg) {
     std::lock_guard<std::mutex> lk(g_print_mtx);
-    std::cout << msg << std::endl;
+    // Escreve mensagem + '\n' num único fwrite para evitar que outra thread
+    // intercale saída entre a mensagem e a quebra de linha.
+    std::string linha = msg;
+    linha.push_back('\n');
+    fwrite(linha.data(), 1, linha.size(), stdout);
+    fflush(stdout);
 }
 
 std::string cortar(const std::string& s) {
@@ -201,11 +210,11 @@ std::string data_texto(const Data& d) {
 std::tm agora_local() {
     std::time_t t = std::time(nullptr);
     std::tm tmv{};
-#ifdef _WIN32
-    localtime_s(&tmv, &t);
-#else
-    localtime_r(&t, &tmv);
-#endif
+    #ifdef _WIN32
+        localtime_s(&tmv, &t);
+    #else
+        localtime_r(&t, &tmv);
+    #endif
     return tmv;
 }
 
@@ -287,8 +296,31 @@ std::string obter_nome_arquivo_da_url(const std::string& url) {
     return sanitizar_nome_arquivo(name);
 }
 
-#include <regex>
-#include <sstream>
+bool garantir_pasta_pai(const std::string& caminho_arquivo) {
+    std::string caminho = cortar(caminho_arquivo);
+    if (caminho.empty()) return false;
+    // Caminhos especiais do SQLite (memoria, vazio) nao tem pasta.
+    std::string baixo = minusculas(caminho);
+    if (baixo == ":memory:" || baixo.rfind("file:", 0) == 0) return true;
+    try {
+        fs::path p(caminho);
+        fs::path pai = p.parent_path();
+        if (pai.empty() || pai == "." || pai == "./") return true; // ex: "clima.db" -> pasta atual
+        std::error_code ec;
+        bool criado = fs::create_directories(pai, ec);
+        if (ec) {
+            log("[WARNING] Nao foi possivel criar pasta '" + pai.string() +
+                "' para o banco '" + caminho + "': " + ec.message());
+            return false;
+        }
+        if (criado) log("[DB] Pasta criada: " + pai.string() + " (para " + caminho + ")");
+        return true;
+    } catch (const std::exception& e) {
+        log(std::string("[WARNING] Nao foi possivel criar pasta para '") + caminho +
+            "': " + e.what());
+        return false;
+    }
+}
 
 std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, const std::string& base_url, const std::string& modo) {
     std::vector<std::string> urls;

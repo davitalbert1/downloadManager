@@ -1,8 +1,5 @@
-clima.db
 __pycache__
 TODO.md
-clima.db-shm
-clima.db-wal
 *.txt
 !CMakeLists.txt
 build/
@@ -11,4 +8,7 @@ dados_era5/
 *.part.grib
 *.part.nc
 *.exe
+*.db
+*.db-shm
+*.db-wal
 config.ini
