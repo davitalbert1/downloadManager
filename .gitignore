@@ -14,3 +14,4 @@ dados/
 *.db-wal
 config.ini
 imgui
+service_account.json
