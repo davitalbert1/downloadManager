@@ -74,6 +74,16 @@ struct DatasetCfg {
     std::string padrao_extracao; // Regex para extrair URLs em páginas HTML/texto (ou "html_imgs", "html_links", "m3u")
     bool usar_yt_dlp = false; // Se true e for stream/video suportado, usa yt-dlp como fallback
     int tamanho_min_bytes = 0; // Se > 0, descarta arquivos menores que isso (evita imagens corrompidas/placeholders)
+
+    // Suporte ao Google Drive
+    std::string drive_folder_id;
+    std::string drive_service_account;
+
+    // Follow links detalhados para APIs com endpoint mestre-detalhe (ex: PokeAPI, Swapi, Rick&Morty)
+    bool seguir_url_detalhe = false; // Se true, acessa cada 'url' do registro para baixar o objeto completo
+    std::string campo_url_detalhe = "url"; // Campo que traz a URL de detalhe (padrao: "url")
+    bool baixar_todas_imagens = false; // Se true, busca todas as URLs de imagem (.png, .jpg, .svg) nos objetos
+    std::string pasta_imagens = "imagens"; // Subpasta/pasta para salvar imagens encontradas
 };
 
 struct DimensaoCfg {

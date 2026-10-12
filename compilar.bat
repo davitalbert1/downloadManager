@@ -1,49 +1,131 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-:: Compila download.cpp com o toolchain MinGW64 do MSYS2
-set "GXX=D:\msys64\mingw64\bin\g++.exe"
+echo ============================================================
+echo   SISTEMA DE COMPILACAO AUTOMATICA VIA CMAKE
+echo ============================================================
 
-if not exist "%GXX%" (
-    for %%D in (A B C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
-        if exist "%%D:\msys64\mingw64\bin\g++.exe" set "GXX=%%D:\msys64\mingw64\bin\g++.exe"
-        if exist "%%D:\mingw64\mingw64\bin\g++.exe"  set "GXX=%%D:\mingw64\mingw64\bin\g++.exe"
+:: 1. Deteccao automatica do MinGW / GCC
+set "MINGW_DIR="
+if exist "D:\msys64\mingw64\bin\gcc.exe" set "MINGW_DIR=D:\msys64\mingw64\bin"
+if not defined MINGW_DIR (
+    if exist "C:\msys64\mingw64\bin\gcc.exe" set "MINGW_DIR=C:\msys64\mingw64\bin"
+)
+if not defined MINGW_DIR (
+    for %%D in (C D E F G H) do (
+        if not defined MINGW_DIR (
+            if exist "%%D:\msys64\mingw64\bin\gcc.exe" set "MINGW_DIR=%%D:\msys64\mingw64\bin"
+            if exist "%%D:\mingw64\bin\gcc.exe" set "MINGW_DIR=%%D:\mingw64\bin"
+        )
     )
 )
 
-if not exist "%GXX%" (
-    echo ERRO: g++ do MinGW64 nao encontrado. Instale o MSYS2: https://www.msys2.org/
-    exit /b 1
+if defined MINGW_DIR (
+    echo [DETECTADO] MinGW toolchain: !MINGW_DIR!
+    set "PATH=!MINGW_DIR!;%PATH%"
+) else (
+    where gcc >nul 2>nul
+    if errorlevel 1 (
+        echo [ERRO] Compilador GCC / MinGW nao encontrado no sistema.
+        exit /b 1
+    )
+    echo [DETECTADO] MinGW localizado no PATH do sistema.
 )
 
-echo Compilando download.exe com:
-echo    %GXX%
+:: 2. Deteccao automatica do CMake
+set "CMAKE_EXE="
+where cmake >nul 2>nul
+if not errorlevel 1 (
+    set "CMAKE_EXE=cmake"
+) else (
+    if defined MINGW_DIR (
+        if exist "!MINGW_DIR!\cmake.exe" set "CMAKE_EXE=!MINGW_DIR!\cmake.exe"
+    )
+    if not defined CMAKE_EXE (
+        for %%D in (C D E F) do (
+            if not defined CMAKE_EXE (
+                if exist "%%D:\msys64\mingw64\bin\cmake.exe" set "CMAKE_EXE=%%D:\msys64\mingw64\bin\cmake.exe"
+                if exist "%%D:\Program Files\CMake\bin\cmake.exe" set "CMAKE_EXE=%%D:\Program Files\CMake\bin\cmake.exe"
+            )
+        )
+    )
+)
+
+if not defined CMAKE_EXE (
+    echo [ERRO] cmake.exe nao foi encontrado! Instale com 'pacman -S mingw-w64-x86_64-cmake' no MSYS2.
+    exit /b 1
+)
+echo [DETECTADO] CMake: !CMAKE_EXE!
+
+:: 3. Deteccao automatica do gerador de build (Ninja ou MinGW Makefiles)
+set "CMAKE_GENERATOR="
+where ninja >nul 2>nul
+if not errorlevel 1 (
+    set "CMAKE_GENERATOR=Ninja"
+) else (
+    if defined MINGW_DIR (
+        if exist "!MINGW_DIR!\ninja.exe" set "CMAKE_GENERATOR=Ninja"
+    )
+)
+if not defined CMAKE_GENERATOR (
+    set "CMAKE_GENERATOR=MinGW Makefiles"
+)
+echo [DETECTADO] Gerador CMake: !CMAKE_GENERATOR!
 echo.
 
-for %%I in ("%GXX%") do set "GXX_DIR=%%~dpI"
-set "PATH=%GXX_DIR%;%PATH%"
-
-"%GXX%" -std=c++17 -O2 -Wall -I. -o download.exe download/main.cpp download/utils.cpp download/config.cpp download/rate_limit.cpp download/storage_sqlite.cpp download/http_client.cpp download/json_parser.cpp download/file_dataset.cpp download/engine_generico.cpp download/era5_importer.cpp -lcurl -lsqlite3 -lgdal -pthread
-
-if errorlevel 1 (
+:: 3.5. Verificacao da dependencia Dear ImGui (dbManager\imgui)
+if not exist "dbManager\imgui\imgui.cpp" (
+    echo [AVISO] Pasta dbManager\imgui nao encontrada (ou incompleta).
+    where git >nul 2>nul
+    if errorlevel 1 (
+        echo [ERRO] 'git' nao encontrado no sistema. Instale o Git para clonar o Dear ImGui.
+        exit /b 1
+    )
+    echo [DETECTADO] Clonando repositorio Dear ImGui em dbManager\imgui ...
+    git clone --depth 1 https://github.com/ocornut/imgui.git "dbManager\imgui"
+    if errorlevel 1 (
+        echo.
+        echo [ERRO] Falha ao clonar o repositorio do Dear ImGui!
+        exit /b 1
+    )
+    echo [OK] Dear ImGui clonado com sucesso.
     echo.
-    echo Falha na compilacao do download.exe.
-    exit /b 1
+) else (
+    echo [DETECTADO] Dear ImGui: dbManager\imgui
 )
 
-echo Compilando era5_import.exe com GDAL e SQLite3...
-"%GXX%" -std=c++17 -O2 -Wall -I. -o era5_import.exe download/era5_main.cpp download/era5_importer.cpp -lgdal -lsqlite3 -pthread
+:: 4. Configuracao do Projeto via CMake
+echo [1/2] Configurando projeto CMake (pasta build)...
+if not exist "build" mkdir "build"
 
+"!CMAKE_EXE!" -S . -B build -G "!CMAKE_GENERATOR!" -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 (
     echo.
-    echo Falha na compilacao do era5_import.exe.
+    echo [ERRO] Falha ao configurar projeto com CMake.
+    exit /b 1
+)
+echo.
+
+:: 5. Compilacao de todos os alvos via CMake
+echo [2/2] Compilando todos os executaveis via CMake...
+"!CMAKE_EXE!" --build build --config Release
+if errorlevel 1 (
+    echo.
+    echo [ERRO] Falha durante a compilacao dos executaveis!
     exit /b 1
 )
 
 echo.
-echo OK: download.exe e era5_import.exe gerados.
-echo Uso:
-echo   download.exe [caminho_do_ini]
-echo   era5_import.exe [--pasta dados_era5] [--db clima.db] [--tabela era5_horario]
+echo ============================================================
+echo  TODOS OS EXECUTAVEIS COMPILADOS COM SUCESSO VIA CMAKE!
+echo ============================================================
+echo   - download.exe       (Download generico, ERA5 e Google Drive)
+echo   - era5_import.exe    (Importador GRIB ERA5 para SQLite)
+echo   - dbManager.exe      (Interface grafica ImGui DirectX 11)
+echo   - clima_auditor.exe  (Auditor e verificador SQLite)
+if exist "build\clima_viewer.exe" (
+echo   - clima_viewer.exe   (Interface Qt 6)
+)
+echo ============================================================
 endlocal

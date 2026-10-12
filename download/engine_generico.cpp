@@ -18,11 +18,6 @@ static std::mutex g_write_mtx;
 static std::mutex g_stats_mtx;
 static std::mutex g_print_mtx;
 
-static const ConjuntoDatas& datas_vazias() {
-    static const ConjuntoDatas vazio;
-    return vazio;
-}
-
 static std::mt19937& rng() {
     static thread_local std::mt19937 gen{
         static_cast<std::mt19937::result_type>(std::random_device{}() ^
@@ -167,6 +162,62 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
             std::set<std::string> filtro(grupo.begin(), grupo.end());
             const std::set<std::string>* pf = ds.iterar_datas ? &filtro : nullptr;
             auto regs = parse_json_generico(*dados, ds, ctx, pf, false, bloco_req);
+
+            // Se ds.seguir_url_detalhe estiver ativado, cada registro que contenha uma URL de detalhe
+            // (ex: pokeapi.co/api/v2/pokemon/1/) eh baixado para enriquecer o registro com o objeto completo
+            if (ds.seguir_url_detalhe && !regs.empty()) {
+                std::string col_url = ds.campo_url_detalhe.empty() ? "url" : ds.campo_url_detalhe;
+                log("[DETALHES] Enriquecendo " + std::to_string(regs.size()) + " registros via " + col_url + "...");
+                size_t num_det = 0;
+                for (auto& reg : regs) {
+                    num_det++;
+                    auto it_url = reg.find(col_url);
+                    if (it_url != reg.end() && std::holds_alternative<std::string>(it_url->second)) {
+                        std::string sub_url = std::get<std::string>(it_url->second);
+                        if (sub_url.rfind("http", 0) == 0) {
+                            auto sub_dados = baixar_com_retry(sub_url, {}, CFG.max_retries, 0.5, chave_api,
+                                                              "GET", hdrs, "", ds.api_key_em);
+                            if (sub_dados && sub_dados->is_object()) {
+                                // Parseia o objeto detalhado e faz merge no registro
+                                auto sub_regs = parse_objeto(*sub_dados, *sub_dados, ds, ctx);
+                                if (!sub_regs.empty()) {
+                                    for (const auto& kv : sub_regs.front()) {
+                                        reg[kv.first] = kv.second;
+                                    }
+                                }
+                                std::string item_nome;
+                                auto it_nom = reg.find("name");
+                                if (it_nom == reg.end()) it_nom = reg.find("nome");
+                                if (it_nom != reg.end() && std::holds_alternative<std::string>(it_nom->second)) {
+                                    item_nome = std::get<std::string>(it_nom->second);
+                                }
+                                if (num_det % 10 == 0 || num_det == regs.size()) {
+                                    log("  [DETALHE " + std::to_string(num_det) + "/" + std::to_string(regs.size()) + "] " + item_nome);
+                                }
+                                // Se baixar_todas_imagens estiver habilitado, baixa os sprites/imagens
+                                if (ds.baixar_todas_imagens) {
+                                    std::vector<std::string> imgs;
+                                    extrair_todas_urls_imagens(*sub_dados, imgs);
+                                    if (!imgs.empty()) {
+                                        std::string pasta = resolver_pasta_saida(ds.pasta_imagens, "imagens", "PASTA_IMAGENS");
+                                        std::filesystem::path base_pasta(pasta);
+                                        std::filesystem::path sub_pasta = base_pasta;
+                                        if (!item_nome.empty()) {
+                                            sub_pasta = base_pasta / sanitizar_nome_arquivo(item_nome);
+                                        }
+                                        for (const auto& img_url : imgs) {
+                                            std::string fn = obter_nome_arquivo_da_url(img_url);
+                                            std::filesystem::path dest = sub_pasta / fn;
+                                            baixar_arquivo_seguro(img_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             todos.insert(todos.end(), std::make_move_iterator(regs.begin()),
                          std::make_move_iterator(regs.end()));
         }
@@ -182,6 +233,16 @@ static std::optional<ResultadoGenerico> baixar_bloco_generico(
     dormir(jitter(rng()));
     const DatasetCfg& ds = CFG.datasets[dataset_idx];
     std::vector<std::string> faltantes;
+    // Datasets sem data: sempre 1 download (idempotencia ja checada na
+    // montagem das tarefas via contar_linhas_tabela).
+    if (!ds.iterar_datas) {
+        ResultadoGenerico r;
+        r.dataset_idx = dataset_idx;
+        r.chave_existentes = chave_existentes;
+        r.ctx = ctx_tarefa;
+        r.registros = baixar_dataset_bloco(ds, datas, ctx_tarefa);
+        return r;
+    }
     {
         std::shared_lock lk(g_mtx_existentes);
         auto it = existentes.find(dataset_idx);
@@ -210,6 +271,19 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
                                std::map<size_t, long long>& baixados,
                                std::map<size_t, long long>& pulados) {
     const DatasetCfg& ds = CFG.datasets[r.dataset_idx];
+    // Datasets sem data: "baixados" = nº de registros; sem conta de dias.
+    if (!ds.iterar_datas) {
+        if (r.registros.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(g_write_mtx);
+            salvar_dataset(ds, r.registros);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_stats_mtx);
+            baixados[r.dataset_idx] += static_cast<long long>(r.registros.size());
+        }
+        return;
+    }
     long long dias_retornados = 0;
     {
         std::set<std::string> dias;
@@ -233,7 +307,7 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
 
     // Se o dataset tiver baixar_arquivos_vinculados ativado (como imagens de pokemons, assets, etc.)
     if (ds.baixar_arquivos_vinculados && !ds.campo_url_arquivo.empty()) {
-        std::string pasta = ds.pasta_saida.empty() ? ("arquivos_" + ds.id) : ds.pasta_saida;
+        std::string pasta = resolver_pasta_saida(ds.pasta_saida, "arquivos_" + ds.id, "PASTA_SAIDA");
         for (const auto& reg : r.registros) {
             auto it_u = reg.find(ds.campo_url_arquivo);
             if (it_u != reg.end() && std::holds_alternative<std::string>(it_u->second)) {
@@ -291,8 +365,21 @@ int executar_generico(const std::vector<std::string>& datas, double tempo_load,
         const DatasetCfg& ds = CFG.datasets[di];
         if (ds.tipo_saida == "arquivo") continue;
 
+        // Datasets sem data (ex: PokeAPI records): 1 tarefa por contexto.
+        // Sem isso, 1940-2025 vira 31412 dias x 1 coord = 1048 blocos
+        // identicos baixando a mesma URL repetidamente.
+        if (!ds.iterar_datas) {
+            auto contextos = expandir_contextos(ds);
+            for (const auto& ctx : contextos) {
+                if (contar_linhas_tabela(ds) > 0) continue; // idempotente
+                tarefas.push_back({di, {}, "", ctx});
+                falt += 1;
+            }
+            continue;
+        }
+
         // Se o dataset usar coordenadas (ou tiver coordenadas como eixo)
-        if (ds.usar_coordenadas || CFG.coordenadas.empty()) {
+        if (ds.usar_coordenadas || !CFG.coordenadas.empty()) {
             std::vector<std::pair<double, double>> lista_coords = CFG.coordenadas;
             if (lista_coords.empty()) {
                 lista_coords.push_back({0.0, 0.0});

@@ -47,6 +47,9 @@ std::vector<std::string> colunas_chave(const DatasetCfg& ds) {
         }
         return out;
     }
+    // Se o dataset não iterar datas (ex: PokeAPI records), tenta inferir chave primária lógica
+    // como 'id', 'name' ou 'nome', se disponível, para permitir UPSERT e evitar duplicação
+    if (!ds.iterar_datas) return {};
     std::vector<std::string> chave;
     if (!ds.chave_data.empty()) chave.push_back(ds.chave_data);
     if (ds.salvar_hora && !ds.chave_hora.empty() && ds.chave_hora != ds.chave_data)
@@ -63,9 +66,7 @@ std::vector<std::string> colunas_chave(const DatasetCfg& ds) {
     return chave;
 }
 
-static std::string inferir_tipo_coluna(const std::string& declarado,
-                                       const std::vector<Registro>& regs,
-                                       const std::string& coluna) {
+static std::string inferir_tipo_coluna(const std::string& declarado, const std::vector<Registro>& regs, const std::string& coluna) {
     if (declarado == "integer") return "INTEGER";
     if (declarado == "real") return "REAL";
     if (declarado == "text") return "TEXT";
@@ -81,10 +82,8 @@ static std::string inferir_tipo_coluna(const std::string& declarado,
             break;
         }
         double v = std::get<double>(it->second);
-        if (std::floor(v) == v && std::fabs(v) < 9e15)
-            viu_int = true;
-        else
-            viu_real = true;
+        if (std::floor(v) == v && std::fabs(v) < 9e15) viu_int = true;
+        else viu_real = true;
     }
     if (viu_texto) return "TEXT";
     if (viu_real) return "REAL";
@@ -114,7 +113,7 @@ std::vector<std::string> colunas_da_tabela(sqlite3* conn, const std::string& tab
 void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra) {
     sqlite3* conn = get_connection_para(ds.db);
     std::vector<std::string> ordem;
-    if (!ds.chave_data.empty()) ordem.push_back(ds.chave_data);
+    if (!ds.chave_data.empty() && ds.iterar_datas) ordem.push_back(ds.chave_data);
     if (ds.salvar_hora && !ds.chave_hora.empty() && ds.chave_hora != ds.chave_data)
         ordem.push_back(ds.chave_hora);
     if (ds.usar_coordenadas) {
@@ -125,8 +124,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
         if (std::find(ordem.begin(), ordem.end(), c) == ordem.end()) ordem.push_back(c);
     }
     for (const auto& c : ds.colunas) {
-        if (std::find(ordem.begin(), ordem.end(), c.coluna) == ordem.end())
-            ordem.push_back(c.coluna);
+        if (std::find(ordem.begin(), ordem.end(), c.coluna) == ordem.end()) ordem.push_back(c.coluna);
     }
     for (const auto& r : amostra) {
         for (const auto& kv : r) {
@@ -150,13 +148,27 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
             std::string decl = "auto";
             auto it = tipo_decl.find(col);
             if (it != tipo_decl.end()) decl = it->second;
-            sql += (prim ? "  " : ", ") + col + " " + inferir_tipo_coluna(decl, amostra, col) + "\n";
+            sql += (prim ? "  \"" : ", \"") + col + "\" " + inferir_tipo_coluna(decl, amostra, col) + "\n";
             prim = false;
         }
         sql += ", created_at TEXT";
         std::vector<std::string> chave = colunas_chave(ds);
-        if (!chave.empty()) sql += ",\n  UNIQUE (" + juntar(chave, ", ") + ")\n)";
-        else sql += "\n)";
+        if (!chave.empty()) {
+            sql += ",\n  UNIQUE (\"" + juntar(chave, "\", \"") + "\")\n)";
+        } else if (!ds.iterar_datas) {
+            // Se for dataset de registros sem data (ex: API REST), tenta UNIQUE em 'name', 'id' ou 'url'
+            std::string ucol;
+            for (const auto& c : {"id", "name", "nome", "url"}) {
+                if (std::find(ordem.begin(), ordem.end(), c) != ordem.end()) {
+                    ucol = c;
+                    break;
+                }
+            }
+            if (!ucol.empty()) sql += ",\n  UNIQUE (\"" + ucol + "\")\n)";
+            else sql += "\n)";
+        } else {
+            sql += "\n)";
+        }
         executar_sql(conn, sql);
         log("[DB] Tabela criada: " + ds.db + "." + ds.tabela + " (" +
             std::to_string(ordem.size()) + " colunas)");
@@ -166,20 +178,52 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
                 std::string decl = "auto";
                 auto it = tipo_decl.find(col);
                 if (it != tipo_decl.end()) decl = it->second;
-                executar_sql(conn, "ALTER TABLE \"" + ds.tabela + "\" ADD COLUMN " + col +
-                                       " " + inferir_tipo_coluna(decl, amostra, col));
+                executar_sql(conn, "ALTER TABLE \"" + ds.tabela + "\" ADD COLUMN \"" + col +
+                                       "\" " + inferir_tipo_coluna(decl, amostra, col));
                 log("[DB] Coluna adicionada: " + ds.tabela + "." + col);
             }
         }
         if (std::find(existentes.begin(), existentes.end(), "created_at") == existentes.end())
             executar_sql(conn, "ALTER TABLE \"" + ds.tabela + "\" ADD COLUMN created_at TEXT");
+        // Migracao: datasets sem data criados antes do fix tem coluna "data"
+        // fantasma (toda NULL) + UNIQUE(data). Remove para nao poluir.
+        if (!ds.iterar_datas && !ds.chave_data.empty() &&
+            std::find(existentes.begin(), existentes.end(), ds.chave_data) != existentes.end()) {
+            bool so_nulos = true;
+            {
+                std::string q = "SELECT COUNT(*) FROM \"" + ds.tabela + "\" WHERE \"" +
+                                ds.chave_data + "\" IS NOT NULL";
+                sqlite3_stmt* st = nullptr;
+                if (sqlite3_prepare_v2(conn, q.c_str(), -1, &st, nullptr) == SQLITE_OK) {
+                    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int64(st, 0) > 0)
+                        so_nulos = false;
+                }
+                sqlite3_finalize(st);
+            }
+            if (so_nulos) {
+                executar_sql(conn, "DROP INDEX IF EXISTS idx_" + ds.tabela + "_chave");
+                executar_sql(conn, "DROP INDEX IF EXISTS idx_" + ds.tabela + "_date");
+                std::string tmp = ds.tabela + "_mig";
+                std::vector<std::string> keep;
+                for (const auto& c : existentes)
+                    if (c != ds.chave_data) keep.push_back("\"" + c + "\"");
+                if (!keep.empty()) {
+                    executar_sql(conn, "DROP TABLE IF EXISTS \"" + tmp + "\"");
+                    executar_sql(conn, "CREATE TABLE \"" + tmp + "\" AS SELECT " +
+                                           juntar(keep, ", ") + " FROM \"" + ds.tabela + "\"");
+                    executar_sql(conn, "DROP TABLE \"" + ds.tabela + "\"");
+                    executar_sql(conn, "ALTER TABLE \"" + tmp + "\" RENAME TO \"" + ds.tabela + "\"");
+                    log("[DB] Coluna fantasma removida: " + ds.tabela + "." + ds.chave_data);
+                }
+            }
+        }
     }
     auto chave_idx = colunas_chave(ds);
     if (!chave_idx.empty()) {
         executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_chave ON \"" +
                                ds.tabela + "\"(" + juntar(chave_idx, ", ") + ")");
     }
-    if (!ds.chave_data.empty())
+    if (!ds.chave_data.empty() && ds.iterar_datas)
         executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_date ON \"" +
                                ds.tabela + "\"(\"" + ds.chave_data + "\")");
 }
@@ -187,6 +231,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
 void criar_tabelas_datasets() {
     for (const auto& ds : CFG.datasets) {
         if (ds.tipo_saida == "arquivo") continue;
+        if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) continue;
         try {
             std::vector<Registro> vazio;
             garantir_tabela(ds, vazio);
@@ -223,18 +268,51 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
 
     std::vector<std::string> chave = colunas_chave(ds);
 
-    std::vector<std::string> marc(campos.size() + 1, "?");
-    std::string sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos, ",") +
-                      ", created_at) VALUES (" + juntar(marc, ",") + ")";
-    std::vector<std::string> upd;
-    for (const auto& c : campos) {
-        if (std::find(chave.begin(), chave.end(), c) == chave.end())
-            upd.push_back("\"" + c + "\"=excluded.\"" + c + "\"");
+    std::string sql;
+    if (!ds.iterar_datas && chave.empty()) {
+        // Sem data e sem chave declarada:
+        // Verifica se a tabela possui UNIQUE na coluna 'name', 'id' ou 'url' para evitar registros duplicados
+        std::string fallback_unique;
+        for (const std::string& col_candidata : {"id", "name", "nome", "url"}) {
+            if (std::find(campos.begin(), campos.end(), col_candidata) != campos.end()) {
+                fallback_unique = col_candidata;
+                break;
+            }
+        }
+        std::vector<std::string> campos_aspas;
+        for (const auto& c : campos) campos_aspas.push_back("\"" + c + "\"");
+
+        std::vector<std::string> marc(campos.size() + 1, "?");
+        sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos_aspas, ",") +
+              ", created_at) VALUES (" + juntar(marc, ",") + ")";
+        if (!fallback_unique.empty()) {
+            std::vector<std::string> upd;
+            for (const auto& c : campos) {
+                if (c != fallback_unique) upd.push_back("\"" + c + "\"=excluded.\"" + c + "\"");
+            }
+            if (!upd.empty()) {
+                sql += " ON CONFLICT(\"" + fallback_unique + "\") DO UPDATE SET " + juntar(upd, ",");
+            } else {
+                sql += " ON CONFLICT DO NOTHING";
+            }
+        }
+    } else {
+        std::vector<std::string> campos_aspas;
+        for (const auto& c : campos) campos_aspas.push_back("\"" + c + "\"");
+
+        std::vector<std::string> marc(campos.size() + 1, "?");
+        sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos_aspas, ",") +
+              ", created_at) VALUES (" + juntar(marc, ",") + ")";
+        std::vector<std::string> upd;
+        for (const auto& c : campos) {
+            if (std::find(chave.begin(), chave.end(), c) == chave.end())
+                upd.push_back("\"" + c + "\"=excluded.\"" + c + "\"");
+        }
+        if (!upd.empty() && !chave.empty())
+            sql += " ON CONFLICT(\"" + juntar(chave, "\",\"") + "\") DO UPDATE SET " + juntar(upd, ",");
+        else
+            sql += " ON CONFLICT DO NOTHING";
     }
-    if (!upd.empty() && !chave.empty())
-        sql += " ON CONFLICT(\"" + juntar(chave, "\",\"") + "\") DO UPDATE SET " + juntar(upd, ",");
-    else
-        sql += " ON CONFLICT DO NOTHING";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
@@ -275,11 +353,26 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
     sqlite3_finalize(stmt);
 }
 
+long long contar_linhas_tabela(const DatasetCfg& ds) {
+    sqlite3* conn = get_connection_para(ds.db);
+    std::vector<std::string> cols = colunas_da_tabela(conn, ds.tabela);
+    if (cols.empty()) return 0;
+    std::string sql = "SELECT COUNT(*) FROM \"" + ds.tabela + "\"";
+    sqlite3_stmt* st = nullptr;
+    long long n = 0;
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
 ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas) {
     ExistentesGen out;
     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
         const DatasetCfg& ds = CFG.datasets[di];
         if (ds.tipo_saida == "arquivo") continue;
+        if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) continue;
         sqlite3* conn = get_connection_para(ds.db);
         std::vector<std::string> cols = colunas_da_tabela(conn, ds.tabela);
         bool tem_data =

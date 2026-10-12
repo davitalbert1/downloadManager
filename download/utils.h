@@ -9,6 +9,12 @@
 std::string cortar(const std::string& s);
 std::string minusculas(std::string v);
 std::string sem_comentario(const std::string& s);
+// Expande ~, %VAR%, $VAR/${VAR} e remove aspas externas; preserva path absoluto.
+std::string expandir_caminho(const std::string& caminho);
+// Resolve pasta de saída: cfg explícito tem prioridade; se vazio/igual ao padrão,
+// usa env (se informado); nunca junta CWD a path absoluto. Retorna string pronta p/ fs::path.
+std::string resolver_pasta_saida(const std::string& valor_cfg, const std::string& padrao,
+                                 const char* nome_env = nullptr);
 std::vector<std::string> dividir(const std::string& s, char sep);
 std::string juntar(const std::vector<std::string>& itens, const std::string& sep);
 std::string num_str(double v);

@@ -29,3 +29,5 @@ std::vector<Registro> parse_json_generico(const json& raiz, const DatasetCfg& ds
                                          const Contexto& ctx,
                                          const std::set<std::string>* filtro,
                                          bool forcar_hora, const std::string& bloco_req);
+
+void extrair_todas_urls_imagens(const json& j, std::vector<std::string>& urls);

@@ -21,6 +21,7 @@ sqlite3* get_connection_para(const std::string& db_path);
 
 std::vector<std::string> colunas_da_tabela(sqlite3* conn, const std::string& tabela);
 std::vector<std::string> colunas_chave(const DatasetCfg& ds);
+long long contar_linhas_tabela(const DatasetCfg& ds);
 void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra);
 void criar_tabelas_datasets();
 void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros);

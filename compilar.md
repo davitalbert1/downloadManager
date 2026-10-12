@@ -30,6 +30,12 @@ cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
+## Compilar auto
+
+```sh
+./compilar.bat
+```
+
 Isso gera:
 
 - `build/clima_viewer.exe` — visualizador Qt (lê `clima.db` do diretório atual)
@@ -41,6 +47,11 @@ Clima viewer:
 
 ```sh
 ./build/clima_viewer.exe
+```
+
+db manager:
+```sh
+./build/db_manager.exe
 ```
 
 ### Formas de execução do Downloader (`download.exe`):

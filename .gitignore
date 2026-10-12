@@ -5,6 +5,7 @@ TODO.md
 build/
 .env
 dados_era5/
+dados/
 *.part.grib
 *.part.nc
 *.exe
@@ -12,3 +13,4 @@ dados_era5/
 *.db-shm
 *.db-wal
 config.ini
+imgui

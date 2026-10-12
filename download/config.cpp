@@ -154,6 +154,7 @@ Ini ler_ini(const std::string& caminho) {
             std::string chave = cortar(linha.substr(0, igual));
             std::string valor = cortar(linha.substr(igual + 1));
             if (chave.empty()) continue;
+            if (chave == "pasta_saida" || chave == "pasta_imagens") valor = expandir_caminho(valor);
             if (chave == "vars" || chave == "colunas" || chave == "params_excluir" ||
                 chave == "lista_vars" || chave == "colunas_extra") {
                 for (auto& token : dividir(valor, ',')) {
@@ -318,6 +319,20 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.usar_yt_dlp = para_bool(ini.obter_ou(secao, "usar_yt_dlp", "0"), false);
         d.tamanho_min_bytes = para_int(ini.obter_ou(secao, "tamanho_min_bytes", "0"), 0);
 
+        d.drive_folder_id = cortar(ini.obter_ou(secao, "drive_folder_id"));
+        if (d.drive_folder_id.empty()) d.drive_folder_id = cortar(ini.obter_ou(secao, "folder_id"));
+        d.drive_service_account = cortar(ini.obter_ou(secao, "drive_service_account"));
+        if (d.drive_service_account.empty()) d.drive_service_account = cortar(ini.obter_ou(secao, "service_account"));
+
+        d.seguir_url_detalhe = para_bool(ini.obter_ou(secao, "seguir_url_detalhe", "0"), false);
+        if (!d.seguir_url_detalhe) d.seguir_url_detalhe = para_bool(ini.obter_ou(secao, "follow_detail_url", "0"), false);
+        d.campo_url_detalhe = cortar(ini.obter_ou(secao, "campo_url_detalhe", "url"));
+        if (d.campo_url_detalhe.empty()) d.campo_url_detalhe = "url";
+        d.baixar_todas_imagens = para_bool(ini.obter_ou(secao, "baixar_todas_imagens", "0"), false);
+        if (!d.baixar_todas_imagens) d.baixar_todas_imagens = para_bool(ini.obter_ou(secao, "download_all_images", "0"), false);
+        d.pasta_imagens = cortar(ini.obter_ou(secao, "pasta_imagens", "imagens"));
+        if (d.pasta_imagens.empty()) d.pasta_imagens = "imagens";
+
         std::string urls_str = ini.obter_ou(secao, "urls");
         if (!urls_str.empty()) {
             for (auto& u : dividir(urls_str, ',')) {
@@ -466,11 +481,13 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
 
         if (d.tipo_saida == "arquivo" && d.url.empty()) d.url = obter_env_ou_config("API_URL", "", "");
 
-        if (d.url.empty()) {
+        bool eh_drive = (d.tipo_saida == "drive" || d.tipo_saida == "google_drive" ||
+                         !d.drive_folder_id.empty());
+        if (d.url.empty() && !eh_drive) {
             std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
-        if (d.vars.empty() && d.tipo_saida != "arquivo")
+        if (d.vars.empty() && d.tipo_saida != "arquivo" && !eh_drive)
             std::cerr << "[WARNING] Dataset '" << d.id << "': sem 'vars' - a API decide o que retorna.\n";
         out.push_back(std::move(d));
     }

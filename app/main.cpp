@@ -68,7 +68,7 @@ GenericoApp::GenericoApp() {
     table->setModel(model);
     inputDb = new QLineEdit("clima.db");
     comboDb = new QComboBox();
-    QPushButton *btnAbrir = new QPushButton("Abrir...");
+    QPushButton *btnAbrir = new QPushButton("Open...");
     QPushButton *btnRecarregar = new QPushButton("Recarregar DBs");
     comboTabela = new QComboBox();
     comboData = new QComboBox();
@@ -83,16 +83,16 @@ GenericoApp::GenericoApp() {
     dataFim->setCalendarPopup(true);
     dataInicio->clear();
     dataFim->clear();
-    chkTodasColunas = new QCheckBox("Todas as colunas");
+    chkTodasColunas = new QCheckBox("All the columns");
     chkTodasColunas->setChecked(true);
-    QPushButton *btnFiltrar = new QPushButton("Filtrar");
-    QPushButton *btnReset = new QPushButton("Mostrar tudo");
+    QPushButton *btnFiltrar = new QPushButton("Filter");
+    QPushButton *btnReset = new QPushButton("Indicate all");
     QHBoxLayout *l1 = new QHBoxLayout();
-    l1->addWidget(new QLabel("Banco:"));
+    l1->addWidget(new QLabel("Database:"));
     l1->addWidget(inputDb, 2);
     l1->addWidget(btnAbrir);
     l1->addWidget(btnRecarregar);
-    l1->addWidget(new QLabel("Tabela:"));
+    l1->addWidget(new QLabel("Table:"));
     l1->addWidget(comboTabela, 2);
     QHBoxLayout *l2 = new QHBoxLayout();
     l2->addWidget(new QLabel("Col.data:"));
@@ -124,7 +124,7 @@ GenericoApp::GenericoApp() {
 }
 
 void GenericoApp::escolherDb() {
-    QString f = QFileDialog::getOpenFileName(this, "Abrir banco", "", "*.db *.sqlite");
+    QString f = QFileDialog::getOpenFileName(this, "Open database", "", "*.db *.sqlite");
     if (f.isEmpty()) return;
     if (!dbs.contains(f)) dbs << f;
     inputDb->setText(f);
@@ -146,7 +146,7 @@ void GenericoApp::trocarDb() {
     QSqlDatabase c = QSqlDatabase::addDatabase("QSQLITE", "gen");
     c.setDatabaseName(dbAtual());
     if (!c.open()) {
-        QMessageBox::critical(this, "Erro", "Nao abriu: " + c.lastError().text());
+        QMessageBox::critical(this, "Error", "Nao abriu: " + c.lastError().text());
         return;
     }
     QSqlQuery q(c);

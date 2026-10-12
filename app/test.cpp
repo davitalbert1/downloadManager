@@ -218,7 +218,7 @@ static void countRecords(Database& db) {
             );
             std::cout << table << ": " << (rows.empty() ? "?" : rows[0][0]) << '\n';
         } catch (const std::exception& error) {
-            std::cout << table << ": erro -> " << error.what() << '\n';
+            std::cout << table << ": error -> " << error.what() << '\n';
         }
     }
 }
@@ -279,7 +279,7 @@ static void showPeriod(Database& db, const std::string& table, const std::string
         return;
     }
 
-    std::cout << "Início: " << rows[0][0] << '\n'
+    std::cout << "Start: " << rows[0][0] << '\n'
               << "Fim: " << rows[0][1] << '\n'
               << "Total: " << rows[0][2] << '\n';
 }
@@ -384,7 +384,7 @@ static void checkGaps(Database& db, const std::string& table,
         if (difference != expectedSeconds) {
             foundGap = true;
             std::cout << "GAP/INTERVALO: " << rows[i - 1][0] << " -> " << rows[i][0]
-                      << " (diferença: " << difference << " segundos)\n";
+                      << " (difference: " << difference << " segundos)\n";
         }
     }
 
@@ -447,7 +447,7 @@ int main(int argc, char* argv[]) {
             const fs::path dbPath = resolveDatabasePath(config.get(section, "db", defaultDb));
             const std::string granularity = config.get(section, "granularidade", "dia");
             const std::string dateColumn = config.get(
-                section, "coluna_data", granularity == "hora" ? "time" : "date"
+                section, "coluna_data", granularity == "hora" ? "team" : "date"
             );
 
             datasets.push_back({id, table, dbPath, granularity, dateColumn});
@@ -482,12 +482,12 @@ int main(int argc, char* argv[]) {
 
                 if (hourly) {
                     showLatest(db, dataset.table, dataset.dateColumn,
-                        {"time", "hora", "latitude", "longitude", "temperature_2m",
+                        {"team", "hour", "latitude", "length", "temperature_2m",
                          "apparent_temperature", "relativehumidity_2m", "precipitation"},
                         latestLimit);
                 } else {
                     showLatest(db, dataset.table, dataset.dateColumn,
-                        {"date", "data", "latitude", "longitude", "weathercode",
+                        {"date", "data", "latitude", "length", "weathercode",
                          "temperature_2m_max", "temperature_2m_min", "sunrise", "sunset",
                          "precipitation_sum"},
                         latestLimit);

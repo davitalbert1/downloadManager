@@ -1,6 +1,7 @@
 #include "config.h"
 #include "engine_generico.h"
 #include "file_dataset.h"
+#include "google_drive.h"
 #include "rate_limit.h"
 #include "storage_sqlite.h"
 #include "utils.h"
@@ -70,8 +71,17 @@ int main(int argc, char** argv) {
         // Executa rigorosamente na ordem declarada em download.ini (de cima para baixo)
         bool tem_db = false;
         for (const auto& ds : CFG.datasets) {
-            if (ds.tipo_saida != "arquivo") {
+            if (ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" && ds.drive_folder_id.empty()) {
                 tem_db = true;
+                break;
+            }
+        }
+
+        // Se não houver dataset com data (apenas records/APIs sem datas), usa lista com 1 dummy
+        bool tem_datas = false;
+        for (const auto& ds : CFG.datasets) {
+            if (ds.iterar_datas && ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" && ds.drive_folder_id.empty()) {
+                tem_datas = true;
                 break;
             }
         }
@@ -81,42 +91,48 @@ int main(int argc, char** argv) {
         double tload = 0.0;
 
         if (tem_db) {
-            datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
-            if (!datas.empty()) {
-                std::cout << "============================================================\n"
-                          << "DOWNLOAD GENERICO DE DADOS E APIS\n"
-                          << "============================================================\n"
-                          << "Configuracao: " << caminho_ini << "\n"
-                          << "Fuso horario: " << CFG.fuso_horario << "\n"
-                          << "Banco de dados: " << CFG.db_path << "\n"
-                          << "download_workers: " << CFG.download_workers
-                          << " | process_workers: " << CFG.process_workers << "\n";
+            criar_tabelas_datasets();
+            if (tem_datas) {
+                datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
+                if (!datas.empty()) {
+                    std::cout << "============================================================\n"
+                              << "DOWNLOAD GENERICO DE DADOS E APIS\n"
+                              << "============================================================\n"
+                              << "Configuracao: " << caminho_ini << "\n"
+                              << "Fuso horario: " << CFG.fuso_horario << "\n"
+                              << "Banco de dados: " << CFG.db_path << "\n"
+                              << "download_workers: " << CFG.download_workers
+                              << " | process_workers: " << CFG.process_workers << "\n";
 
-                criar_tabelas_datasets();
-
-                std::cout << "\n[DB] Carregando registros existentes...\n";
-                auto t0 = std::chrono::steady_clock::now();
-                existentes = carregar_existentes_generico(datas);
-                tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                for (size_t di = 0; di < CFG.datasets.size(); ++di) {
-                    if (CFG.datasets[di].tipo_saida == "arquivo") continue;
-                    long long tot = 0;
-                    auto it = existentes.find(di);
-                    if (it != existentes.end())
-                        for (const auto& kv : it->second) tot += (long long)kv.second.size();
-                    std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias existentes\n";
+                    std::cout << "\n[DB] Carregando registros existentes...\n";
+                    auto t0 = std::chrono::steady_clock::now();
+                    existentes = carregar_existentes_generico(datas);
+                    tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    for (size_t di = 0; di < CFG.datasets.size(); ++di) {
+                        if (CFG.datasets[di].tipo_saida == "arquivo" ||
+                            CFG.datasets[di].tipo_saida == "drive" ||
+                            CFG.datasets[di].tipo_saida == "google_drive" ||
+                            !CFG.datasets[di].drive_folder_id.empty()) continue;
+                        long long tot = 0;
+                        auto it = existentes.find(di);
+                        if (it != existentes.end())
+                            for (const auto& kv : it->second) tot += (long long)kv.second.size();
+                        std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias existentes\n";
+                    }
                 }
+            } else {
+                datas = { hoje() };
             }
         }
 
         for (size_t di = 0; di < CFG.datasets.size(); ++di) {
             const auto& ds = CFG.datasets[di];
-            if (ds.tipo_saida == "arquivo") {
+            if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) {
+                executar_dataset_google_drive(ds);
+            } else if (ds.tipo_saida == "arquivo") {
                 executar_dataset_arquivo(ds);
             } else {
-                if (!datas.empty()) {
-                    executar_generico(datas, tload, existentes, di);
-                }
+                executar_generico(datas, tload, existentes, di);
             }
         }
 

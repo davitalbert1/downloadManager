@@ -423,9 +423,11 @@ static std::string extrair_asset_de_arquivo(const std::filesystem::path& arq) {
 }
 
 static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, const std::string& base_url, const std::string& api_key) {
-    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_arquivos");
+    // pasta_saida aceita path absoluto (C:\..., /..., \\server\...) ou relativo.
+    std::string pasta_saida_str = resolver_pasta_saida(ds.pasta_saida, "dados_arquivos", "PASTA_SAIDA");
     std::filesystem::path pasta_saida(pasta_saida_str);
-    std::filesystem::create_directories(pasta_saida);
+    std::error_code ec_dir;
+    std::filesystem::create_directories(pasta_saida, ec_dir);
 
     std::string extensao = obter_env_ou_config("FORMATO", ds.extensao, "bin");
     if (extensao == "netcdf") extensao = "nc";
@@ -685,8 +687,10 @@ bool baixar_arquivo_seguro(const std::string& url,
                            int tamanho_min,
                            const std::map<std::string, std::string>& headers,
                            double timeout_sec) {
-    std::filesystem::path dest(caminho_destino);
-    std::filesystem::create_directories(dest.parent_path());
+    std::filesystem::path dest(expandir_caminho(caminho_destino));
+    std::error_code ec_pre;
+    auto pai = dest.parent_path();
+    if (!pai.empty()) std::filesystem::create_directories(pai, ec_pre);
 
     // Se já existe e é válido
     std::error_code ec;
@@ -759,9 +763,14 @@ bool baixar_arquivo_seguro(const std::string& url,
 }
 
 void executar_dataset_arquivo(const DatasetCfg& ds) {
-    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_arquivos");
+    std::string pasta_saida_str = resolver_pasta_saida(ds.pasta_saida, "dados_arquivos", "PASTA_SAIDA");
     std::filesystem::path pasta_saida(pasta_saida_str);
-    std::filesystem::create_directories(pasta_saida);
+    std::error_code ec_mk;
+    std::filesystem::create_directories(pasta_saida, ec_mk);
+    if (ec_mk) {
+        log("[ERRO] Nao foi possivel criar pasta_saida '" + pasta_saida.string() + "': " + ec_mk.message());
+        return;
+    }
 
     if (std::filesystem::exists(pasta_saida)) {
         for (const auto& entry : std::filesystem::directory_iterator(pasta_saida)) {

@@ -76,6 +76,31 @@ static void injetar_ctx_registro(Registro& reg, const DatasetCfg& ds, const Cont
     }
 }
 
+static bool eh_url_imagem(const std::string& u) {
+    if (u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) return false;
+    std::string s = minusculas(u);
+    size_t q = s.find('?');
+    if (q != std::string::npos) s = s.substr(0, q);
+    for (const char* ext : {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}) {
+        if (s.size() >= std::strlen(ext) && s.rfind(ext) == s.size() - std::strlen(ext))
+            return true;
+    }
+    return false;
+}
+
+void extrair_todas_urls_imagens(const json& j, std::vector<std::string>& urls) {
+    if (j.is_string()) {
+        std::string s = j.get<std::string>();
+        if (eh_url_imagem(s)) urls.push_back(s);
+    } else if (j.is_array()) {
+        for (const auto& item : j) extrair_todas_urls_imagens(item, urls);
+    } else if (j.is_object()) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            extrair_todas_urls_imagens(it.value(), urls);
+        }
+    }
+}
+
 static void achatar_objeto(const json& obj, const std::string& prefix, Registro& reg,
                            const DatasetCfg& ds, const std::map<std::string, ColunaCfg>& ov) {
     if (!obj.is_object()) return;
@@ -85,7 +110,46 @@ static void achatar_objeto(const json& obj, const std::string& prefix, Registro&
             achatar_objeto(it.value(), p, reg, ds, ov);
             continue;
         }
-        if (it.value().is_array()) continue;
+        if (it.value().is_array()) {
+            // Se for um array de valores primitivos ou objetos pequenos (ex: types, abilities, stats)
+            // serializa em texto legível para não perder informações preciosas!
+            const auto& arr = it.value();
+            if (!arr.empty()) {
+                std::string bruto = prefix.empty() ? it.key() : prefix + "_" + it.key();
+                std::string col = normalizar_nome(bruto);
+                if (col == "created_at") continue;
+
+                // Tenta sintetizar lista simples (ex: strings ou objetos com "name", "stat", etc.)
+                std::vector<std::string> partes;
+                for (const auto& el : arr) {
+                    if (el.is_string()) {
+                        partes.push_back(el.get<std::string>());
+                    } else if (el.is_number()) {
+                        partes.push_back(num_str(el.get<double>()));
+                    } else if (el.is_object()) {
+                        if (el.contains("name") && el["name"].is_string()) {
+                            partes.push_back(el["name"].get<std::string>());
+                        } else if (el.contains("type") && el["type"].is_object() && el["type"].contains("name")) {
+                            partes.push_back(el["type"]["name"].get<std::string>());
+                        } else if (el.contains("ability") && el["ability"].is_object() && el["ability"].contains("name")) {
+                            partes.push_back(el["ability"]["name"].get<std::string>());
+                        } else if (el.contains("stat") && el["stat"].is_object() && el["stat"].contains("name") && el.contains("base_stat")) {
+                            std::string stat_n = el["stat"]["name"].get<std::string>();
+                            std::string stat_v = el["base_stat"].is_number() ? std::to_string(el["base_stat"].get<int>()) : el["base_stat"].dump();
+                            partes.push_back(stat_n + ":" + stat_v);
+                        } else if (el.contains("move") && el["move"].is_object() && el["move"].contains("name")) {
+                            partes.push_back(el["move"]["name"].get<std::string>());
+                        }
+                    }
+                }
+                if (!partes.empty() && partes.size() <= 200) {
+                    if (reg.find(col) == reg.end()) reg[col] = juntar(partes, ", ");
+                } else if (partes.empty() && arr.size() <= 10) {
+                    if (reg.find(col) == reg.end()) reg[col] = arr.dump();
+                }
+            }
+            continue;
+        }
         auto ovi = ov.find(it.key());
         std::string bruto = prefix.empty() ? it.key() : prefix + "_" + it.key();
         std::string col = ovi != ov.end() ? ovi->second.coluna : normalizar_nome(bruto);

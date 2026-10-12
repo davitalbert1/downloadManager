@@ -43,8 +43,92 @@ std::string minusculas(std::string v) {
 }
 
 std::string sem_comentario(const std::string& s) {
-    size_t p = s.find_first_of(";#");
-    return p == std::string::npos ? s : s.substr(0, p);
+    // Respeita aspas simples/duplas: ';' ou '#' dentro de aspas faz parte
+    // do valor (ex: pasta_saida = "C:\dados #1; backup").
+    bool em_simples = false, em_duplas = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '\'' && !em_duplas) em_simples = !em_simples;
+        else if (c == '"' && !em_simples) em_duplas = !em_duplas;
+        else if ((c == ';' || c == '#') && !em_simples && !em_duplas)
+            return s.substr(0, i);
+    }
+    return s;
+}
+
+static std::string remover_aspas_externas(const std::string& s) {
+    std::string v = cortar(s);
+    if (v.size() >= 2 && ((v.front() == '"' && v.back() == '"') ||
+                           (v.front() == '\'' && v.back() == '\'')))
+        return cortar(v.substr(1, v.size() - 2));
+    return v;
+}
+
+std::string expandir_caminho(const std::string& caminho) {
+    std::string v = remover_aspas_externas(caminho);
+    if (v.empty()) return v;
+    // ~ e ~/... -> $HOME (ou %USERPROFILE% no Windows)
+    if (v == "~" || (v.size() > 1 && v[0] == '~' && (v[1] == '/' || v[1] == '\\'))) {
+        const char* home = std::getenv("HOME");
+#ifdef _WIN32
+        if (!home || !*home) home = std::getenv("USERPROFILE");
+#endif
+        if (home && *home) v = std::string(home) + v.substr(1);
+    }
+    // %VAR% (Windows) e $VAR / ${VAR} (posix)
+    std::string out;
+    out.reserve(v.size());
+    for (size_t i = 0; i < v.size();) {
+        if (v[i] == '%') {
+            size_t f = v.find('%', i + 1);
+            if (f != std::string::npos && f > i + 1) {
+                const char* ev = std::getenv(v.substr(i + 1, f - i - 1).c_str());
+                if (ev) out += ev;
+                i = f + 1;
+                continue;
+            }
+        }
+        if (v[i] == '$' && i + 1 < v.size()) {
+            size_t j = i + 1;
+            std::string nome;
+            if (v[j] == '{') {
+                size_t f = v.find('}', j + 1);
+                if (f != std::string::npos) {
+                    nome = v.substr(j + 1, f - j - 1);
+                    j = f + 1;
+                }
+            } else {
+                size_t k = j;
+                while (k < v.size() && (std::isalnum((unsigned char)v[k]) || v[k] == '_')) ++k;
+                nome = v.substr(j, k - j);
+                j = k;
+            }
+            if (!nome.empty()) {
+                const char* ev = std::getenv(nome.c_str());
+                if (ev) out += ev;
+                i = j;
+                continue;
+            }
+        }
+        out += v[i++];
+    }
+    return remover_aspas_externas(out);
+}
+
+std::string resolver_pasta_saida(const std::string& valor_cfg, const std::string& padrao,
+                                 const char* nome_env) {
+    std::string cfg = expandir_caminho(valor_cfg);
+    bool cfg_explicito = !cfg.empty() && cfg != padrao;
+    if (cfg_explicito) return cfg; // absoluto ou relativo: usa como esta
+    if (nome_env && *nome_env) {
+        const char* ev = std::getenv(nome_env);
+        if (ev && *ev) {
+            std::string e = expandir_caminho(ev);
+            if (!e.empty()) return e;
+        }
+    }
+    if (!cfg.empty()) return cfg;
+    return padrao;
 }
 
 std::vector<std::string> dividir(const std::string& s, char sep) {
