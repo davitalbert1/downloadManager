@@ -84,6 +84,16 @@ struct DatasetCfg {
     std::string campo_url_detalhe = "url"; // Campo que traz a URL de detalhe (padrao: "url")
     bool baixar_todas_imagens = false; // Se true, busca todas as URLs de imagem (.png, .jpg, .svg) nos objetos
     std::string pasta_imagens = "imagens"; // Subpasta/pasta para salvar imagens encontradas
+
+    // Wikipedia/Wikimedia dumps (.xml.bz2 -> SQLite, espelha F:\wikipedia)
+    // tipo_saida = wikipedia
+    std::string projeto;      // ex: enwiki (vazio = deduz do nome do arquivo)
+    std::string data_dump;    // ex: 2026-07-01 (vazio = deduz do nome/URL)
+    bool apenas_ns0 = true;       // so namespace 0 (artigos)
+    bool ignorar_redirect = true; // pula #REDIRECT/#REDIRECIONAMENTO
+    int tamanho_minimo = 20;      // descarta texto limpo menor que isso
+    int wiki_batch = 2000;        // paginas por COMMIT
+    bool listar_remoto = true;    // lista o diretorio remoto; 0 = so pasta local
 };
 
 struct DimensaoCfg {

@@ -1,5 +1,6 @@
 #pragma once
 #include <sqlite3.h>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <map>
@@ -17,6 +18,7 @@ struct Era5ImportConfig {
     std::vector<std::pair<double, double>> coordenadas; // Lat, Lon dos pontos a extrair
     bool converter_kelvin_para_celsius = true; // Se 2T / 2D estiver em Kelvin (~ > 150), subtrai 273.15
     size_t tamanho_lote = 1000; // Tamanho do lote de inserção (transações SQLite)
+    size_t process_workers = 0; // 0 = usa CFG.process_workers (download.exe); N = fixo
 };
 
 // Funções do importador

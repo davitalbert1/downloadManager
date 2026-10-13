@@ -5,6 +5,7 @@
 #include "rate_limit.h"
 #include "storage_sqlite.h"
 #include "utils.h"
+#include "wikipedia_importer.h"
 #include <curl/curl.h>
 #include <algorithm>
 #include <chrono>
@@ -71,7 +72,8 @@ int main(int argc, char** argv) {
         // Executa rigorosamente na ordem declarada em download.ini (de cima para baixo)
         bool tem_db = false;
         for (const auto& ds : CFG.datasets) {
-            if (ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" && ds.drive_folder_id.empty()) {
+            if (ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" &&
+                ds.tipo_saida != "wikipedia" && ds.tipo_saida != "wiki" && ds.drive_folder_id.empty()) {
                 tem_db = true;
                 break;
             }
@@ -80,7 +82,8 @@ int main(int argc, char** argv) {
         // Se não houver dataset com data (apenas records/APIs sem datas), usa lista com 1 dummy
         bool tem_datas = false;
         for (const auto& ds : CFG.datasets) {
-            if (ds.iterar_datas && ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" && ds.drive_folder_id.empty()) {
+            if (ds.iterar_datas && ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" &&
+                ds.tipo_saida != "wikipedia" && ds.tipo_saida != "wiki" && ds.drive_folder_id.empty()) {
                 tem_datas = true;
                 break;
             }
@@ -129,6 +132,8 @@ int main(int argc, char** argv) {
             const auto& ds = CFG.datasets[di];
             if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) {
                 executar_dataset_google_drive(ds);
+            } else if (ds.tipo_saida == "wikipedia" || ds.tipo_saida == "wiki") {
+                executar_dataset_wikipedia(ds);
             } else if (ds.tipo_saida == "arquivo") {
                 executar_dataset_arquivo(ds);
             } else {

@@ -343,6 +343,14 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         std::string hrs_str = ini.obter_ou(secao, "horarios");
         if (!hrs_str.empty()) d.horarios = dividir(hrs_str, ',');
 
+        d.projeto = cortar(ini.obter_ou(secao, "projeto"));
+        d.data_dump = cortar(ini.obter_ou(secao, "data_dump"));
+        d.apenas_ns0 = para_bool(ini.obter_ou(secao, "apenas_ns0", "1"), true);
+        d.ignorar_redirect = para_bool(ini.obter_ou(secao, "ignorar_redirect", "1"), true);
+        d.tamanho_minimo = para_int(ini.obter_ou(secao, "tamanho_minimo", "20"), 20);
+        d.wiki_batch = para_int(ini.obter_ou(secao, "wiki_batch", "2000"), 2000);
+        d.listar_remoto = para_bool(ini.obter_ou(secao, "listar_remoto", "1"), true);
+
         d.bloco = cortar(ini.obter_ou(secao, "bloco"));
         if (d.bloco.empty()) d.bloco = cortar(ini.obter_ou(secao, "block"));
         d.params_chave = cortar(ini.obter_ou(secao, "params_chave", d.bloco));
@@ -483,11 +491,12 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
 
         bool eh_drive = (d.tipo_saida == "drive" || d.tipo_saida == "google_drive" ||
                          !d.drive_folder_id.empty());
-        if (d.url.empty() && !eh_drive) {
+        bool eh_wiki = (d.tipo_saida == "wikipedia" || d.tipo_saida == "wiki");
+        if (d.url.empty() && !eh_drive && !eh_wiki) {
             std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
-        if (d.vars.empty() && d.tipo_saida != "arquivo" && !eh_drive)
+        if (d.vars.empty() && d.tipo_saida != "arquivo" && !eh_drive && !eh_wiki)
             std::cerr << "[WARNING] Dataset '" << d.id << "': sem 'vars' - a API decide o que retorna.\n";
         out.push_back(std::move(d));
     }

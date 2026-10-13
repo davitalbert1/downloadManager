@@ -3,6 +3,7 @@
 #include <gdal_priv.h>
 #include <sqlite3.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -11,8 +12,10 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -611,9 +614,40 @@ size_t importar_pasta_era5(const Era5ImportConfig& cfg) {
               << "============================================================\n";
 
     size_t processados = 0;
-    for (const auto& p : arquivos_grib) {
-        if (importar_arquivo_era5(p.string(), cfg)) processados++;
+    // Importação GRIB -> SQLite em paralelo com process_workers. Cada worker
+    // abre sua própria conexão SQLite (busy_timeout + WAL) e o GDAL é
+    // registrado uma vez no processo (GDALAllRegister é thread-safe p/ leitura).
+    // cfg.process_workers == 0 → padrão: nº de núcleos (mín. 2).
+    size_t n_proc = (size_t)cfg.process_workers;
+    if (n_proc == 0) {
+        n_proc = std::thread::hardware_concurrency();
+        if (n_proc == 0) n_proc = 2;
     }
+    if (n_proc < 1) n_proc = 1;
+    if (n_proc > arquivos_grib.size() && !arquivos_grib.empty())
+        n_proc = arquivos_grib.size();
+    std::cout << "Workers de importacao (process_workers): " << n_proc << "\n"
+              << "============================================================\n";
+    std::atomic<size_t> idx{0};
+    std::atomic<size_t> ok_at{0};
+    std::vector<std::thread> th;
+    th.reserve(n_proc);
+    GDALAllRegister();
+    for (size_t i = 0; i < n_proc; ++i) {
+        th.emplace_back([&] {
+            while (true) {
+                size_t k = idx.fetch_add(1);
+                if (k >= arquivos_grib.size()) break;
+                try {
+                    if (importar_arquivo_era5(arquivos_grib[k].string(), cfg)) ok_at.fetch_add(1);
+                } catch (const std::exception& e) {
+                    std::cerr << "[ERRO] " << arquivos_grib[k].string() << ": " << e.what() << "\n";
+                }
+            }
+        });
+    }
+    for (auto& t : th) t.join();
+    processados = ok_at.load();
 
     std::cout << "\n[FINALIZADO] " << processados << " de " << arquivos_grib.size()
               << " arquivos importados para o banco " << cfg.db_path << ".\n";

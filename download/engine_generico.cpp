@@ -168,54 +168,54 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
             if (ds.seguir_url_detalhe && !regs.empty()) {
                 std::string col_url = ds.campo_url_detalhe.empty() ? "url" : ds.campo_url_detalhe;
                 log("[DETALHES] Enriquecendo " + std::to_string(regs.size()) + " registros via " + col_url + "...");
-                size_t num_det = 0;
-                for (auto& reg : regs) {
-                    num_det++;
-                    auto it_url = reg.find(col_url);
-                    if (it_url != reg.end() && std::holds_alternative<std::string>(it_url->second)) {
-                        std::string sub_url = std::get<std::string>(it_url->second);
-                        if (sub_url.rfind("http", 0) == 0) {
+                std::atomic<size_t> num_det{0};
+                std::atomic<size_t> idx_det{0};
+                int n_det = CFG.download_workers < 1 ? 1 : CFG.download_workers;
+                if ((size_t)n_det > regs.size()) n_det = (int)regs.size();
+                std::vector<std::thread> th_det;
+                th_det.reserve((size_t)n_det);
+                for (int w = 0; w < n_det; ++w) {
+                    th_det.emplace_back([&, w] {
+                        while (true) {
+                            size_t k = idx_det.fetch_add(1);
+                            if (k >= regs.size()) break;
+                            auto it_url = regs[k].find(col_url);
+                            if (it_url == regs[k].end()) continue;
+                            if (!std::holds_alternative<std::string>(it_url->second)) continue;
+                            std::string sub_url = std::get<std::string>(it_url->second);
+                            if (sub_url.rfind("http", 0) != 0) continue;
                             auto sub_dados = baixar_com_retry(sub_url, {}, CFG.max_retries, 0.5, chave_api,
                                                               "GET", hdrs, "", ds.api_key_em);
-                            if (sub_dados && sub_dados->is_object()) {
-                                // Parseia o objeto detalhado e faz merge no registro
-                                auto sub_regs = parse_objeto(*sub_dados, *sub_dados, ds, ctx);
-                                if (!sub_regs.empty()) {
-                                    for (const auto& kv : sub_regs.front()) {
-                                        reg[kv.first] = kv.second;
-                                    }
-                                }
-                                std::string item_nome;
-                                auto it_nom = reg.find("name");
-                                if (it_nom == reg.end()) it_nom = reg.find("nome");
-                                if (it_nom != reg.end() && std::holds_alternative<std::string>(it_nom->second)) {
-                                    item_nome = std::get<std::string>(it_nom->second);
-                                }
-                                if (num_det % 10 == 0 || num_det == regs.size()) {
-                                    log("  [DETALHE " + std::to_string(num_det) + "/" + std::to_string(regs.size()) + "] " + item_nome);
-                                }
-                                // Se baixar_todas_imagens estiver habilitado, baixa os sprites/imagens
-                                if (ds.baixar_todas_imagens) {
-                                    std::vector<std::string> imgs;
-                                    extrair_todas_urls_imagens(*sub_dados, imgs);
-                                    if (!imgs.empty()) {
-                                        std::string pasta = resolver_pasta_saida(ds.pasta_imagens, "imagens", "PASTA_IMAGENS");
-                                        std::filesystem::path base_pasta(pasta);
-                                        std::filesystem::path sub_pasta = base_pasta;
-                                        if (!item_nome.empty()) {
-                                            sub_pasta = base_pasta / sanitizar_nome_arquivo(item_nome);
-                                        }
-                                        for (const auto& img_url : imgs) {
-                                            std::string fn = obter_nome_arquivo_da_url(img_url);
-                                            std::filesystem::path dest = sub_pasta / fn;
-                                            baixar_arquivo_seguro(img_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
-                                        }
+                            if (!sub_dados || !sub_dados->is_object()) continue;
+                            auto sub_regs = parse_objeto(*sub_dados, *sub_dados, ds, ctx);
+                            if (!sub_regs.empty()) {
+                                for (const auto& kv : sub_regs.front()) regs[k][kv.first] = kv.second;
+                            }
+                            std::string item_nome;
+                            auto it_nom = regs[k].find("name");
+                            if (it_nom == regs[k].end()) it_nom = regs[k].find("nome");
+                            if (it_nom != regs[k].end() && std::holds_alternative<std::string>(it_nom->second))
+                                item_nome = std::get<std::string>(it_nom->second);
+                            size_t n = num_det.fetch_add(1) + 1;
+                            if (n % 10 == 0 || n == regs.size())
+                                log("  [DETALHE " + std::to_string(n) + "/" + std::to_string(regs.size()) + "] " + item_nome);
+                            if (ds.baixar_todas_imagens) {
+                                std::vector<std::string> imgs;
+                                extrair_todas_urls_imagens(*sub_dados, imgs);
+                                if (!imgs.empty()) {
+                                    std::string pasta = resolver_pasta_saida(ds.pasta_imagens, "imagens", "PASTA_IMAGENS");
+                                    std::filesystem::path sub_pasta(pasta);
+                                    if (!item_nome.empty()) sub_pasta /= sanitizar_nome_arquivo(item_nome);
+                                    for (const auto& img_url : imgs) {
+                                        std::filesystem::path dest = sub_pasta / obter_nome_arquivo_da_url(img_url);
+                                        baixar_arquivo_seguro(img_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
                                     }
                                 }
                             }
                         }
-                    }
+                    });
                 }
+                for (auto& t : th_det) t.join();
             }
 
             todos.insert(todos.end(), std::make_move_iterator(regs.begin()),
@@ -306,8 +306,12 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
     }
 
     // Se o dataset tiver baixar_arquivos_vinculados ativado (como imagens de pokemons, assets, etc.)
+    // Downloads em paralelo com download_workers (rede).
     if (ds.baixar_arquivos_vinculados && !ds.campo_url_arquivo.empty()) {
         std::string pasta = resolver_pasta_saida(ds.pasta_saida, "arquivos_" + ds.id, "PASTA_SAIDA");
+        struct AlvoVinc { std::string url; std::string nome; };
+        std::vector<AlvoVinc> alvos;
+        alvos.reserve(r.registros.size());
         for (const auto& reg : r.registros) {
             auto it_u = reg.find(ds.campo_url_arquivo);
             if (it_u != reg.end() && std::holds_alternative<std::string>(it_u->second)) {
@@ -323,11 +327,26 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
                     if (nome_local.empty()) {
                         nome_local = obter_nome_arquivo_da_url(file_url);
                     }
-                    std::filesystem::path dest = std::filesystem::path(pasta) / nome_local;
-                    baixar_arquivo_seguro(file_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                    alvos.push_back({file_url, nome_local});
                 }
             }
         }
+        int n_v = CFG.download_workers < 1 ? 1 : CFG.download_workers;
+        if ((size_t)n_v > alvos.size() && !alvos.empty()) n_v = (int)alvos.size();
+        std::atomic<size_t> idx_v{0};
+        std::vector<std::thread> th_v;
+        th_v.reserve((size_t)std::max(1, n_v));
+        for (int w = 0; w < n_v; ++w) {
+            th_v.emplace_back([&] {
+                while (true) {
+                    size_t k = idx_v.fetch_add(1);
+                    if (k >= alvos.size()) break;
+                    std::filesystem::path dest = std::filesystem::path(pasta) / alvos[k].nome;
+                    baixar_arquivo_seguro(alvos[k].url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                }
+            });
+        }
+        for (auto& t : th_v) t.join();
     }
     {
         std::unique_lock<std::shared_mutex> lk(g_mtx_existentes);

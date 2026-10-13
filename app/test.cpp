@@ -200,8 +200,7 @@ static bool columnExists(Database& db, const std::string& table, const std::stri
     return false;
 }
 
-// ------------------------------ Relatórios -------------------------------
-
+// Relatórios
 static void listTables(Database& db) {
     std::cout << "\n=== TABELAS NO BANCO ===\n";
     const auto tables = getTables(db);

@@ -1,4 +1,5 @@
 #include "google_drive.h"
+#include "config.h"
 #include "utils.h"
 #include <atomic>
 #include <chrono>
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <ctime>
 #include <cstdlib>
@@ -23,13 +25,13 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// ---- Progresso do dataset Drive: 1 linha viva por arquivo (via \r) ----
+// Progresso do dataset Drive: 1 linha viva por arquivo (via \r)
 // Regras: infos de download sao POR ARQUIVO (tamanho, baixado, velocidade
 // do arquivo, ETA do arquivo). O agregado do dataset (total geral, % geral)
 // aparece só no resumo da pasta e no resumo final. Arquivo "ja existe" vira
 // 1 linha curta, sem barra de progresso.
 struct ProgressoDrive {
-    std::atomic<unsigned long long> total_bytes{0};   // soma dos tamanhos conhecidos
+    std::atomic<unsigned long long> total_bytes{0}; // soma dos tamanhos conhecidos
     std::atomic<unsigned long long> baixado_bytes{0}; // bytes de rede gravados
     std::atomic<unsigned long long> verificado_bytes{0}; // bytes de arq já existente
     std::atomic<size_t> total_arquivos{0};
@@ -53,7 +55,10 @@ static std::string drive_formatar_bytes(unsigned long long b) {
     const char* un[] = {"B", "KB", "MB", "GB", "TB"};
     double v = (double)b;
     int u = 0;
-    while (v >= 1024.0 && u < 4) { v /= 1024.0; ++u; }
+    while (v >= 1024.0 && u < 4) {
+        v /= 1024.0;
+        ++u;
+    }
     char buf[64];
     std::snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.1f %s", v, un[u]);
     return buf;
@@ -73,16 +78,16 @@ struct ProgressoArquivoDrive {
     FILE* file = nullptr;
     ProgressoDrive* global = nullptr;
     std::string nome;
-    unsigned long long total = 0;   // tamanho esperado do arquivo (0 = desconhecido)
-    unsigned long long feito = 0;   // bytes gravados neste arquivo
-    bool imprimiu = false;          // barra ja desenhada (precisa fechar com '\n' em erro)
+    unsigned long long total = 0; // tamanho esperado do arquivo (0 = desconhecido)
+    unsigned long long feito = 0; // bytes gravados neste arquivo
+    bool imprimiu = false; // barra ja desenhada (precisa fechar com '\n' em erro)
     std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point ultimo_log = std::chrono::steady_clock::now();
 };
 
 static void drive_log_arquivo(ProgressoDrive* p, const ProgressoArquivoDrive& a, bool fim) {
     // Barra única POR ARQUIVO, reescrita na mesma linha com \r:
-    //   [3/465] IMG_3948.JPG | 5.6/10.5 MB 53% | 4.1 MB/s | ETA 00:00:01
+    // [3/465] IMG_3948.JPG | 5.6/10.5 MB 53% | 4.1 MB/s | ETA 00:00:01
     // No fim (ok) quebra a linha. "ja existe" não passa por aqui.
     double dec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - a.inicio).count();
@@ -94,7 +99,7 @@ static void drive_log_arquivo(ProgressoDrive* p, const ProgressoArquivoDrive& a,
         if (pct > 100.0) pct = 100.0;
         double eta = vel > 1.0 ? ((double)(a.total > a.feito ? a.total - a.feito : 0)) / vel : -1.0;
         std::snprintf(buf, sizeof(buf),
-            "[%zu/%zu] %s | %s/%s %5.1f%% | %s/s | ETA %s%c",
+            "  [%zu/%zu] %s | %s/%s %5.1f%% | %s/s | ETA %s%c",
             p ? p->prontos_arquivos.load() + 1 : 0,
             p ? p->total_arquivos.load() : 0,
             a.nome.c_str(),
@@ -447,16 +452,16 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
                 progresso->prontos_arquivos.fetch_add(1);
             }
             // "ja existe" = 1 linha curta, sem barra de progresso.
-            log("  [DRIVE JA EXISTE] " + nome + " (" +
+            log("[DRIVE JA EXISTE] " + nome + " (" +
                 drive_formatar_bytes((unsigned long long)sz) + ")");
             return;
         }
     }
 
     if (tam_esperado > 0)
-        log("  [DRIVE BAIXANDO] " + nome + " (" + drive_formatar_bytes(tam_esperado) + ") -> " + caminho_final.string());
+        log("[DRIVE BAIXANDO] " + nome + " (" + drive_formatar_bytes(tam_esperado) + ") -> " + caminho_final.string());
     else
-        log("  [DRIVE BAIXANDO] " + nome + " (tamanho desconhecido) -> " + caminho_final.string());
+        log("[DRIVE BAIXANDO] " + nome + " (tamanho desconhecido) -> " + caminho_final.string());
     std::string url = "https://www.googleapis.com/drive/v3/files/" + drive_url_encode(id) + "?alt=media";
     FILE* file = _wfopen(caminho_temp.wstring().c_str(), L"wb");
     if (!file) {
@@ -490,13 +495,19 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
     // Em erro, fecha a barra pendente (se houver) para o log nao colar na
     // linha do progresso.
     if (result != CURLE_OK) {
-        if (ctx_prog.imprimiu) { fputc('\n', stdout); fflush(stdout); }
+        if (ctx_prog.imprimiu) {
+            fputc('\n', stdout);
+            fflush(stdout);
+        }
         std::error_code remove_ec;
         fs::remove(caminho_temp, remove_ec);
         throw std::runtime_error(std::string("Erro CURL ao baixar: ") + curl_easy_strerror(result));
     }
     if (http_code < 200 || http_code >= 300) {
-        if (ctx_prog.imprimiu) { fputc('\n', stdout); fflush(stdout); }
+        if (ctx_prog.imprimiu) {
+            fputc('\n', stdout);
+            fflush(stdout);
+        }
         std::string corpo;
         {
             std::ifstream erro_file(caminho_temp, std::ios::binary);
@@ -547,7 +558,10 @@ static void drive_remover_temporarios(const fs::path& pasta) {
     }
 }
 
+static std::mutex g_drive_token_mtx;
+
 static void drive_renovar_token_se_preciso(TokenAcessoDrive& token, const json& service_account) {
+    std::lock_guard<std::mutex> lk(g_drive_token_mtx);
     if (!token_vencendo(token)) return;
     log("  [DRIVE] Token de acesso renovando...");
     try {
@@ -561,18 +575,22 @@ static void drive_renovar_token_se_preciso(TokenAcessoDrive& token, const json& 
 // filhos UMA vez, baixa primeiro todos os arquivos dela e SÓ DEPOIS desce
 // para cada subpasta (uma de cada vez). Sem pré-varredura global: o total
 // (%/ETA) é estimado de forma incremental a partir dos sizes conhecidos.
+// download_workers = nº de threads paralelas p/ arquivos dentro da pasta.
+// process_workers é reservado p/ futuro pós-processamento (ex: checksum/index).
 static void drive_baixar_item_recursivo(const json& item, const fs::path& destino_local,
                                         TokenAcessoDrive& token, const json& service_account,
-                                        int tamanho_min_bytes, size_t& sucesso, size_t& erros,
+                                        int tamanho_min_bytes, std::atomic<size_t>& sucesso,
+                                        std::atomic<size_t>& erros,
+                                        int download_workers,
                                         ProgressoDrive* progresso = nullptr,
                                         int profundidade = 0) {
     if (profundidade > 64) {
-        erros++;
+        erros.fetch_add(1);
         log("  [ERRO DRIVE] Profundidade maxima excedida (possivel ciclo).");
         return;
     }
     if (!item.contains("id") || !item.contains("name")) {
-        erros++;
+        erros.fetch_add(1);
         log("  [ERRO ARQUIVO DRIVE] Item sem id/name retornado pelo Google.");
         return;
     }
@@ -585,7 +603,7 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
         std::error_code ec;
         fs::create_directories(sub, ec);
         if (ec) {
-            erros++;
+            erros.fetch_add(1);
             log("  [ERRO PASTA DRIVE] " + nome + ": " + ec.message());
             return;
         }
@@ -595,7 +613,7 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
         try {
             filhos = drive_listar_arquivos(id, token.valor);
         } catch (const std::exception& e) {
-            erros++;
+            erros.fetch_add(1);
             log(std::string("  [ERRO LISTAR DRIVE] ") + nome + ": " + e.what());
             return;
         }
@@ -623,24 +641,51 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
             "' (" + std::to_string(filhos.size() - subpastas.size()) + " arquivos, " +
             std::to_string(subpastas.size()) + " subpastas)");
         // Snapshot antes do conteúdo desta pasta: resumo por pasta no fim.
-        size_t prontos_antes = progresso ? progresso->prontos_arquivos.load() : 0;
+        size_t prontos_antes = progresso ? progresso->prontos_arquivos.load() : sucesso.load();
         unsigned long long bytes_antes = progresso ? progresso->baixado_bytes.load() : 0;
         auto inicio_pasta = std::chrono::steady_clock::now();
+        // Arquivos da pasta em paralelo (download_workers); subpastas em
+        // sequência (DFS por pasta) para não explodir nº de threads.
+        std::vector<json> arquivos_pasta;
+        arquivos_pasta.reserve(filhos.size());
         for (const auto& f : filhos) {
             if (f.value("mimeType", "") == "application/vnd.google-apps.folder") continue;
             if (f.value("mimeType", "").rfind("application/vnd.google-apps.", 0) == 0) continue;
-            drive_baixar_item_recursivo(f, sub, token, service_account,
-                                        tamanho_min_bytes, sucesso, erros, progresso, profundidade + 1);
+            arquivos_pasta.push_back(f);
+        }
+        int n_dl = download_workers < 1 ? 1 : download_workers;
+        if ((size_t)n_dl > arquivos_pasta.size() && !arquivos_pasta.empty())
+            n_dl = (int)arquivos_pasta.size();
+        log("  [DRIVE] download_workers=" + std::to_string(n_dl) +
+            " process_workers=" + std::to_string(CFG.process_workers) +
+            " p/ " + std::to_string(arquivos_pasta.size()) + " arquivos em '" + nome + "'");
+        {
+            std::atomic<size_t> idx{0};
+            std::vector<std::thread> th;
+            th.reserve((size_t)n_dl);
+            for (int i = 0; i < n_dl; ++i) {
+                th.emplace_back([&] {
+                    while (true) {
+                        size_t k = idx.fetch_add(1);
+                        if (k >= arquivos_pasta.size()) break;
+                        drive_baixar_item_recursivo(arquivos_pasta[k], sub, token, service_account,
+                                                    tamanho_min_bytes, sucesso, erros,
+                                                    download_workers, progresso, profundidade + 1);
+                    }
+                });
+            }
+            for (auto& t : th) t.join();
         }
         for (const auto& s : subpastas)
             drive_baixar_item_recursivo(s, sub, token, service_account,
-                                        tamanho_min_bytes, sucesso, erros, progresso, profundidade + 1);
+                                        tamanho_min_bytes, sucesso, erros,
+                                        download_workers, progresso, profundidade + 1);
         {
             // Resumo da pasta: consolidado dos arquivos concluídos aqui dentro.
             double dec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - inicio_pasta).count();
             std::string resumo = "  [DRIVE PASTA OK] " + nome + ": " +
-                std::to_string((progresso ? progresso->prontos_arquivos.load() : sucesso) - prontos_antes) +
+                std::to_string((progresso ? progresso->prontos_arquivos.load() : sucesso.load()) - prontos_antes) +
                 " arquivos, " +
                 drive_formatar_bytes((progresso ? progresso->baixado_bytes.load() : 0ULL) - bytes_antes) +
                 " em " + drive_formatar_tempo(dec);
@@ -653,21 +698,22 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
         drive_renovar_token_se_preciso(token, service_account);
         try {
             drive_baixar_arquivo(item, destino_local, token.valor, tamanho_min_bytes, progresso);
-            sucesso++;
+            sucesso.fetch_add(1);
             return;
         } catch (const ErroHttpDrive& e) {
             if (e.codigo == 401 && tentativa == 0) {
                 log("  [DRIVE HTTP 401] Renovando token de acesso...");
                 try {
+                    std::lock_guard<std::mutex> lk(g_drive_token_mtx);
                     token = drive_obter_access_token(service_account);
                 } catch (...) {}
                 continue;
             }
-            erros++;
+            erros.fetch_add(1);
             log(std::string("  [ERRO ARQUIVO DRIVE] ") + e.what());
             return;
         } catch (const std::exception& e) {
-            erros++;
+            erros.fetch_add(1);
             log(std::string("  [ERRO ARQUIVO DRIVE] ") + e.what());
             return;
         }
@@ -773,27 +819,52 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
     {
         std::vector<json> subpastas_raiz;
         subpastas_raiz.reserve(arquivos.size());
+        std::vector<json> arquivos_raiz;
+        arquivos_raiz.reserve(arquivos.size());
         for (const auto& a : arquivos) {
             if (a.value("mimeType", "") == "application/vnd.google-apps.folder") {
                 subpastas_raiz.push_back(a);
                 continue;
             }
             if (a.value("mimeType", "").rfind("application/vnd.google-apps.", 0) == 0) continue;
+            arquivos_raiz.push_back(a);
             progresso.total_arquivos.fetch_add(1);
             progresso.total_bytes.fetch_add(drive_tamanho_do_item(a));
         }
         log("  [DRIVE] Raiz: " + std::to_string(arquivos.size()) + " itens (" +
-            std::to_string(arquivos.size() - subpastas_raiz.size()) + " arquivos, " +
+            std::to_string(arquivos_raiz.size()) + " arquivos, " +
             std::to_string(subpastas_raiz.size()) + " subpastas)");
-        for (const auto& arq : arquivos) {
-            if (arq.value("mimeType", "") == "application/vnd.google-apps.folder") continue;
-            if (arq.value("mimeType", "").rfind("application/vnd.google-apps.", 0) == 0) continue;
-            drive_baixar_item_recursivo(arq, dest, token, service_account,
-                                        ds.tamanho_min_bytes, sucesso, erros, &progresso);
+        int n_dl = CFG.download_workers < 1 ? 1 : CFG.download_workers;
+        if ((size_t)n_dl > arquivos_raiz.size() && !arquivos_raiz.empty())
+            n_dl = (int)arquivos_raiz.size();
+        std::atomic<size_t> suc_at{0}, err_at{0};
+        log("  [DRIVE] download_workers=" + std::to_string(n_dl) +
+            " process_workers=" + std::to_string(CFG.process_workers) +
+            " p/ raiz (" + std::to_string(arquivos_raiz.size()) + " arquivos)");
+        {
+            std::atomic<size_t> idx{0};
+            std::vector<std::thread> th;
+            th.reserve((size_t)std::max(1, n_dl));
+            for (int i = 0; i < n_dl; ++i) {
+                th.emplace_back([&] {
+                    while (true) {
+                        size_t k = idx.fetch_add(1);
+                        if (k >= arquivos_raiz.size()) break;
+                        drive_baixar_item_recursivo(arquivos_raiz[k], dest, token, service_account,
+                                                    ds.tamanho_min_bytes, suc_at, err_at,
+                                                    n_dl, &progresso);
+                    }
+                });
+            }
+            for (auto& t : th) t.join();
         }
         for (const auto& s : subpastas_raiz)
             drive_baixar_item_recursivo(s, dest, token, service_account,
-                                        ds.tamanho_min_bytes, sucesso, erros, &progresso);
+                                        ds.tamanho_min_bytes, suc_at, err_at,
+                                        CFG.download_workers < 1 ? 1 : CFG.download_workers,
+                                        &progresso);
+        sucesso = suc_at.load();
+        erros = err_at.load();
     }
 
     {

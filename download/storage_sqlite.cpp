@@ -231,6 +231,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
 void criar_tabelas_datasets() {
     for (const auto& ds : CFG.datasets) {
         if (ds.tipo_saida == "arquivo") continue;
+        if (ds.tipo_saida == "wikipedia" || ds.tipo_saida == "wiki") continue; // esquema proprio (paginas/progresso/...)
         if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) continue;
         try {
             std::vector<Registro> vazio;

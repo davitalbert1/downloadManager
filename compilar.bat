@@ -76,7 +76,7 @@ echo.
 
 :: 3.5. Verificacao da dependencia Dear ImGui (dbManager\imgui)
 if not exist "dbManager\imgui\imgui.cpp" (
-    echo [AVISO] Pasta dbManager\imgui nao encontrada (ou incompleta).
+    echo [AVISO] Pasta dbManager\imgui nao encontrada ^(ou incompleta^).
     where git >nul 2>nul
     if errorlevel 1 (
         echo [ERRO] 'git' nao encontrado no sistema. Instale o Git para clonar o Dear ImGui.

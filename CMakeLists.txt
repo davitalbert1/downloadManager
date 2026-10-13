@@ -45,10 +45,11 @@ add_executable(download
     download/engine_generico.cpp
     download/era5_importer.cpp
     download/google_drive.cpp
+    download/wikipedia_importer.cpp
 )
 target_include_directories(download PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(OpenSSL REQUIRED)
-target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 GDAL::GDAL OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 GDAL::GDAL OpenSSL::SSL OpenSSL::Crypto Threads::Threads bz2)
 
 # clima_auditor app/test.cpp
 add_executable(clima_auditor app/test.cpp)

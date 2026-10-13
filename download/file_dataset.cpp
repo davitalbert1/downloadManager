@@ -482,6 +482,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
                 imp_cfg.db_path = db_alvo;
                 imp_cfg.tabela = tab_alvo;
                 imp_cfg.coordenadas = CFG.coordenadas;
+                imp_cfg.process_workers = 1; // import único inline; paralelismo é no nível de meses
                 importar_arquivo_era5(destino.string(), imp_cfg);
             }
             return true;
@@ -669,6 +670,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
                 imp_cfg.db_path = db_alvo;
                 imp_cfg.tabela = tab_alvo;
                 imp_cfg.coordenadas = CFG.coordenadas;
+                imp_cfg.process_workers = 1; // import único inline; paralelismo é no nível de meses
                 importar_arquivo_era5(destino.string(), imp_cfg);
             }
 

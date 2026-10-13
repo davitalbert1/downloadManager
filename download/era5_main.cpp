@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
                       << "  --tabela <nome>       Tabela destino (padrao: era5_horario)\n"
                       << "  --ini <caminho>       Arquivo de configuracao para coordenadas (padrao: download.ini)\n"
                       << "  --lote <tamanho>      Tamanho do lote de commit SQL (padrao: 1000)\n"
+                      << "  --workers <n>         Threads de importacao GRIB->SQLite (padrao: nucleos)\n"
                       << "  --no-kelvin-to-celsius Nao converter temperatura de Kelvin para Celsius\n";
             return 0;
         } else if (arg == "--pasta" && i + 1 < argc) {
@@ -32,6 +33,8 @@ int main(int argc, char** argv) {
             cfg.ini_path = argv[++i];
         } else if (arg == "--lote" && i + 1 < argc) {
             cfg.tamanho_lote = std::stoul(argv[++i]);
+        } else if (arg == "--workers" && i + 1 < argc) {
+            cfg.process_workers = std::stoi(argv[++i]);
         } else if (arg == "--no-kelvin-to-celsius") {
             cfg.converter_kelvin_para_celsius = false;
         } else if (arg.size() > 5 && arg.substr(arg.size() - 5) == ".grib") {
