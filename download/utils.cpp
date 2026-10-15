@@ -251,6 +251,67 @@ bool para_bool(const std::string& s, bool padrao) {
     return padrao;
 }
 
+long long parse_tamanho_bytes(const std::string& s, long long padrao) {
+    std::string v = cortar(s);
+    if (v.empty()) return padrao;
+    std::string low = v;
+    std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    // "0", "desligado", "off", "false", "ilimitado", "-1" = sem limite
+    if (low == "0" || low == "-1" || low == "off" || low == "false" || low == "nao" ||
+        low == "não" || low == "desligado" || low == "ilimitado" || low == "unlimited" ||
+        low == "none")
+        return 0;
+    // Separa numero do sufixo (ex: "1.5 GB", "500MB", "1024")
+    size_t i = 0;
+    while (i < v.size() && (std::isdigit((unsigned char)v[i]) || v[i] == '.' || v[i] == ',' ||
+                            v[i] == '+' || v[i] == '-'))
+        ++i;
+    std::string num_s = cortar(v.substr(0, i));
+    std::string suf = cortar(v.substr(i));
+    for (char& c : num_s)
+        if (c == ',') c = '.';
+    double num = 0;
+    try {
+        num = std::stod(num_s);
+    } catch (...) {
+        return padrao;
+    }
+    if (!(num > 0.0)) return 0;
+    std::string sfx = suf;
+    std::transform(sfx.begin(), sfx.end(), sfx.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    // Remove plural/trailing "s" e espacos ("mbs" -> "mb", "bytes" -> "byte")
+    while (!sfx.empty() && sfx.back() == 's') sfx.pop_back();
+    long long mult = 1;
+    if (sfx.empty() || sfx == "b" || sfx == "byte") mult = 1;
+    else if (sfx == "k" || sfx == "kb" || sfx == "kib" || sfx == "kilobyte") mult = 1024LL;
+    else if (sfx == "m" || sfx == "mb" || sfx == "mib" || sfx == "megabyte") mult = 1024LL * 1024LL;
+    else if (sfx == "g" || sfx == "gb" || sfx == "gib" || sfx == "gigabyte") mult = 1024LL * 1024LL * 1024LL;
+    else if (sfx == "t" || sfx == "tb" || sfx == "tib" || sfx == "terabyte") mult = 1024LL * 1024LL * 1024LL * 1024LL;
+    else return padrao; // sufixo desconhecido: nao inventa, mantem padrao
+    double bytes = num * (double)mult;
+    if (bytes > (double)std::numeric_limits<long long>::max())
+        return std::numeric_limits<long long>::max();
+    return (long long)bytes;
+}
+
+std::string formatar_bytes(long long b) {
+    if (b <= 0) return "0 B";
+    const char* un[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = (double)b;
+    int u = 0;
+    while (v >= 1024.0 && u < 4) {
+        v /= 1024.0;
+        ++u;
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.1f %s", v, un[u]);
+    return buf;
+}
+
 Data para_data(const std::string& s) {
     Data d;
     if (std::sscanf(s.c_str(), "%d-%d-%d", &d.ano, &d.mes, &d.dia) != 3 || d.mes < 1 ||

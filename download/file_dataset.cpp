@@ -51,6 +51,49 @@ static size_t escrever_arquivo_cb(char* ptr, size_t tam, size_t nmemb, void* ud)
     return tam * nmemb;
 }
 
+// Escritor com limite maximo: aborta o download assim que ultrapassar tamanho_max
+// (evita baixar GBs para so depois descartar). Retorna 0 p/ abortar o curl.
+struct EscritorLimitado {
+    std::ofstream* out = nullptr;
+    long long tamanho_max = 0; // <=0 = sem limite
+    long long escrito = 0;
+    bool estourou = false;
+};
+
+static size_t escrever_arquivo_limitado_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
+    auto* w = static_cast<EscritorLimitado*>(ud);
+    size_t n = tam * nmemb;
+    if (w->tamanho_max > 0 && w->escrito + (long long)n > w->tamanho_max) {
+        w->estourou = true;
+        return 0; // aborta CURLE_WRITE_ERROR
+    }
+    w->out->write(ptr, n);
+    w->escrito += (long long)n;
+    return n;
+}
+
+// Captura headers (Location p/ redirect manual + Content-Length p/ skip antecipado)
+struct HeadersDownload {
+    std::string location;
+    long long content_length = -1; // -1 = desconhecido
+};
+
+static size_t ler_headers_download_cb(char* buffer, size_t tam, size_t n, void* ud) {
+    auto* h = static_cast<HeadersDownload*>(ud);
+    std::string linha(buffer, tam * n);
+    std::string baixo = linha;
+    std::transform(baixo.begin(), baixo.end(), baixo.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (baixo.rfind("location:", 0) == 0) h->location = cortar(linha.substr(9));
+    else if (baixo.rfind("content-length:", 0) == 0) {
+        try {
+            h->content_length = std::stoll(cortar(linha.substr(15)));
+        } catch (...) {}
+    }
+    return tam * n;
+}
+
 // Escritor assíncrono de disco
 // O curl empurra blocos de dados para uma fila limitada; uma thread separada
 // consome e grava em disco, desacoplando rede e I/O de disco.
@@ -282,11 +325,20 @@ struct DownloadProgressContext {
     std::chrono::steady_clock::time_point ult_log;
     double ultimo_pct = -1.0;
     int ultimo_marco = -1; // último marco de 10% impresso (0,1,...,10)
+    long long tamanho_max = 0; // >0 = aborta quando dltotal ou dlnow exceder
+    bool estourou = false;
 };
 
 static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) {
-    if (dltotal <= 0) return 0;
     auto* ctx = static_cast<DownloadProgressContext*>(clientp);
+    if (ctx->tamanho_max > 0) {
+        if ((dltotal > 0 && dltotal > (curl_off_t)ctx->tamanho_max) ||
+            (dlnow > (curl_off_t)ctx->tamanho_max)) {
+            ctx->estourou = true;
+            return 1; // aborta o transfer
+        }
+    }
+    if (dltotal <= 0) return 0;
     auto agora = std::chrono::steady_clock::now();
     double dec = std::chrono::duration<double>(agora - ctx->ult_log).count();
     bool concluido = (dlnow == dltotal);
@@ -327,7 +379,10 @@ static bool http_download_stream(const std::string& url,
                                  const std::string& caminho_destino,
                                  const std::string& api_key,
                                  const std::string& tag,
-                                 double timeout_sec = 1800.0) {
+                                 double timeout_sec = 1800.0,
+                                 long long tamanho_max = 0,
+                                 bool* pulado_por_tamanho = nullptr) {
+    if (pulado_por_tamanho) *pulado_por_tamanho = false;
     AsyncFileWriter writer(caminho_destino);
     if (!writer.good()) return false;
 
@@ -354,7 +409,7 @@ static bool http_download_stream(const std::string& url,
         headers = curl_slist_append(headers, token_header.c_str());
     }
 
-    DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now()};
+    DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now(), -1.0, -1, tamanho_max, false};
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -374,6 +429,15 @@ static bool http_download_stream(const std::string& url,
     if (headers) curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     writer.close(); // drena a fila pendente e fecha o arquivo
+
+    if (prog_ctx.estourou && tamanho_max > 0) {
+        std::error_code ec;
+        std::filesystem::remove(caminho_destino, ec);
+        if (pulado_por_tamanho) *pulado_por_tamanho = true;
+        log("                                   \r[SKIP] " + tag + " excede tamanho_max (" +
+            formatar_bytes(tamanho_max) + "): " + url);
+        return false;
+    }
 
     if (rc != CURLE_OK || status < 200 || status >= 300 || !writer.good()) {
         log("[ERRO] Download HTTP " + std::to_string(status) + " para " + tag);
@@ -641,9 +705,12 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
 
     std::string url_atual = download_url;
     bool ok = false;
+    bool pulado_max = false;
     for (int pulo = 0; pulo < 4; ++pulo) {
         log("[URL] " + std::string(tag) + ": " + url_atual);
-        ok = http_download_stream(url_atual, temporario.string(), api_key, tag);
+        pulado_max = false;
+        ok = http_download_stream(url_atual, temporario.string(), api_key, tag, CFG.http_timeout,
+                                  ds.tamanho_max_bytes, &pulado_max);
         if (!ok) break;
 
         std::string asset_url = extrair_asset_de_arquivo(temporario);
@@ -659,6 +726,17 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
     }
 
     if (ok && std::filesystem::exists(temporario)) {
+        // Checagem final de tamanho (servidor pode nao informar tamanho antes)
+        if (ds.tamanho_max_bytes > 0) {
+            std::error_code ec_sz;
+            auto sz = std::filesystem::file_size(temporario, ec_sz);
+            if (!ec_sz && sz > static_cast<unsigned long long>(ds.tamanho_max_bytes)) {
+                std::filesystem::remove(temporario, ec_sz);
+                log("[SKIP] " + std::string(tag) + " (" + formatar_bytes((long long)sz) +
+                    ") excede tamanho_max (" + formatar_bytes(ds.tamanho_max_bytes) + ")");
+                return false;
+            }
+        }
         std::error_code ec;
         std::filesystem::rename(temporario, destino, ec);
         if (!ec) {
@@ -686,9 +764,18 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
 bool baixar_arquivo_seguro(const std::string& url,
                            const std::string& caminho_destino,
                            const std::string& api_key,
-                           int tamanho_min,
+                           long long tamanho_min,
                            const std::map<std::string, std::string>& headers,
-                           double timeout_sec) {
+                           double timeout_sec,
+                           long long tamanho_max,
+                           bool* pulado_por_tamanho) {
+    if (pulado_por_tamanho) *pulado_por_tamanho = false;
+    auto marcar_pulado = [&](const std::string& motivo) {
+        if (pulado_por_tamanho) *pulado_por_tamanho = true;
+        log("[SKIP] " + motivo + " (limite " + formatar_bytes(tamanho_max) + "): " + url);
+    };
+    if (tamanho_max < 0) tamanho_max = 0;
+    if (tamanho_min < 0) tamanho_min = 0;
     std::filesystem::path dest(expandir_caminho(caminho_destino));
     std::error_code ec_pre;
     auto pai = dest.parent_path();
@@ -699,6 +786,10 @@ bool baixar_arquivo_seguro(const std::string& url,
     if (std::filesystem::exists(dest, ec)) {
         auto sz = std::filesystem::file_size(dest, ec);
         if (!ec && sz > 0 && (tamanho_min <= 0 || sz >= static_cast<unsigned long long>(tamanho_min))) {
+            if (tamanho_max > 0 && sz > static_cast<unsigned long long>(tamanho_max)) {
+                marcar_pulado("Arquivo local (" + formatar_bytes((long long)sz) + ") excede tamanho_max");
+                return false;
+            }
             return true;
         }
         std::filesystem::remove(dest, ec);
@@ -733,8 +824,12 @@ bool baixar_arquivo_seguro(const std::string& url,
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (hdr) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &arq);
+    EscritorLimitado wl{&arq, tamanho_max, 0, false};
+    HeadersDownload hdrs;
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_limitado_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &wl);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_download_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hdrs);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -749,6 +844,24 @@ bool baixar_arquivo_seguro(const std::string& url,
     curl_easy_cleanup(curl);
     arq.close();
 
+    // Skip por tamanho: Content-Length ja anunciava excesso, ou o stream estourou o limite.
+    if (tamanho_max > 0) {
+        if (hdrs.content_length > tamanho_max) {
+            std::filesystem::remove(temp_dest, ec);
+            marcar_pulado("Content-Length " + formatar_bytes(hdrs.content_length) + " excede tamanho_max");
+            return false;
+        }
+        if (wl.estourou || rc == CURLE_WRITE_ERROR) {
+            // Confirma: pode ser erro real de disco; checa o que foi gravado.
+            auto parcial = std::filesystem::file_size(temp_dest, ec);
+            if (wl.estourou || (!ec && parcial >= static_cast<unsigned long long>(tamanho_max))) {
+                std::filesystem::remove(temp_dest, ec);
+                marcar_pulado("Download excedeu tamanho_max durante o stream");
+                return false;
+            }
+        }
+    }
+
     if (rc != CURLE_OK || status < 200 || status >= 300) {
         std::filesystem::remove(temp_dest, ec);
         return false;
@@ -757,6 +870,11 @@ bool baixar_arquivo_seguro(const std::string& url,
     auto sz = std::filesystem::file_size(temp_dest, ec);
     if (ec || sz == 0 || (tamanho_min > 0 && sz < static_cast<unsigned long long>(tamanho_min))) {
         std::filesystem::remove(temp_dest, ec);
+        return false;
+    }
+    if (tamanho_max > 0 && sz > static_cast<unsigned long long>(tamanho_max)) {
+        std::filesystem::remove(temp_dest, ec);
+        marcar_pulado("Arquivo final (" + formatar_bytes((long long)sz) + ") excede tamanho_max");
         return false;
     }
 
@@ -817,11 +935,14 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
         std::atomic<size_t> idx_url{0};
         std::atomic<size_t> baixados{0};
         std::atomic<size_t> falhas{0};
+        std::atomic<size_t> pulados{0};
         std::vector<std::thread> workers;
 
         log("============================================================");
         log("BAIXANDO ARQUIVOS DIRETOS: " + ds.id + " (" + std::to_string(urls_para_baixar.size()) + " itens)");
         log("Diretório de saída: " + pasta_saida.string());
+        if (ds.tamanho_max_bytes > 0)
+            log("Tamanho maximo: " + formatar_bytes(ds.tamanho_max_bytes) + " (maiores sao pulados)");
         log("============================================================");
 
         for (int i = 0; i < n_workers; ++i) {
@@ -833,10 +954,14 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
                     std::string nome_arq = obter_nome_arquivo_da_url(u);
                     std::filesystem::path dest = pasta_saida / nome_arq;
 
-                    bool ok = baixar_arquivo_seguro(u, dest.string(), api_key, ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                    bool pulado_max = false;
+                    bool ok = baixar_arquivo_seguro(u, dest.string(), api_key, ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
+                                                    ds.tamanho_max_bytes, &pulado_max);
                     if (ok) {
                         ++baixados;
                         log("  [ARQUIVO " + std::to_string(baixados.load()) + "/" + std::to_string(urls_para_baixar.size()) + "] " + nome_arq);
+                    } else if (pulado_max) {
+                        ++pulados;
                     } else {
                         ++falhas;
                         log("  [FALHA] " + u);
@@ -845,7 +970,9 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
             });
         }
         for (auto& t : workers) t.join();
-        log("[CONCLUÍDO] " + std::to_string(baixados.load()) + " baixados, " + std::to_string(falhas.load()) + " falhas.");
+        log("[CONCLUÍDO] " + std::to_string(baixados.load()) + " baixados, " +
+            std::to_string(pulados.load()) + " pulados (tamanho), " +
+            std::to_string(falhas.load()) + " falhas.");
         return;
     }
 

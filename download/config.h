@@ -74,6 +74,7 @@ struct DatasetCfg {
     std::string padrao_extracao; // Regex para extrair URLs em páginas HTML/texto (ou "html_imgs", "html_links", "m3u")
     bool usar_yt_dlp = false; // Se true e for stream/video suportado, usa yt-dlp como fallback
     int tamanho_min_bytes = 0; // Se > 0, descarta arquivos menores que isso (evita imagens corrompidas/placeholders)
+    long long tamanho_max_bytes = 0; // Se > 0, PULA arquivos maiores que isso (antes e durante o download). 0 = sem limite.
 
     // Suporte ao Google Drive
     std::string drive_folder_id;
@@ -125,6 +126,7 @@ struct Config {
     double custo_dias_ref = 14.0;
     double custo_dias_fator = 1.5;
     double cooldown_quota = 300.0;
+    long long tamanho_max_bytes = 0; // Limite global (bytes). Dataset pode sobrescrever.
     std::string api_keys;
     std::string api_key_param = "apikey";
     std::string fuso_horario = "America/Sao_Paulo";

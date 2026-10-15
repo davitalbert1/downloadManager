@@ -208,7 +208,8 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
                                     if (!item_nome.empty()) sub_pasta /= sanitizar_nome_arquivo(item_nome);
                                     for (const auto& img_url : imgs) {
                                         std::filesystem::path dest = sub_pasta / obter_nome_arquivo_da_url(img_url);
-                                        baixar_arquivo_seguro(img_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                                        baixar_arquivo_seguro(img_url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
+                                                              ds.tamanho_max_bytes, nullptr);
                                     }
                                 }
                             }
@@ -342,7 +343,8 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
                     size_t k = idx_v.fetch_add(1);
                     if (k >= alvos.size()) break;
                     std::filesystem::path dest = std::filesystem::path(pasta) / alvos[k].nome;
-                    baixar_arquivo_seguro(alvos[k].url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
+                    baixar_arquivo_seguro(alvos[k].url, dest.string(), "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
+                                          ds.tamanho_max_bytes, nullptr);
                 }
             });
         }

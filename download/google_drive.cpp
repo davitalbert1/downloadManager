@@ -80,6 +80,8 @@ struct ProgressoArquivoDrive {
     std::string nome;
     unsigned long long total = 0; // tamanho esperado do arquivo (0 = desconhecido)
     unsigned long long feito = 0; // bytes gravados neste arquivo
+    unsigned long long tamanho_max = 0; // >0 = aborta quando exceder
+    bool estourou_max = false; // limite excedido no meio do stream
     bool imprimiu = false; // barra ja desenhada (precisa fechar com '\n' em erro)
     std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point ultimo_log = std::chrono::steady_clock::now();
@@ -184,6 +186,10 @@ static size_t drive_write_file_progress_cb(void* contents, size_t size, size_t n
     auto* ctx = static_cast<ProgressoArquivoDrive*>(userp);
     if (!ctx || !ctx->file) return 0;
     size_t n = size * nmemb;
+    if (ctx->tamanho_max > 0 && ctx->feito + (unsigned long long)n > ctx->tamanho_max) {
+        ctx->estourou_max = true;
+        return 0; // aborta (CURLE_WRITE_ERROR) sem gravar o excesso
+    }
     size_t gravados = fwrite(contents, 1, n, ctx->file);
     ctx->feito += (unsigned long long)gravados;
     if (ctx->global) ctx->global->baixado_bytes.fetch_add((unsigned long long)gravados);
@@ -420,8 +426,11 @@ static std::vector<json> drive_listar_arquivos(const std::string& folder_id, con
     return arquivos;
 }
 
-static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, const std::string& access_token, int min_bytes = 0,
+static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, const std::string& access_token, long long min_bytes = 0,
+                               long long max_bytes = 0, bool* pulado_por_tamanho = nullptr,
                                ProgressoDrive* progresso = nullptr) {
+    if (pulado_por_tamanho) *pulado_por_tamanho = false;
+    if (max_bytes < 0) max_bytes = 0;
     if (!arquivo.contains("id") || !arquivo.contains("name")) {
         throw std::runtime_error("Arquivo retornado pelo Google nao possui id ou name.");
     }
@@ -447,6 +456,13 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
     if (fs::exists(caminho_final, ec)) {
         auto sz = fs::file_size(caminho_final, ec);
         if (!ec && sz > 0 && (min_bytes <= 0 || sz >= static_cast<unsigned long long>(min_bytes))) {
+            if (max_bytes > 0 && sz > static_cast<unsigned long long>(max_bytes)) {
+                if (pulado_por_tamanho) *pulado_por_tamanho = true;
+                if (progresso) progresso->prontos_arquivos.fetch_add(1);
+                log("[DRIVE SKIP] " + nome + " (" + drive_formatar_bytes((unsigned long long)sz) +
+                    ") excede tamanho_max (" + drive_formatar_bytes((unsigned long long)max_bytes) + ")");
+                return;
+            }
             if (progresso) {
                 progresso->baixado_bytes.fetch_add((unsigned long long)sz);
                 progresso->prontos_arquivos.fetch_add(1);
@@ -462,6 +478,14 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
         log("[DRIVE BAIXANDO] " + nome + " (" + drive_formatar_bytes(tam_esperado) + ") -> " + caminho_final.string());
     else
         log("[DRIVE BAIXANDO] " + nome + " (tamanho desconhecido) -> " + caminho_final.string());
+    // Skip antecipado via metadados (Drive informa size sem baixar nada)
+    if (max_bytes > 0 && tam_esperado > static_cast<unsigned long long>(max_bytes)) {
+        if (pulado_por_tamanho) *pulado_por_tamanho = true;
+        if (progresso) progresso->prontos_arquivos.fetch_add(1);
+        log("[DRIVE SKIP] " + nome + " (" + drive_formatar_bytes(tam_esperado) +
+            ") excede tamanho_max (" + drive_formatar_bytes((unsigned long long)max_bytes) + ")");
+        return;
+    }
     std::string url = "https://www.googleapis.com/drive/v3/files/" + drive_url_encode(id) + "?alt=media";
     FILE* file = _wfopen(caminho_temp.wstring().c_str(), L"wb");
     if (!file) {
@@ -481,6 +505,7 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
     ctx_prog.global = progresso;
     ctx_prog.nome = nome;
     ctx_prog.total = tam_esperado;
+    ctx_prog.tamanho_max = max_bytes > 0 ? static_cast<unsigned long long>(max_bytes) : 0;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, drive_write_file_progress_cb);
@@ -494,6 +519,19 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
     curl_easy_cleanup(curl);
     // Em erro, fecha a barra pendente (se houver) para o log nao colar na
     // linha do progresso.
+    if (ctx_prog.estourou_max && max_bytes > 0) {
+        if (ctx_prog.imprimiu) {
+            fputc('\n', stdout);
+            fflush(stdout);
+        }
+        std::error_code remove_ec;
+        fs::remove(caminho_temp, remove_ec);
+        if (pulado_por_tamanho) *pulado_por_tamanho = true;
+        if (progresso) progresso->prontos_arquivos.fetch_add(1);
+        log("[DRIVE SKIP] " + nome + " excede tamanho_max (" +
+            drive_formatar_bytes((unsigned long long)max_bytes) + ") - interrompido no stream");
+        return;
+    }
     if (result != CURLE_OK) {
         if (ctx_prog.imprimiu) {
             fputc('\n', stdout);
@@ -579,9 +617,11 @@ static void drive_renovar_token_se_preciso(TokenAcessoDrive& token, const json& 
 // process_workers é reservado p/ futuro pós-processamento (ex: checksum/index).
 static void drive_baixar_item_recursivo(const json& item, const fs::path& destino_local,
                                         TokenAcessoDrive& token, const json& service_account,
-                                        int tamanho_min_bytes, std::atomic<size_t>& sucesso,
+                                        long long tamanho_min_bytes, long long tamanho_max_bytes,
+                                        std::atomic<size_t>& sucesso,
                                         std::atomic<size_t>& erros,
                                         int download_workers,
+                                        std::atomic<size_t>* pulados = nullptr,
                                         ProgressoDrive* progresso = nullptr,
                                         int profundidade = 0) {
     if (profundidade > 64) {
@@ -669,8 +709,8 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
                         size_t k = idx.fetch_add(1);
                         if (k >= arquivos_pasta.size()) break;
                         drive_baixar_item_recursivo(arquivos_pasta[k], sub, token, service_account,
-                                                    tamanho_min_bytes, sucesso, erros,
-                                                    download_workers, progresso, profundidade + 1);
+                                                    tamanho_min_bytes, tamanho_max_bytes, sucesso, erros,
+                                                    download_workers, pulados, progresso, profundidade + 1);
                     }
                 });
             }
@@ -678,8 +718,8 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
         }
         for (const auto& s : subpastas)
             drive_baixar_item_recursivo(s, sub, token, service_account,
-                                        tamanho_min_bytes, sucesso, erros,
-                                        download_workers, progresso, profundidade + 1);
+                                        tamanho_min_bytes, tamanho_max_bytes, sucesso, erros,
+                                        download_workers, pulados, progresso, profundidade + 1);
         {
             // Resumo da pasta: consolidado dos arquivos concluídos aqui dentro.
             double dec = std::chrono::duration<double>(
@@ -697,8 +737,14 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
     for (int tentativa = 0; tentativa < 2; ++tentativa) {
         drive_renovar_token_se_preciso(token, service_account);
         try {
-            drive_baixar_arquivo(item, destino_local, token.valor, tamanho_min_bytes, progresso);
-            sucesso.fetch_add(1);
+            bool pulado_max = false;
+            drive_baixar_arquivo(item, destino_local, token.valor, tamanho_min_bytes, tamanho_max_bytes,
+                                 &pulado_max, progresso);
+            if (pulado_max) {
+                if (pulados) pulados->fetch_add(1);
+            } else {
+                sucesso.fetch_add(1);
+            }
             return;
         } catch (const ErroHttpDrive& e) {
             if (e.codigo == 401 && tentativa == 0) {
@@ -815,7 +861,7 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
     progresso.inicio = std::chrono::steady_clock::now();
     log("  [DRIVE] Baixando pasta por pasta (conclui uma antes de ir p/ proxima)...");
 
-    size_t sucesso = 0, erros = 0;
+    size_t sucesso = 0, erros = 0, pulados = 0;
     {
         std::vector<json> subpastas_raiz;
         subpastas_raiz.reserve(arquivos.size());
@@ -827,17 +873,30 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
                 continue;
             }
             if (a.value("mimeType", "").rfind("application/vnd.google-apps.", 0) == 0) continue;
+            // Skip antecipado: metadado size ja diz que excede o limite (sem baixar nada)
+            if (ds.tamanho_max_bytes > 0) {
+                unsigned long long sz = drive_tamanho_do_item(a);
+                if (sz > static_cast<unsigned long long>(ds.tamanho_max_bytes)) {
+                    ++pulados;
+                    progresso.prontos_arquivos.fetch_add(1);
+                    log("[DRIVE SKIP] " + a.value("name", "?") + " (" + drive_formatar_bytes(sz) +
+                        ") excede tamanho_max (" +
+                        drive_formatar_bytes((unsigned long long)ds.tamanho_max_bytes) + ")");
+                    continue;
+                }
+            }
             arquivos_raiz.push_back(a);
             progresso.total_arquivos.fetch_add(1);
             progresso.total_bytes.fetch_add(drive_tamanho_do_item(a));
         }
         log("  [DRIVE] Raiz: " + std::to_string(arquivos.size()) + " itens (" +
             std::to_string(arquivos_raiz.size()) + " arquivos, " +
-            std::to_string(subpastas_raiz.size()) + " subpastas)");
+            std::to_string(subpastas_raiz.size()) + " subpastas" +
+            (pulados ? ", " + std::to_string(pulados) + " pulados (tamanho)" : "") + ")");
         int n_dl = CFG.download_workers < 1 ? 1 : CFG.download_workers;
         if ((size_t)n_dl > arquivos_raiz.size() && !arquivos_raiz.empty())
             n_dl = (int)arquivos_raiz.size();
-        std::atomic<size_t> suc_at{0}, err_at{0};
+        std::atomic<size_t> suc_at{0}, err_at{0}, pul_at{0};
         log("  [DRIVE] download_workers=" + std::to_string(n_dl) +
             " process_workers=" + std::to_string(CFG.process_workers) +
             " p/ raiz (" + std::to_string(arquivos_raiz.size()) + " arquivos)");
@@ -851,8 +910,8 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
                         size_t k = idx.fetch_add(1);
                         if (k >= arquivos_raiz.size()) break;
                         drive_baixar_item_recursivo(arquivos_raiz[k], dest, token, service_account,
-                                                    ds.tamanho_min_bytes, suc_at, err_at,
-                                                    n_dl, &progresso);
+                                                    ds.tamanho_min_bytes, ds.tamanho_max_bytes, suc_at, err_at,
+                                                    n_dl, &pul_at, &progresso);
                     }
                 });
             }
@@ -860,11 +919,12 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
         }
         for (const auto& s : subpastas_raiz)
             drive_baixar_item_recursivo(s, dest, token, service_account,
-                                        ds.tamanho_min_bytes, suc_at, err_at,
+                                        ds.tamanho_min_bytes, ds.tamanho_max_bytes, suc_at, err_at,
                                         CFG.download_workers < 1 ? 1 : CFG.download_workers,
-                                        &progresso);
+                                        &pul_at, &progresso);
         sucesso = suc_at.load();
         erros = err_at.load();
+        pulados += pul_at.load();
     }
 
     {
@@ -874,6 +934,7 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
         double vel = (double)progresso.baixado_bytes.load() / dec;
         log("------------------------------------------------------------");
         log("CONCLUIDO DRIVE: " + std::to_string(sucesso) + " baixados/verificados, " +
+            std::to_string(pulados) + " pulados (tamanho), " +
             std::to_string(erros) + " erros em " + drive_formatar_tempo(dec) +
             " | " + drive_formatar_bytes(progresso.baixado_bytes.load()) +
             " a " + drive_formatar_bytes((unsigned long long)vel) + "/s");

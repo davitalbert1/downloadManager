@@ -318,6 +318,17 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.padrao_extracao = cortar(ini.obter_ou(secao, "padrao_extracao"));
         d.usar_yt_dlp = para_bool(ini.obter_ou(secao, "usar_yt_dlp", "0"), false);
         d.tamanho_min_bytes = para_int(ini.obter_ou(secao, "tamanho_min_bytes", "0"), 0);
+        { // tamanho maximo: aceita bytes ou sufixos (KB/MB/GB/TB); aliases PT/EN
+            std::string tmax = cortar(ini.obter_ou(secao, "tamanho_max_bytes"));
+            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "tamanho_maximo"));
+            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "tamanho_max"));
+            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "max_bytes"));
+            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "max_file_size"));
+            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "max_size"));
+            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "tamanho_limite"));
+            if (!tmax.empty()) d.tamanho_max_bytes = parse_tamanho_bytes(tmax, 0);
+            // vazio = herda do [geral] em carregar_config()
+        }
 
         d.drive_folder_id = cortar(ini.obter_ou(secao, "drive_folder_id"));
         if (d.drive_folder_id.empty()) d.drive_folder_id = cortar(ini.obter_ou(secao, "folder_id"));
@@ -551,6 +562,25 @@ void carregar_config(const std::string& caminho) {
     le_texto("general", "fuso_horario", CFG.fuso_horario);
     le_texto("general", "periodo_inicio", CFG.periodo_inicio);
     le_texto("general", "periodo_fim", CFG.periodo_fim);
+    { // limite global de tamanho (vale p/ todos os datasets que nao definirem o proprio)
+        std::string gmax;
+        if (ini.obter("geral", "tamanho_max_bytes", gmax) || ini.obter("general", "tamanho_max_bytes", gmax) ||
+            ini.obter("geral", "tamanho_maximo", gmax) || ini.obter("general", "tamanho_maximo", gmax) ||
+            ini.obter("geral", "tamanho_max", gmax) || ini.obter("general", "tamanho_max", gmax) ||
+            ini.obter("geral", "max_bytes", gmax) || ini.obter("general", "max_bytes", gmax) ||
+            ini.obter("geral", "max_file_size", gmax) || ini.obter("general", "max_file_size", gmax) ||
+            ini.obter("geral", "max_size", gmax) || ini.obter("general", "max_size", gmax)) {
+            CFG.tamanho_max_bytes = parse_tamanho_bytes(gmax, 0);
+        }
+        // env tem prioridade se o ini nao definiu (0 = nao definido)
+        if (CFG.tamanho_max_bytes <= 0) {
+            const char* ev = std::getenv("TAMANHO_MAX_BYTES");
+            if (!ev || !*ev) ev = std::getenv("MAX_FILE_SIZE");
+            if (!ev || !*ev) ev = std::getenv("MAX_SIZE");
+            if (ev && *ev) CFG.tamanho_max_bytes = parse_tamanho_bytes(ev, 0);
+        }
+        if (CFG.tamanho_max_bytes < 0) CFG.tamanho_max_bytes = 0;
+    }
 
     auto coord_linhas = ini.lista("coordenadas");
     if (coord_linhas.empty()) coord_linhas = ini.lista("coordinates");
@@ -614,8 +644,13 @@ void carregar_config(const std::string& caminho) {
     std::cout << "[CFG] download_workers=" << CFG.download_workers
               << " process_workers=" << CFG.process_workers
               << " (fonte: " << caminho << ")\n";
+    if (CFG.tamanho_max_bytes > 0)
+        std::cout << "[CFG] tamanho_max_bytes global=" << formatar_bytes(CFG.tamanho_max_bytes)
+                  << " (" << CFG.tamanho_max_bytes << " bytes)\n";
     for (auto& d : CFG.datasets) {
         if (d.db.empty()) d.db = CFG.db_path;
         if (d.api_keys.empty()) d.api_keys = CFG.api_keys;
+        if (d.tamanho_max_bytes <= 0) d.tamanho_max_bytes = CFG.tamanho_max_bytes; // herda global
+        if (d.tamanho_max_bytes < 0) d.tamanho_max_bytes = 0;
     }
 }

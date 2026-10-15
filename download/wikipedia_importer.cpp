@@ -472,13 +472,23 @@ void executar_dataset_wikipedia(const DatasetCfg& ds) {
                         fs::path dest = fs::path(pasta) / n2;
                         std::error_code ec2;
                         if (fs::exists(dest, ec2) && fs::file_size(dest, ec2) > 0) {
+                            if (ds.tamanho_max_bytes > 0) {
+                                auto sz = fs::file_size(dest, ec2);
+                                if (!ec2 && sz > static_cast<unsigned long long>(ds.tamanho_max_bytes)) {
+                                    log("[WIKI][SKIP] " + n2 + " (" + std::to_string(sz) +
+                                        " bytes) excede tamanho_max");
+                                    continue;
+                                }
+                            }
                             log("[WIKI] OK (local): " + n2);
                             continue;
                         }
                         log("[WIKI] Baixando: " + n2);
+                        bool pulado_max = false;
                         bool ok = baixar_arquivo_seguro(juntar_url(base_url, n2), dest.string(),
-                            "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout);
-                        if (!ok) log("[WIKI][ERRO] Falha no download: " + n2);
+                            "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
+                            ds.tamanho_max_bytes, &pulado_max);
+                        if (!ok && !pulado_max) log("[WIKI][ERRO] Falha no download: " + n2);
                     }
                 });
             }

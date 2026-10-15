@@ -32,6 +32,11 @@ bool para_bool(const std::string& s, bool padrao);
 std::string sanitizar_nome_arquivo(const std::string& nome, size_t tam_max = 180);
 std::string obter_nome_arquivo_da_url(const std::string& url);
 
+// Tamanhos de arquivo: aceita bytes puros ou sufixos KB/MB/GB/TB (ex: "500MB",
+// "1.5GB", "102400", "0" = sem limite). Retorna bytes; <=0 = sem limite.
+long long parse_tamanho_bytes(const std::string& s, long long padrao = 0);
+std::string formatar_bytes(long long b);
+
 // Utilitários de Data e Hora (Howard Hinnant civil days)
 struct Data {
     int ano = 0, mes = 0, dia = 0;
