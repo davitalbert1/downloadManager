@@ -25,7 +25,6 @@ else()
     message(STATUS "Qt6 nao encontrado. clima_viewer nao sera compilado via CMake.")
 endif()
 
-# era5_import.exe - importador de arquivos GRIB / ERA5 para SQLite
 find_package(GDAL REQUIRED)
 
 # download.exe - download de dados genericos/climaticos
@@ -43,7 +42,7 @@ add_executable(download
     download/json_parser.cpp
     download/file_dataset.cpp
     download/engine_generico.cpp
-    download/era5_importer.cpp
+    download/grib_importer.cpp
     download/google_drive.cpp
     download/wikipedia_importer.cpp
 )
@@ -55,15 +54,13 @@ target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 GDAL::GDAL
 add_executable(clima_auditor app/test.cpp)
 target_link_libraries(clima_auditor PRIVATE SQLite3::SQLite3)
 
-# era5_import.exe - importador de arquivos GRIB / ERA5 para SQLite
-find_package(GDAL REQUIRED)
-
-add_executable(era5_import
-    download/era5_main.cpp
-    download/era5_importer.cpp
+# grib_import.exe - importador de arquivos GRIB para SQLite
+add_executable(grib_import
+    download/grib_main.cpp
+    download/grib_importer.cpp
 )
-target_include_directories(era5_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(era5_import PRIVATE GDAL::GDAL SQLite3::SQLite3 Threads::Threads)
+target_include_directories(grib_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(grib_import PRIVATE GDAL::GDAL SQLite3::SQLite3 Threads::Threads)
 
 # nlohmann/json (header-only): usa o pacote CMake se existir,
 # senão procura o include padrão nlohmann/json.hpp
@@ -109,8 +106,8 @@ target_link_libraries(db_manager PRIVATE
 add_custom_command(TARGET download POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:download> ${CMAKE_SOURCE_DIR}/download.exe
 )
-add_custom_command(TARGET era5_import POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:era5_import> ${CMAKE_SOURCE_DIR}/era5_import.exe
+add_custom_command(TARGET grib_import POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:grib_import> ${CMAKE_SOURCE_DIR}/grib_import.exe
 )
 add_custom_command(TARGET clima_auditor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:clima_auditor> ${CMAKE_SOURCE_DIR}/clima_auditor.exe

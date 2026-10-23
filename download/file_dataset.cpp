@@ -1,5 +1,6 @@
 #include "file_dataset.h"
-#include "era5_importer.h"
+#include "grib_importer.h"
+#include "http_client.h"
 #include "rate_limit.h"
 #include "storage_sqlite.h"
 #include "utils.h"
@@ -19,6 +20,68 @@
 #include <vector>
 
 using json = nlohmann::json;
+
+// Autenticação declarada pelo dataset: onde a chave vai (query, header ou
+// basic), qual o nome do header/parâmetro e o prefixo (ex: "Bearer").
+struct AuthApi {
+    std::string modo = "auto"; // auto | query | header | basic | none
+    std::string header = "Authorization";
+    std::string prefixo = "Bearer";
+    std::string param = "apikey";
+};
+
+static AuthApi auth_do_dataset(const DatasetCfg& ds) {
+    AuthApi a;
+    a.modo = minusculas(ds.api_key_em);
+    if (a.modo.empty()) a.modo = "auto";
+    if (!ds.api_key_header.empty()) a.header = ds.api_key_header;
+    a.prefixo = ds.api_key_prefix;
+    a.param = ds.api_key_param.empty() ? CFG.api_key_param : ds.api_key_param;
+    return a;
+}
+
+// URLs assinadas (S3/GCS/Azure) já carregam a credencial; enviar header extra
+// costuma invalidar a assinatura.
+static bool url_presignada(const std::string& url) {
+    return url.find("X-Amz-") != std::string::npos ||
+           url.find("X-Goog-") != std::string::npos ||
+           url.find("Signature=") != std::string::npos ||
+           url.find("sig=") != std::string::npos ||
+           url.find("object-store") != std::string::npos ||
+           url.find("amazonaws.com") != std::string::npos;
+}
+
+static std::string url_com_chave(const std::string& url_entrada, const AuthApi& auth,
+                                 const std::string& chave) {
+    if (chave.empty() || auth.modo != "query" || url_presignada(url_entrada))
+        return url_entrada;
+    CURL* curl = curl_easy_init();
+    if (!curl) return url_entrada;
+    char* esc = curl_easy_escape(curl, chave.c_str(), 0);
+    std::string url = url_entrada;
+    if (esc) {
+        url += (url.find('?') == std::string::npos ? "?" : "&");
+        url += auth.param + "=" + esc;
+        curl_free(esc);
+    }
+    curl_easy_cleanup(curl);
+    return url;
+}
+
+static void aplicar_auth(CURL* curl, struct curl_slist** headers, const AuthApi& auth,
+                         const std::string& chave, const std::string& url) {
+    if (chave.empty() || auth.modo == "none" || url_presignada(url)) return;
+    std::string modo = auth.modo;
+    if (modo == "auto") modo = (chave.find(':') != std::string::npos) ? "basic" : "header";
+    if (modo == "basic") {
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERPWD, chave.c_str());
+    } else if (modo == "header") {
+        std::string valor = auth.prefixo.empty() ? chave : auth.prefixo + " " + chave;
+        std::string linha = auth.header + ": " + valor;
+        *headers = curl_slist_append(*headers, linha.c_str());
+    }
+}
 
 struct RespostaHttpAvancada {
     long status = 0;
@@ -180,8 +243,9 @@ private:
     std::thread writer_;
 };
 
-static RespostaHttpAvancada http_post_json(const std::string& url,
+static RespostaHttpAvancada http_post_json(const std::string& url_entrada,
                                            const std::string& json_body,
+                                           const AuthApi& auth,
                                            const std::string& api_key,
                                            double timeout_sec = 60.0) {
     RespostaHttpAvancada r;
@@ -192,20 +256,11 @@ static RespostaHttpAvancada http_post_json(const std::string& url,
         return r;
     }
 
+    std::string url = url_com_chave(url_entrada, auth, api_key);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: application/json");
-    if (!api_key.empty()) {
-        if (api_key.find(':') != std::string::npos) {
-            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
-        } else {
-            std::string auth_header = "Authorization: Bearer " + api_key;
-            headers = curl_slist_append(headers, auth_header.c_str());
-        }
-        std::string token_header = "PRIVATE-TOKEN: " + api_key;
-        headers = curl_slist_append(headers, token_header.c_str());
-    }
+    aplicar_auth(curl, &headers, auth, api_key, url);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -232,7 +287,8 @@ static RespostaHttpAvancada http_post_json(const std::string& url,
     return r;
 }
 
-static RespostaHttpAvancada http_get_headers(const std::string& url,
+static RespostaHttpAvancada http_get_headers(const std::string& url_entrada,
+                                             const AuthApi& auth,
                                              const std::string& api_key,
                                              double timeout_sec = 60.0) {
     RespostaHttpAvancada r;
@@ -243,19 +299,10 @@ static RespostaHttpAvancada http_get_headers(const std::string& url,
         return r;
     }
 
+    std::string url = url_com_chave(url_entrada, auth, api_key);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Accept: application/json");
-    if (!api_key.empty()) {
-        if (api_key.find(':') != std::string::npos) {
-            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
-        } else {
-            std::string auth_header = "Authorization: Bearer " + api_key;
-            headers = curl_slist_append(headers, auth_header.c_str());
-        }
-        std::string token_header = "PRIVATE-TOKEN: " + api_key;
-        headers = curl_slist_append(headers, token_header.c_str());
-    }
+    aplicar_auth(curl, &headers, auth, api_key, url);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -264,6 +311,45 @@ static RespostaHttpAvancada http_get_headers(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        r.erro_rede = true;
+        r.erro_mensagem = curl_easy_strerror(rc);
+    } else {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+static RespostaHttpAvancada http_delete(const std::string& url_entrada,
+                                        const AuthApi& auth,
+                                        const std::string& api_key) {
+    RespostaHttpAvancada r;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        r.erro_rede = true;
+        r.erro_mensagem = "Falha ao inicializar CURL";
+        return r;
+    }
+
+    std::string url = url_com_chave(url_entrada, auth, api_key);
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    aplicar_auth(curl, &headers, auth, api_key, url);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 60000L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
@@ -320,8 +406,16 @@ static std::string extrair_url_download(const json& j) {
     return sanitizar_url_download(extrair_url_download_bruto(j));
 }
 
+static std::string duracao_hms(double segundos) {
+    long long s = static_cast<long long>(std::max(0.0, segundos));
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld", s / 3600, (s / 60) % 60, s % 60);
+    return std::string(buf);
+}
+
 struct DownloadProgressContext {
     std::string tag;
+    std::chrono::steady_clock::time_point inicio;
     std::chrono::steady_clock::time_point ult_log;
     double ultimo_pct = -1.0;
     int ultimo_marco = -1; // último marco de 10% impresso (0,1,...,10)
@@ -338,31 +432,52 @@ static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow
             return 1; // aborta o transfer
         }
     }
-    if (dltotal <= 0) return 0;
     auto agora = std::chrono::steady_clock::now();
     double dec = std::chrono::duration<double>(agora - ctx->ult_log).count();
-    bool concluido = (dlnow == dltotal);
-
     double baixado_mb = static_cast<double>(dlnow) / (1024.0 * 1024.0);
+
+    if (dltotal <= 0) {
+        // Sem Content-Length: ainda assim mostra quanto ja veio e a velocidade.
+        if (dec >= 3.0 && dlnow > 0) {
+            double total_decorrido =
+                std::chrono::duration<double>(agora - ctx->inicio).count();
+            double mbps = total_decorrido > 0.0 ? baixado_mb / total_decorrido : 0.0;
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                          "  [BAIXANDO] %s: %.2f MB baixados - %.2f MB/s (tamanho total desconhecido)",
+                          ctx->tag.c_str(), baixado_mb, mbps);
+            log(buf);
+            ctx->ult_log = agora;
+            ctx->ultimo_pct = 0.0;
+        }
+        return 0;
+    }
+
+    bool concluido = (dlnow == dltotal);
     double total_mb = static_cast<double>(dltotal) / (1024.0 * 1024.0);
     double pct = (total_mb > 0.0) ? (baixado_mb / total_mb * 100.0) : 0.0;
 
     // Com vários workers, cada atualização é impressa em sua própria linha via
-    // log(), que serializa a saída com mutex. Para não inundar o terminal,
-    // imprime apenas em marcos de 10% (0%, 10%, 20% ... 100%) ou a cada 10s.
+    // log(), que serializa a saída com mutex. Imprime em marcos de 10% e,
+    // no mínimo, a cada 3s para o usuario ver bytes/velocidade/ETA.
     int marco_atual = static_cast<int>(pct / 10.0);
     bool inicio = (ctx->ultimo_pct < 0.0);
     bool novo_marco = (marco_atual > ctx->ultimo_marco);
-    bool tempo_suficiente = (dec >= 10.0);
+    bool tempo_suficiente = (dec >= 3.0);
 
     if (concluido || inicio || novo_marco || tempo_suficiente) {
         ctx->ult_log = agora;
         ctx->ultimo_pct = pct;
         ctx->ultimo_marco = marco_atual;
 
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%)",
-                      ctx->tag.c_str(), baixado_mb, total_mb, pct);
+        double decorrido_total = std::chrono::duration<double>(agora - ctx->inicio).count();
+        double mbps = decorrido_total > 0.0 ? baixado_mb / decorrido_total : 0.0;
+        double eta = mbps > 0.0 ? (total_mb - baixado_mb) / mbps : 0.0;
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%) - %.2f MB/s - ETA %s",
+                      ctx->tag.c_str(), baixado_mb, total_mb, pct, mbps,
+                      duracao_hms(eta).c_str());
         log(buf);
     }
     return 0;
@@ -375,8 +490,9 @@ static size_t escrever_async_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
     return total;
 }
 
-static bool http_download_stream(const std::string& url,
+static bool http_download_stream(const std::string& url_entrada,
                                  const std::string& caminho_destino,
+                                 const AuthApi& auth,
                                  const std::string& api_key,
                                  const std::string& tag,
                                  double timeout_sec = 1800.0,
@@ -389,27 +505,13 @@ static bool http_download_stream(const std::string& url,
     CURL* curl = curl_easy_init();
     if (!curl) return false;
 
-    bool eh_storage_presigned = (url.find("object-store") != std::string::npos ||
-                                 url.find("s3.") != std::string::npos ||
-                                 url.find("amazonaws.com") != std::string::npos ||
-                                 url.find("Signature=") != std::string::npos ||
-                                 url.find("X-Amz-") != std::string::npos ||
-                                 url.find("cci2-prod-cache") != std::string::npos);
-
+    std::string url = url_com_chave(url_entrada, auth, api_key);
     struct curl_slist* headers = nullptr;
-    if (!api_key.empty() && !eh_storage_presigned) {
-        if (api_key.find(':') != std::string::npos) {
-            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
-        } else {
-            std::string auth_header = "Authorization: Bearer " + api_key;
-            headers = curl_slist_append(headers, auth_header.c_str());
-        }
-        std::string token_header = "PRIVATE-TOKEN: " + api_key;
-        headers = curl_slist_append(headers, token_header.c_str());
-    }
+    aplicar_auth(curl, &headers, auth, api_key, url);
 
-    DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now(), -1.0, -1, tamanho_max, false};
+    DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now(),
+                                     std::chrono::steady_clock::now(), -1.0, -1,
+                                     tamanho_max, false};
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -486,7 +588,243 @@ static std::string extrair_asset_de_arquivo(const std::filesystem::path& arq) {
     }
 }
 
-static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, const std::string& base_url, const std::string& api_key) {
+static bool texto_contem_algum(const std::string& texto,
+                               const std::vector<std::string>& trechos) {
+    for (const auto& t : trechos)
+        if (!t.empty() && texto.find(t) != std::string::npos) return true;
+    return false;
+}
+
+static bool status_na_lista(const std::string& status,
+                            const std::vector<std::string>& lista) {
+    return std::find(lista.begin(), lista.end(), status) != lista.end();
+}
+
+static std::string valor_do_campo(const json& j, const std::string& campo) {
+    if (campo.empty() || !j.is_object()) return "";
+    auto it = j.find(campo);
+    if (it == j.end()) return "";
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number_integer()) return std::to_string(it->get<long long>());
+    return "";
+}
+
+static const json* json_no_caminho(const json& j, const std::string& caminho) {
+    const json* atual = &j;
+    size_t inicio = 0;
+    while (inicio <= caminho.size()) {
+        size_t ponto = caminho.find('.', inicio);
+        std::string parte =
+            caminho.substr(inicio, ponto == std::string::npos ? std::string::npos : ponto - inicio);
+        if (parte.empty() || !atual->is_object()) return nullptr;
+        auto it = atual->find(parte);
+        if (it == atual->end()) return nullptr;
+        atual = &(*it);
+        if (ponto == std::string::npos) break;
+        inicio = ponto + 1;
+    }
+    return atual;
+}
+
+static const json* lista_de_jobs(const json& j, const std::string& campo) {
+    if (j.is_array()) return &j;
+    if (!j.is_object()) return nullptr;
+    for (const std::string& chave : std::vector<std::string>{campo, "jobs", "data", "results"}) {
+        if (chave.empty()) continue;
+        auto it = j.find(chave);
+        if (it != j.end() && it->is_array()) return &(*it);
+    }
+    return nullptr;
+}
+
+static std::string extrair_id_job(const json& j, const std::string& campo) {
+    std::string v = valor_do_campo(j, campo);
+    if (!v.empty()) return v;
+    for (const char* k : {"id", "job_id", "jobId", "request_id"}) {
+        v = valor_do_campo(j, k);
+        if (!v.empty()) return v;
+    }
+    return "";
+}
+
+static std::string criado_em(const json& job) {
+    for (const char* k : {"created", "created_at", "creation_time", "creationTime",
+                          "started", "start_time", "submitted"}) {
+        auto it = job.find(k);
+        if (it != job.end() && it->is_string()) return it->get<std::string>();
+    }
+    return "";
+}
+
+static std::string url_do_job(const std::string& modelo, const DatasetCfg& ds,
+                              const std::string& base, const std::string& job_id) {
+    if (modelo.empty()) return "";
+    Contexto ctx;
+    ctx["base"] = base;
+    ctx["dataset_api"] = ds.dataset_api;
+    ctx["dataset"] = ds.dataset_api;
+    ctx["job_id"] = job_id;
+    std::string url = cortar(aplicar_ctx(modelo, ctx));
+    if (url.empty()) return "";
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+        if (url.front() != '/') url = "/" + url;
+        url = base + url;
+    }
+    return url;
+}
+
+static std::string motivo_rejeicao_job(const DatasetCfg& ds, const AuthApi& auth,
+                                       const std::string& base, const std::string& api_key,
+                                       const std::string& job_id) {
+    std::string url = url_do_job(ds.job_resultado, ds, base, job_id);
+    if (url.empty()) return "";
+    RespostaHttpAvancada r = http_get_headers(url, auth, api_key);
+    if (r.erro_rede || r.corpo.empty()) return "";
+    std::string msg;
+    try {
+        json j = json::parse(r.corpo);
+        for (const char* k : {"traceback", "detail", "title", "message", "reason", "error"}) {
+            auto it = j.find(k);
+            if (it != j.end() && it->is_string()) {
+                msg = cortar(it->get<std::string>());
+                if (!msg.empty()) break;
+            }
+        }
+        if (msg.empty()) msg = cortar(r.corpo);
+    } catch (...) {
+        msg = cortar(r.corpo);
+    }
+    if (msg.size() > 800) msg.resize(800);
+    return msg;
+}
+
+// GRIB1, secao 1: ano do seculo, mes e seculo ficam em offsets fixos.
+static bool decodificar_data_grib(const unsigned char* b, size_t n, int& ano, int& mes) {
+    if (n < 64 || b[0] != 'G' || b[1] != 'R' || b[2] != 'I' || b[3] != 'B' || b[7] != 1)
+        return false;
+    int seculo = b[32];
+    if (seculo < 1 || seculo > 30) return false;
+    int a = (seculo - 1) * 100 + b[20];
+    int m = b[21];
+    if (a < 1900 || a > 2100 || m < 1 || m > 12) return false;
+    ano = a;
+    mes = m;
+    return true;
+}
+
+static bool ler_data_grib_local(const std::filesystem::path& arquivo, int& ano, int& mes) {
+    std::ifstream in(arquivo, std::ios::binary);
+    if (!in) return false;
+    unsigned char b[64] = {0};
+    in.read(reinterpret_cast<char*>(b), sizeof(b));
+    return in.gcount() == static_cast<std::streamsize>(sizeof(b)) &&
+           decodificar_data_grib(b, sizeof(b), ano, mes);
+}
+
+static bool ler_data_grib_remota(const std::string& url_entrada, const AuthApi& auth,
+                                 const std::string& api_key, int& ano, int& mes) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    std::string url = url_com_chave(url_entrada, auth, api_key);
+    std::string buf;
+    struct curl_slist* headers = nullptr;
+    aplicar_auth(curl, &headers, auth, api_key, url);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-63");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    if (rc != CURLE_OK || status < 200 || status >= 300 || buf.size() < 64) return false;
+    return decodificar_data_grib(reinterpret_cast<const unsigned char*>(buf.data()), buf.size(),
+                                 ano, mes);
+}
+
+// Reaproveita o job ativo mais recente (mantém a posição já conquistada na
+// fila) e cancela apenas duplicados antigos, conforme a configuração.
+static std::string obter_job_ativo(const DatasetCfg& ds, const AuthApi& auth,
+                                   const std::string& base, const std::string& api_key,
+                                   const std::string& tag) {
+    std::string url = url_do_job(ds.job_listar_ativos, ds, base, "");
+    if (url.empty()) return "";
+    RespostaHttpAvancada r = http_get_headers(url, auth, api_key);
+    if (r.erro_rede || r.status < 200 || r.status >= 300) return "";
+
+    json j;
+    try {
+        j = json::parse(r.corpo);
+    } catch (...) {
+        return "";
+    }
+    const json* lista = lista_de_jobs(j, ds.job_lista_campo);
+    if (!lista) return "";
+
+    struct JobAtivo {
+        std::string id;
+        std::string created;
+    };
+    std::vector<JobAtivo> ativos;
+    for (const auto& job : *lista) {
+        if (!job.is_object()) continue;
+        if (!ds.job_campo_dataset.empty() && !ds.dataset_api.empty() &&
+            valor_do_campo(job, ds.job_campo_dataset) != ds.dataset_api)
+            continue;
+        std::string id = extrair_id_job(job, ds.job_campo_id);
+        if (id.empty()) continue;
+        ativos.push_back({id, criado_em(job)});
+    }
+    if (ativos.empty()) return "";
+
+    size_t manter = 0;
+    for (size_t i = 1; i < ativos.size(); ++i)
+        if (ativos[i].created > ativos[manter].created) manter = i;
+
+    if (ds.job_cancelar_duplicados) {
+        for (size_t i = 0; i < ativos.size(); ++i) {
+            if (i == manter) continue;
+            std::string url_job = url_do_job(ds.job_status, ds, base, ativos[i].id);
+            if (url_job.empty()) continue;
+            RespostaHttpAvancada d = http_delete(url_job, auth, api_key);
+            if (!d.erro_rede && d.status >= 200 && d.status < 300)
+                log("[CANCELADO] " + tag + ": job duplicado " + ativos[i].id.substr(0, 8));
+            else
+                log("[AVISO] " + tag + ": nao conseguiu cancelar o job duplicado " +
+                    ativos[i].id.substr(0, 8));
+        }
+    }
+    return ativos[manter].id;
+}
+
+static std::string nome_arquivo_mensal(const DatasetCfg& ds, int ano, int mes,
+                                       const std::string& extensao) {
+    if (!ds.padrao_arquivo.empty()) {
+        Contexto fctx;
+        fctx["id"] = ds.id;
+        fctx["ano"] = std::to_string(ano);
+        char mes_buf[8];
+        std::snprintf(mes_buf, sizeof(mes_buf), "%02d", mes);
+        fctx["mes"] = mes_buf;
+        fctx["extensao"] = extensao;
+        return aplicar_ctx(ds.padrao_arquivo, fctx);
+    }
+    char fn[256];
+    std::snprintf(fn, sizeof(fn), "%s_%04d_%02d.%s", ds.id.c_str(), ano, mes, extensao.c_str());
+    return fn;
+}
+
+// Processa um mês de um dataset cujo resultado é um arquivo. Pode criar um job
+// assíncrono (endpoints em job_*) ou baixar direto de url_pronta.
+static bool processar_mes_arquivo(const DatasetCfg& ds, int ano, int mes,
+                                  const std::string& base_url, const std::string& api_key,
+                                  const std::string& url_pronta = "") {
+    AuthApi auth = auth_do_dataset(ds);
     // pasta_saida aceita path absoluto (C:\..., /..., \\server\...) ou relativo.
     std::string pasta_saida_str = resolver_pasta_saida(ds.pasta_saida, "dados_arquivos", "PASTA_SAIDA");
     std::filesystem::path pasta_saida(pasta_saida_str);
@@ -496,20 +834,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
     std::string extensao = obter_env_ou_config("FORMATO", ds.extensao, "bin");
     if (extensao == "netcdf") extensao = "nc";
 
-    char nome_final[128];
-    if (!ds.padrao_arquivo.empty()) {
-        Contexto fctx;
-        fctx["id"] = ds.id;
-        fctx["ano"] = std::to_string(ano);
-        char mes_buf[8];
-        std::snprintf(mes_buf, sizeof(mes_buf), "%02d", mes);
-        fctx["mes"] = mes_buf;
-        fctx["extensao"] = extensao;
-        std::string fn = aplicar_ctx(ds.padrao_arquivo, fctx);
-        std::snprintf(nome_final, sizeof(nome_final), "%s", fn.c_str());
-    } else {
-        std::snprintf(nome_final, sizeof(nome_final), "%s_%04d_%02d.%s", ds.id.c_str(), ano, mes, extensao.c_str());
-    }
+    std::string nome_final = nome_arquivo_mensal(ds, ano, mes, extensao);
     std::filesystem::path destino = pasta_saida / nome_final;
 
     std::string db_alvo = ds.db.empty() ? CFG.db_path : ds.db;
@@ -530,7 +855,7 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
                 std::string h_str = obter_env_ou_config("HORARIOS", "", "00:00,12:00");
                 hrs = dividir(h_str, ',');
             }
-            if (era5_mes_ja_no_banco(conn, tab_alvo, ano, mes, CFG.coordenadas, hrs)) {
+            if (grib_mes_ja_no_banco(conn, tab_alvo, ano, mes, CFG.coordenadas, hrs)) {
                 log("[NO BANCO] " + std::string(nome_final) + " ja importado em " + db_alvo + "." + tab_alvo + " - pulando download.");
                 return true;
             }
@@ -542,12 +867,12 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
             log("[JÁ EXISTE] " + std::string(nome_final));
             // Se o arquivo existe em disco mas os dados ainda não foram pro banco e auto_importar_banco está ligado:
             if (ds.auto_importar_banco && (extensao == "grib" || extensao == "grb")) {
-                Era5ImportConfig imp_cfg;
+                GribImportConfig imp_cfg;
                 imp_cfg.db_path = db_alvo;
                 imp_cfg.tabela = tab_alvo;
                 imp_cfg.coordenadas = CFG.coordenadas;
                 imp_cfg.process_workers = 1; // import único inline; paralelismo é no nível de meses
-                importar_arquivo_era5(destino.string(), imp_cfg);
+                importar_arquivo_grib(destino.string(), imp_cfg);
             }
             return true;
         } else {
@@ -576,153 +901,252 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
         horarios = dividir(h_str, ',');
     }
 
-    std::vector<std::string> vars = ds.vars;
-    if (vars.empty()) {
-        vars = {
-            "10m_u_component_of_wind", "10m_v_component_of_wind",
-            "2m_temperature", "2m_dewpoint_temperature",
-            "surface_pressure", "mean_sea_level_pressure",
-            "total_precipitation", "surface_solar_radiation_downwards"
-        };
-    }
-
-    std::string dataset_name = ds.dataset_api.empty() ? "reanalysis-era5-single-levels" : ds.dataset_api;
-
     char tag[64];
     std::snprintf(tag, sizeof(tag), "%04d-%02d", ano, mes);
-    log("[SOLICITANDO] " + std::string(tag));
+    if (url_pronta.empty()) log("[SOLICITANDO] " + std::string(tag));
 
-    json solicitacao_direct;
-    solicitacao_direct["product_type"] = json::array({ds.product_type.empty() ? "reanalysis" : ds.product_type});
-    solicitacao_direct["variable"] = vars;
-    char ano_str[16], mes_str[16];
-    std::snprintf(ano_str, sizeof(ano_str), "%04d", ano);
-    std::snprintf(mes_str, sizeof(mes_str), "%02d", mes);
-    solicitacao_direct["year"] = json::array({ano_str});
-    solicitacao_direct["month"] = json::array({mes_str});
-    solicitacao_direct["day"] = lista_dias;
-    solicitacao_direct["time"] = horarios;
-    solicitacao_direct["format"] = (extensao == "nc" ? "netcdf" : "grib");
-    solicitacao_direct["data_format"] = (extensao == "nc" ? "netcdf" : "grib");
-    solicitacao_direct["download_format"] = "unarchived";
-
-    json solicitacao_cads;
-    solicitacao_cads["inputs"] = solicitacao_direct;
-
-    std::string endpoint_post = base_url;
-    if (endpoint_post.rfind("http", 0) != 0) endpoint_post = "https://cds.climate.copernicus.eu/api";
-    if (endpoint_post.back() == '/') endpoint_post.pop_back();
-
-    std::string url_execute = endpoint_post + "/resources/" + dataset_name;
-    RespostaHttpAvancada resp;
-    for (int tentativa = 0; tentativa < 3; ++tentativa) {
-        if (tentativa > 0) {
-            long espera = (resp.status == 429) ? 30L : 10L * tentativa;
-            log("[REPETINDO] " + std::string(tag) + ": nova tentativa de envio em " +
-                std::to_string(espera) + "s (falha anterior: HTTP " + std::to_string(resp.status) +
-                (resp.erro_rede ? " / " + resp.erro_mensagem : "") + ")");
-            dormir(static_cast<double>(espera));
-        }
-
-        url_execute = endpoint_post + "/resources/" + dataset_name;
-        resp = http_post_json(url_execute, solicitacao_direct.dump(), api_key);
-
-        if (resp.status == 404) {
-            url_execute = endpoint_post + "/retrieve/v1/processes/" + dataset_name + "/execute";
-            resp = http_post_json(url_execute, solicitacao_cads.dump(), api_key);
-        }
-
-        if (!resp.erro_rede && resp.status >= 200 && resp.status < 300) break;
-    }
-
-    if (resp.erro_rede || resp.status < 200 || resp.status >= 300) {
-        std::string err_info = resp.erro_rede ? resp.erro_mensagem : ("HTTP " + std::to_string(resp.status));
-        std::string corpo_reduzido = resp.corpo.substr(0, 200);
-        log("[ERRO] Falha ao enviar requisição para " + std::string(tag) + " (" + err_info + "): " + corpo_reduzido);
+    std::string endpoint = cortar(base_url);
+    while (!endpoint.empty() && endpoint.back() == '/') endpoint.pop_back();
+    if (endpoint.empty()) {
+        log("[ERRO] " + std::string(tag) + ": url base nao configurada");
         return false;
     }
 
-    std::string job_id;
-    std::string download_url;
-
-    try {
-        json jresp = json::parse(resp.corpo);
-        download_url = extrair_url_download(jresp);
-        if (download_url.empty()) {
-            if (jresp.contains("job_id") && jresp["job_id"].is_string()) {
-                job_id = jresp["job_id"].get<std::string>();
-            } else if (jresp.contains("request_id") && jresp["request_id"].is_string()) {
-                job_id = jresp["request_id"].get<std::string>();
-            } else if (jresp.contains("jobID") && jresp["jobID"].is_string()) {
-                job_id = jresp["jobID"].get<std::string>();
-            } else if (jresp.contains("status") && jresp.contains("result")) {
-                download_url = extrair_url_download(jresp["result"]);
-            }
+    std::string download_url = url_pronta;
+    if (download_url.empty()) {
+        std::string corpo = ds.corpo;
+        if (corpo.empty()) {
+            corpo = "{}";
+        } else {
+            char ano_str[16], mes_str[16];
+            std::snprintf(ano_str, sizeof(ano_str), "%04d", ano);
+            std::snprintf(mes_str, sizeof(mes_str), "%02d", mes);
+            Contexto ctx;
+            ctx["ano"] = ano_str;
+            ctx["mes"] = mes_str;
+            ctx["dataset_api"] = ds.dataset_api;
+            ctx["extensao"] = extensao;
+            ctx["product_type"] = ds.product_type;
+            ctx["data_format"] = ds.data_format;
+            ctx["download_format"] = ds.download_format;
+            ctx["vars_json"] = json(ds.vars).dump();
+            ctx["dias_json"] = json(lista_dias).dump();
+            ctx["horarios_json"] = json(horarios).dump();
+            corpo = aplicar_ctx(corpo, ctx);
         }
-    } catch (...) {}
 
-    if (job_id.empty() && download_url.empty() && !resp.header_location.empty()) {
-        download_url = sanitizar_url_download(resp.header_location);
-    }
+        std::string url_executar = ds.job_executar.empty()
+                                       ? endpoint
+                                       : url_do_job(ds.job_executar, ds, endpoint, "");
+        if (url_executar.empty()) {
+            log("[ERRO] " + std::string(tag) + ": job_executar invalido");
+            return false;
+        }
 
-    if (!job_id.empty() && download_url.empty()) {
-        std::string status_url = endpoint_post + "/retrieve/v1/jobs/" + job_id;
-        for (int tentativa = 0; tentativa < 360; ++tentativa) {
-            dormir(5.0);
-            RespostaHttpAvancada sresp = http_get_headers(status_url, api_key);
-            if (sresp.status >= 200 && sresp.status < 300) {
-                try {
-                    json sj = json::parse(sresp.corpo);
-                    std::string st = sj.value("status", "");
-                    if (st == "successful" || st == "completed") {
-                        download_url = extrair_url_download(sj);
-                        if (download_url.empty()) download_url = status_url + "/results";
-                        break;
-                    } else if (st == "failed") {
-                        log("[ERRO] CDS Job falhou: " + sj.value("message", "erro"));
+        // Reaproveita o job que ja esta na fila em vez de cancelar e
+        // reiniciar a espera a cada execucao.
+        std::string job_id = obter_job_ativo(ds, auth, endpoint, api_key, tag);
+        if (!job_id.empty())
+            log("[FILA] " + std::string(tag) + ": reaproveitando job " + job_id.substr(0, 8) +
+                " ja aceito (sem reiniciar a espera)");
+
+        bool reenviar = false;
+        do {
+            reenviar = false;
+            if (job_id.empty()) {
+                while (true) {
+                    RespostaHttpAvancada resp = http_post_json(url_executar, corpo, auth, api_key);
+
+                    if (resp.erro_rede || resp.status == 429 || resp.status >= 500 ||
+                        texto_contem_algum(minusculas(resp.corpo), ds.job_reenviar_se)) {
+                        std::string motivo = resp.erro_rede ? resp.erro_mensagem
+                                                            : ("HTTP " + std::to_string(resp.status));
+                        log("[JOB] " + std::string(tag) + ": instabilidade (" + motivo +
+                            "); nova tentativa em 60s");
+                        dormir(60.0);
+                        continue;
+                    }
+                    if (resp.status < 200 || resp.status >= 300) {
+                        std::string erro = cortar(resp.corpo);
+                        if (erro.size() > 300) erro.resize(300);
+                        log("[ERRO] " + std::string(tag) + ": HTTP " + std::to_string(resp.status) +
+                            " - " + erro);
                         return false;
                     }
-                } catch (...) {}
+
+                    try {
+                        json jresp = json::parse(resp.corpo);
+                        download_url = extrair_url_download(jresp);
+                        if (download_url.empty()) job_id = extrair_id_job(jresp, ds.job_campo_id);
+                    } catch (...) {
+                        log("[ERRO] " + std::string(tag) + ": resposta invalida da API");
+                        return false;
+                    }
+                    if (job_id.empty() && download_url.empty()) {
+                        log("[ERRO] " + std::string(tag) + ": API nao devolveu id do job");
+                        return false;
+                    }
+                    break;
+                }
+                if (!download_url.empty()) break;
+                if (!job_id.empty())
+                    log("[JOB] " + std::string(tag) + ": job " + job_id.substr(0, 8) +
+                        " enviado; aguardando processamento (pode levar horas)");
             }
-        }
+
+            std::string url_status = url_do_job(ds.job_status, ds, endpoint, job_id);
+            if (url_status.empty()) {
+                log("[ERRO] " + std::string(tag) + ": job_status nao configurado");
+                return false;
+            }
+            std::vector<std::string> status_ok = ds.job_status_ok;
+            if (status_ok.empty())
+                status_ok = {"successful", "completed", "succeeded", "finished"};
+            std::vector<std::string> status_erro = ds.job_status_erro;
+            if (status_erro.empty())
+                status_erro = {"rejected", "failed", "dismissed", "cancelled", "canceled", "error"};
+
+            auto inicio = std::chrono::steady_clock::now();
+            auto ultimo_log = inicio;
+            std::string status_anterior;
+            json ultimo_json;
+            int falhas_seguidas = 0;
+
+            while (true) {
+                dormir(std::max(1.0, ds.job_poll_intervalo));
+                RespostaHttpAvancada sresp = http_get_headers(url_status, auth, api_key);
+                if (sresp.erro_rede || sresp.status < 200 || sresp.status >= 300) {
+                    if (++falhas_seguidas == 1 || falhas_seguidas % 10 == 0) {
+                        std::string motivo = sresp.erro_rede
+                                                 ? sresp.erro_mensagem
+                                                 : ("HTTP " + std::to_string(sresp.status));
+                        log("[JOB] " + std::string(tag) + ": falha ao consultar status (" +
+                            motivo + "); tentando de novo");
+                    }
+                    continue;
+                }
+                falhas_seguidas = 0;
+
+                std::string status;
+                try {
+                    ultimo_json = json::parse(sresp.corpo);
+                    status = minusculas(valor_do_campo(ultimo_json, ds.job_campo_status));
+                    if (status.empty()) status = minusculas(valor_do_campo(ultimo_json, "state"));
+                } catch (...) {
+                    continue;
+                }
+                if (status.empty()) continue;
+
+                auto agora = std::chrono::steady_clock::now();
+                double decorrido = std::chrono::duration<double>(agora - inicio).count();
+                // Log so na mudanca de status e em um heartbeat por minuto para
+                // nao parecer um loop enquanto o servidor mantem o job na fila.
+                if (status != status_anterior) {
+                    std::string espera;
+                    if (!status_na_lista(status, status_ok) &&
+                        !status_na_lista(status, status_erro))
+                        espera = " - aguardando o servidor processar (pode levar horas; "
+                                 "nao cancele, senao perde a posicao na fila)";
+                    log("[JOB] " + std::string(tag) + ": " + status + espera + " | " +
+                        duracao_hms(decorrido));
+                    status_anterior = status;
+                    ultimo_log = agora;
+                } else if (std::chrono::duration<double>(agora - ultimo_log).count() >= 60.0) {
+                    log("[JOB] " + std::string(tag) + ": " + status + " | " +
+                        duracao_hms(decorrido));
+                    ultimo_log = agora;
+                }
+
+                if (status_na_lista(status, status_ok)) {
+                    std::string url_resultado = url_do_job(ds.job_resultado, ds, endpoint, job_id);
+                    if (url_resultado.empty()) {
+                        download_url = extrair_url_download(ultimo_json);
+                    } else {
+                        RespostaHttpAvancada rresp =
+                            http_get_headers(url_resultado, auth, api_key);
+                        if (!rresp.erro_rede && rresp.status >= 200 && rresp.status < 300) {
+                            try {
+                                download_url = extrair_url_download(json::parse(rresp.corpo));
+                            } catch (...) {}
+                        }
+                        if (download_url.empty()) download_url = url_resultado;
+                    }
+                    if (download_url.empty()) {
+                        log("[ERRO] " + std::string(tag) + ": resultado indisponivel");
+                        return false;
+                    }
+                    break;
+                }
+
+                if (status_na_lista(status, status_erro)) {
+                    std::string motivo = motivo_rejeicao_job(ds, auth, endpoint, api_key, job_id);
+                    if (motivo.empty()) motivo = status;
+                    if (texto_contem_algum(minusculas(motivo), ds.job_reenviar_se)) {
+                        log("[JOB] " + std::string(tag) + ": nova tentativa em 60s (" + motivo + ")");
+                        dormir(60.0);
+                        reenviar = true;
+                        job_id.clear();
+                    } else {
+                        log("[ERRO] " + std::string(tag) + ": " + motivo);
+                        return false;
+                    }
+                    break;
+                }
+            }
+        } while (reenviar);
+    } else {
+        log("[JOB PRONTO] " + std::string(tag) + ": resultado ja processado; baixando agora");
     }
 
     download_url = sanitizar_url_download(download_url);
-
     if (download_url.empty()) {
-        log("[ERRO] Não foi possível obter URL de download para " + std::string(tag));
+        log("[ERRO] " + std::string(tag) + ": sem URL de download");
         return false;
     }
-
     if (download_url.rfind("http", 0) != 0) {
         if (download_url.front() != '/') download_url = "/" + download_url;
-        download_url = endpoint_post + download_url;
+        download_url = endpoint + download_url;
     }
 
     char nome_temp[128];
     std::snprintf(nome_temp, sizeof(nome_temp), "%s_%04d_%02d.temp", ds.id.c_str(), ano, mes);
     std::filesystem::path temporario = pasta_saida / nome_temp;
 
-    std::string url_atual = download_url;
     bool ok = false;
     bool pulado_max = false;
-    for (int pulo = 0; pulo < 4; ++pulo) {
-        log("[URL] " + std::string(tag) + ": " + url_atual);
-        pulado_max = false;
-        ok = http_download_stream(url_atual, temporario.string(), api_key, tag, CFG.http_timeout,
-                                  ds.tamanho_max_bytes, &pulado_max);
-        if (!ok) break;
+    double timeout_download = std::max(CFG.http_timeout, 1800.0);
 
-        std::string asset_url = extrair_asset_de_arquivo(temporario);
-        if (asset_url.empty()) break;
-
-        std::filesystem::remove(temporario);
-        if (asset_url.rfind("http", 0) != 0) {
-            if (asset_url.front() != '/') asset_url = "/" + asset_url;
-            asset_url = endpoint_post + asset_url;
+    auto baixar_ate_asset = [&](std::string url) {
+        for (int salto = 0; salto < 4; ++salto) {
+            std::error_code ec;
+            std::filesystem::remove(temporario, ec);
+            pulado_max = false;
+            if (!http_download_stream(url, temporario.string(), auth, api_key, tag,
+                                      timeout_download, ds.tamanho_max_bytes, &pulado_max))
+                return false;
+            std::string asset_url = extrair_asset_de_arquivo(temporario);
+            if (asset_url.empty()) return true;
+            std::filesystem::remove(temporario, ec);
+            if (asset_url.rfind("http", 0) != 0) {
+                if (asset_url.front() != '/') asset_url = "/" + asset_url;
+                asset_url = endpoint + asset_url;
+            }
+            url = asset_url;
         }
-        log("[SEGUINDO ASSET] " + std::string(tag) + " -> " + asset_url);
-        url_atual = asset_url;
+        return false;
+    };
+
+    for (int tentativa_dl = 0; tentativa_dl < 3 && !ok && !pulado_max; ++tentativa_dl) {
+        if (tentativa_dl > 0) {
+            log("[REPETINDO] Download " + std::string(tag) + " em 15s (tentativa " +
+                std::to_string(tentativa_dl + 1) + "/3)...");
+            dormir(15.0);
+        }
+        ok = baixar_ate_asset(download_url);
+    }
+    if (!ok && !pulado_max) {
+        std::error_code ec;
+        std::filesystem::remove(temporario, ec);
     }
 
     if (ok && std::filesystem::exists(temporario)) {
@@ -740,16 +1164,41 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
         std::error_code ec;
         std::filesystem::rename(temporario, destino, ec);
         if (!ec) {
-            log("[CONCLUÍDO] " + std::string(nome_final));
+            // Confere o mes real no GRIB (protege contra job reaproveitado de outro mes).
+            if (extensao == "grib" || extensao == "grb") {
+                int ano_real = 0, mes_real = 0;
+                if (ler_data_grib_local(destino, ano_real, mes_real) &&
+                    (ano_real != ano || mes_real != mes)) {
+                    char tag_real[64];
+                    std::snprintf(tag_real, sizeof(tag_real), "%04d-%02d", ano_real, mes_real);
+                    std::filesystem::path destino_real =
+                        pasta_saida / nome_arquivo_mensal(ds, ano_real, mes_real, extensao);
+                    std::error_code ec_mv;
+                    std::filesystem::rename(destino, destino_real, ec_mv);
+                    if (!ec_mv) {
+                        log("[AVISO] Servidor devolveu " + std::string(tag_real) + " para o pedido " +
+                            std::string(tag) + "; arquivo salvo no nome correto.");
+                        destino = destino_real;
+                    } else if (std::filesystem::exists(destino_real)) {
+                        // Mes ja baixado antes: descarta a copia com nome errado.
+                        std::error_code ec_rm;
+                        std::filesystem::remove(destino, ec_rm);
+                        log("[AVISO] Servidor devolveu " + std::string(tag_real) + " (ja existente); " +
+                            "duplicado do pedido " + std::string(tag) + " descartado.");
+                        return true;
+                    }
+                }
+            }
+            log("[CONCLUÍDO] " + destino.filename().string());
 
             // Importação automática imediata para o SQLite se configurado
             if (ds.auto_importar_banco && (extensao == "grib" || extensao == "grb")) {
-                Era5ImportConfig imp_cfg;
+                GribImportConfig imp_cfg;
                 imp_cfg.db_path = db_alvo;
                 imp_cfg.tabela = tab_alvo;
                 imp_cfg.coordenadas = CFG.coordenadas;
                 imp_cfg.process_workers = 1; // import único inline; paralelismo é no nível de meses
-                importar_arquivo_era5(destino.string(), imp_cfg);
+                importar_arquivo_grib(destino.string(), imp_cfg);
             }
 
             return true;
@@ -759,6 +1208,54 @@ static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, c
     }
 
     return false;
+}
+
+// Baixa resultados de jobs já concluídos, evitando reenviar o pedido e esperar
+// tudo de novo na fila. Para arquivos GRIB o período é lido do cabeçalho,
+// pois muitas APIs de jobs não devolvem os parâmetros do pedido.
+static void recuperar_resultados_job(const DatasetCfg& ds, const std::string& base_url,
+                                     const std::string& api_key) {
+    std::string url = url_do_job(ds.job_listar_ok, ds, cortar(base_url), "");
+    if (url.empty()) return;
+    AuthApi auth = auth_do_dataset(ds);
+    RespostaHttpAvancada r = http_get_headers(url, auth, api_key);
+    if (r.erro_rede || r.status < 200 || r.status >= 300) return;
+
+    json j;
+    try {
+        j = json::parse(r.corpo);
+    } catch (...) {
+        return;
+    }
+    const json* lista = lista_de_jobs(j, ds.job_lista_campo);
+    if (!lista) return;
+
+    std::set<std::string> vistos;
+    int disponiveis = 0;
+    for (const auto& job : *lista) {
+        if (!job.is_object()) continue;
+        if (!ds.job_campo_dataset.empty() && !ds.dataset_api.empty() &&
+            valor_do_campo(job, ds.job_campo_dataset) != ds.dataset_api)
+            continue;
+
+        const json* alvo = &job;
+        if (!ds.job_campo_asset.empty()) {
+            alvo = json_no_caminho(job, ds.job_campo_asset);
+            if (!alvo) continue;
+        }
+        std::string href = extrair_url_download(*alvo);
+        if (href.empty() || !vistos.insert(href).second) continue;
+
+        int ano = 0, mes = 0;
+        if (!ler_data_grib_remota(href, auth, api_key, ano, mes)) continue;
+        ++disponiveis;
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "%04d-%02d", ano, mes);
+        log("[JOB] resultado pronto: " + std::string(tag));
+        processar_mes_arquivo(ds, ano, mes, base_url, api_key, href);
+    }
+    if (disponiveis > 0)
+        log("[RECUPERADOS] " + std::to_string(disponiveis) + " resultado(s) prontos.");
 }
 
 bool baixar_arquivo_seguro(const std::string& url,
@@ -812,17 +1309,11 @@ bool baixar_arquivo_seguro(const std::string& url,
         hdr = curl_slist_append(hdr, l.c_str());
     }
 
-    if (!api_key.empty()) {
-        if (api_key.find(':') != std::string::npos) {
-            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
-        } else {
-            std::string auth = "Authorization: Bearer " + api_key;
-            hdr = curl_slist_append(hdr, auth.c_str());
-        }
-    }
+    AuthApi auth_padrao;
+    std::string url_final = url_com_chave(url, auth_padrao, api_key);
+    aplicar_auth(curl, &hdr, auth_padrao, api_key, url_final);
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, url_final.c_str());
     if (hdr) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
     EscritorLimitado wl{&arq, tamanho_max, 0, false};
     HeadersDownload hdrs;
@@ -907,7 +1398,11 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
     }
 
     std::string api_url = ds.url.empty() ? obter_env_ou_config("API_URL", "", "") : ds.url;
-    std::string api_key = ds.api_keys.empty() ? obter_env_ou_config("API_KEY", obter_env_ou_config("CDSAPI_KEY", "", ""), "") : ds.api_keys;
+    std::string api_key = ds.api_keys;
+    if (api_key.empty() && !ds.api_key_env.empty())
+        api_key = obter_env_ou_config(ds.api_key_env.c_str(), "", "");
+    if (api_key.empty()) api_key = obter_env_ou_config("API_KEY", "", "");
+    AuthApi auth = auth_do_dataset(ds);
 
     // Caso 1: Se o dataset contém uma lista direta de URLs (modo lista direta ou extração web)
     if (!ds.lista_urls.empty() || (!ds.padrao_extracao.empty() && !api_url.empty())) {
@@ -915,7 +1410,7 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
 
         if (!ds.padrao_extracao.empty() && !api_url.empty()) {
             log("[EXTRAÇÃO] Acessando " + api_url + " para extrair links (" + ds.padrao_extracao + ")...");
-            RespostaHttpAvancada r = http_get_headers(api_url, api_key, CFG.http_timeout);
+            RespostaHttpAvancada r = http_get_headers(api_url, auth, api_key, CFG.http_timeout);
             if (r.status >= 200 && r.status < 300 && !r.corpo.empty()) {
                 auto extraidas = extrair_urls_de_conteudo(r.corpo, api_url, ds.padrao_extracao);
                 log("[EXTRAÇÃO] " + std::to_string(extraidas.size()) + " links/arquivos encontrados.");
@@ -932,6 +1427,19 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
 
         int n_workers = CFG.download_workers;
         if (n_workers < 1) n_workers = 1;
+        std::map<std::string, std::string> headers_dl = ds.headers;
+        std::string chave_dl = api_key;
+        if (!api_key.empty()) {
+            std::string modo = auth.modo;
+            if (modo == "auto") modo = api_key.find(':') != std::string::npos ? "basic" : "header";
+            if (modo == "header") {
+                headers_dl[auth.header] =
+                    auth.prefixo.empty() ? api_key : auth.prefixo + " " + api_key;
+                chave_dl.clear();
+            } else if (modo == "query") {
+                chave_dl.clear();
+            }
+        }
         std::atomic<size_t> idx_url{0};
         std::atomic<size_t> baixados{0};
         std::atomic<size_t> falhas{0};
@@ -954,9 +1462,12 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
                     std::string nome_arq = obter_nome_arquivo_da_url(u);
                     std::filesystem::path dest = pasta_saida / nome_arq;
 
+                    std::string url_final = url_com_chave(u, auth, api_key);
                     bool pulado_max = false;
-                    bool ok = baixar_arquivo_seguro(u, dest.string(), api_key, ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
-                                                    ds.tamanho_max_bytes, &pulado_max);
+                    bool ok = baixar_arquivo_seguro(url_final, dest.string(), chave_dl,
+                                                    ds.tamanho_min_bytes, headers_dl,
+                                                    CFG.http_timeout, ds.tamanho_max_bytes,
+                                                    &pulado_max);
                     if (ok) {
                         ++baixados;
                         log("  [ARQUIVO " + std::to_string(baixados.load()) + "/" + std::to_string(urls_para_baixar.size()) + "] " + nome_arq);
@@ -976,7 +1487,7 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
         return;
     }
 
-    // Caso 2: Dataset temporal (ERA5 ou APIs de reanálise por períodos/meses)
+    // Caso 2: Dataset temporal (jobs/arquivos por período ou mês)
     int ano_inicial = para_int(obter_env_ou_config("ANO_INICIAL", "", std::to_string(ds.ano_inicial)), 1940);
     int dias_atraso = para_int(obter_env_ou_config("DIAS_ATRASO", "", std::to_string(ds.dias_atraso)), 0);
 
@@ -992,6 +1503,11 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
 
     int n_workers = CFG.download_workers;
     if (n_workers < 1) n_workers = 1;
+    if (ds.job_sequencial) {
+        if (n_workers != 1)
+            log("[CFG] " + ds.id + " exige jobs sequenciais; usando 1 download_worker.");
+        n_workers = 1;
+    }
     if ((size_t)n_workers > meses.size() && !meses.empty())
         n_workers = (int)meses.size();
 
@@ -1003,6 +1519,12 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
         std::to_string(n_workers));
     log("============================================================");
 
+    std::string formato_saida = minusculas(obter_env_ou_config("FORMATO", ds.extensao, "bin"));
+    if (!ds.job_listar_ok.empty() &&
+        (formato_saida == "grib" || formato_saida == "grb")) {
+        recuperar_resultados_job(ds, api_url, api_key);
+    }
+
     std::atomic<size_t> idx_mes{0};
     std::vector<std::thread> workers;
     workers.reserve((size_t)n_workers);
@@ -1012,7 +1534,7 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
                 size_t k = idx_mes.fetch_add(1);
                 if (k >= meses.size()) break;
                 try {
-                    processar_dataset_era5_mes(ds, meses[k].first, meses[k].second, api_url, api_key);
+                    processar_mes_arquivo(ds, meses[k].first, meses[k].second, api_url, api_key);
                 } catch (const std::exception& e) {
                     log(std::string("[ERROR] MES ") + std::to_string(meses[k].first) + "-" +
                         std::to_string(meses[k].second) + ": " + e.what());

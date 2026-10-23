@@ -305,8 +305,38 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.dataset_api = cortar(ini.obter_ou(secao, "dataset_api"));
         d.product_type = cortar(ini.obter_ou(secao, "product_type"));
         d.data_format = cortar(ini.obter_ou(secao, "data_format", d.extensao));
-        d.download_format = cortar(ini.obter_ou(secao, "download_format", "unarchived"));
+        d.download_format = cortar(ini.obter_ou(secao, "download_format"));
         d.padrao_arquivo = cortar(ini.obter_ou(secao, "padrao_arquivo"));
+        d.job_executar = cortar(ini.obter_ou(secao, "job_executar"));
+        d.job_status = cortar(ini.obter_ou(secao, "job_status"));
+        d.job_resultado = cortar(ini.obter_ou(secao, "job_resultado"));
+        d.job_listar_ativos = cortar(ini.obter_ou(secao, "job_listar_ativos"));
+        d.job_listar_ok = cortar(ini.obter_ou(secao, "job_listar_ok"));
+        d.job_lista_campo = cortar(ini.obter_ou(secao, "job_lista_campo", "jobs"));
+        d.job_campo_dataset = cortar(ini.obter_ou(secao, "job_campo_dataset"));
+        d.job_campo_id = cortar(ini.obter_ou(secao, "job_campo_id"));
+        d.job_campo_status = cortar(ini.obter_ou(secao, "job_campo_status", "status"));
+        d.job_campo_asset = cortar(ini.obter_ou(secao, "job_campo_asset"));
+        auto ler_lista_cfg = [&](const char* chave, std::vector<std::string>& destino) {
+            for (auto& item : dividir(ini.obter_ou(secao, chave), ',')) {
+                std::string v = minusculas(cortar(item));
+                if (!v.empty()) destino.push_back(v);
+            }
+        };
+        ler_lista_cfg("job_status_ok", d.job_status_ok);
+        ler_lista_cfg("job_status_erro", d.job_status_erro);
+        ler_lista_cfg("job_reenviar_se", d.job_reenviar_se);
+        {
+            std::string v = cortar(ini.obter_ou(secao, "job_poll_intervalo"));
+            if (!v.empty()) {
+                try {
+                    d.job_poll_intervalo = std::stod(v);
+                } catch (...) {}
+            }
+        }
+        d.job_sequencial = para_bool(ini.obter_ou(secao, "job_sequencial", "0"), false);
+        d.job_cancelar_duplicados =
+            para_bool(ini.obter_ou(secao, "job_cancelar_duplicados", "1"), true);
         d.ano_inicial = para_int(ini.obter_ou(secao, "ano_inicial", "1940"), 1940);
         d.dias_atraso = para_int(ini.obter_ou(secao, "dias_atraso", "0"), 0);
         d.auto_importar_banco = para_bool(ini.obter_ou(secao, "auto_importar_banco", "0"), false);
@@ -456,6 +486,8 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.api_key_em = minusculas(cortar(ini.obter_ou(secao, "api_key_em", "query")));
         d.api_key_header = cortar(ini.obter_ou(secao, "api_key_header", "Authorization"));
         d.api_key_prefix = cortar(ini.obter_ou(secao, "api_key_prefix", "Bearer"));
+        d.api_key_param = cortar(ini.obter_ou(secao, "api_key_param"));
+        d.api_key_env = cortar(ini.obter_ou(secao, "api_key_env"));
 
         if (it_sec != ini.valores.end()) {
             for (const auto& kv : it_sec->second) {

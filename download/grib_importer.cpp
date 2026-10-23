@@ -1,4 +1,4 @@
-#include "era5_importer.h"
+#include "grib_importer.h"
 #include <gdal.h>
 #include <gdal_priv.h>
 #include <sqlite3.h>
@@ -150,7 +150,7 @@ std::vector<std::pair<double, double>> carregar_coordenadas_ini(const std::strin
 }
 
 // Verifica se um mês (ano, mes) já está totalmente povoado no banco para as coordenadas fornecidas
-bool era5_mes_ja_no_banco(sqlite3* db, const std::string& tabela, int ano, int mes, const std::vector<std::pair<double, double>>& coords, const std::vector<std::string>& horarios) {
+bool grib_mes_ja_no_banco(sqlite3* db, const std::string& tabela, int ano, int mes, const std::vector<std::pair<double, double>>& coords, const std::vector<std::string>& horarios) {
     if (!db || coords.empty()) return false;
 
     // Checa se a tabela existe
@@ -288,8 +288,8 @@ struct PixelCoord {
     bool valido = false;
 };
 
-bool importar_arquivo_era5(const std::string& grib_path, const Era5ImportConfig& cfg) {
-    std::cout << "\n[ERA5 Import] Abrindo: " << grib_path << " ...\n";
+bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig& cfg) {
+    std::cout << "\n[GRIB Import] Abrindo: " << grib_path << " ...\n";
 
     GDALAllRegister();
     GDALDataset* poDataset = static_cast<GDALDataset*>(GDALOpen(grib_path.c_str(), GA_ReadOnly));
@@ -336,7 +336,7 @@ bool importar_arquivo_era5(const std::string& grib_path, const Era5ImportConfig&
         double lat = c.first;
         double lon = c.second;
 
-        // Longitude ERA5 costuma ir de -180 a 180 ou de 0 a 360 dependendo do arquivo.
+        // Longitude em GRIB costuma ir de -180 a 180 ou de 0 a 360 dependendo do arquivo.
         // Se origin_x >= 0 e lon < 0, converte lon para [0, 360)
         double lon_calc = lon;
         if (origin_x >= 0.0 && lon_calc < 0.0) {
@@ -459,7 +459,7 @@ bool importar_arquivo_era5(const std::string& grib_path, const Era5ImportConfig&
     std::map<std::pair<std::string, std::string>, std::vector<BandaInfo>> grupos_tempo;
     for (const auto& b : bandas) grupos_tempo[{b.data, b.hora}].push_back(b);
 
-    std::cout << "[ERA5 Import] Total de bandas: " << band_count
+    std::cout << "[GRIB Import] Total de bandas: " << band_count
               << " | Instantes temporais: " << grupos_tempo.size()
               << " | Pontos: " << pixels.size() << "\n";
 
@@ -579,12 +579,12 @@ bool importar_arquivo_era5(const std::string& grib_path, const Era5ImportConfig&
     sqlite3_finalize(insert_stmt);
     sqlite3_close(db);
 
-    std::cout << "[ERA5 Import] Concluido com sucesso: " << cont << " registros inseridos/atualizados na tabela '"
+    std::cout << "[GRIB Import] Concluido com sucesso: " << cont << " registros inseridos/atualizados na tabela '"
               << cfg.tabela << "'!\n";
     return true;
 }
 
-size_t importar_pasta_era5(const Era5ImportConfig& cfg) {
+size_t importar_pasta_grib(const GribImportConfig& cfg) {
     if (!fs::exists(cfg.pasta_grib)) {
         std::cerr << "[ERRO] Pasta nao encontrada: " << cfg.pasta_grib << "\n";
         return 0;
@@ -605,7 +605,7 @@ size_t importar_pasta_era5(const Era5ImportConfig& cfg) {
     std::sort(arquivos_grib.begin(), arquivos_grib.end());
 
     std::cout << "============================================================\n"
-              << "IMPORTACAO DE DADOS ERA5 (GRIB -> SQLITE)\n"
+              << "IMPORTACAO DE DADOS GRIB -> SQLITE\n"
               << "============================================================\n"
               << "Pasta de entrada: " << cfg.pasta_grib << "\n"
               << "Banco SQLite: " << cfg.db_path << "\n"
@@ -639,7 +639,7 @@ size_t importar_pasta_era5(const Era5ImportConfig& cfg) {
                 size_t k = idx.fetch_add(1);
                 if (k >= arquivos_grib.size()) break;
                 try {
-                    if (importar_arquivo_era5(arquivos_grib[k].string(), cfg)) ok_at.fetch_add(1);
+                    if (importar_arquivo_grib(arquivos_grib[k].string(), cfg)) ok_at.fetch_add(1);
                 } catch (const std::exception& e) {
                     std::cerr << "[ERRO] " << arquivos_grib[k].string() << ": " << e.what() << "\n";
                 }

@@ -1,21 +1,21 @@
-#include "era5_importer.h"
+#include "grib_importer.h"
 #include <iostream>
 #include <string>
 
 int main(int argc, char** argv) {
-    Era5ImportConfig cfg;
+    GribImportConfig cfg;
 
     std::string arquivo_especifico = "";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
-            std::cout << "Uso: era5_import.exe [opcoes]\n"
+            std::cout << "Uso: grib_import.exe [opcoes]\n"
                       << "Opcoes:\n"
-                      << "  --pasta <caminho>     Pasta contendo arquivos .grib (padrao: dados_era5)\n"
+                      << "  --pasta <caminho>     Pasta contendo arquivos .grib (padrao: dados_grib)\n"
                       << "  --arquivo <caminho>   Importar apenas um arquivo .grib especifico\n"
                       << "  --db <caminho>        Banco SQLite destino (padrao: clima.db)\n"
-                      << "  --tabela <nome>       Tabela destino (padrao: era5_horario)\n"
+                      << "  --tabela <nome>       Tabela destino (padrao: clima_horario)\n"
                       << "  --ini <caminho>       Arquivo de configuracao para coordenadas (padrao: download.ini)\n"
                       << "  --lote <tamanho>      Tamanho do lote de commit SQL (padrao: 1000)\n"
                       << "  --workers <n>         Threads de importacao GRIB->SQLite (padrao: nucleos)\n"
@@ -43,10 +43,10 @@ int main(int argc, char** argv) {
     }
 
     if (!arquivo_especifico.empty()) {
-        bool ok = importar_arquivo_era5(arquivo_especifico, cfg);
+        bool ok = importar_arquivo_grib(arquivo_especifico, cfg);
         return ok ? 0 : 1;
     } else {
-        size_t qtd = importar_pasta_era5(cfg);
+        size_t qtd = importar_pasta_grib(cfg);
         return qtd > 0 ? 0 : 1;
     }
 }

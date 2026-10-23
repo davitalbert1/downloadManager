@@ -144,7 +144,7 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         if (!vars.empty() && !chave_req.empty() && !params.count(chave_req))
             params[chave_req] = juntar(vars, ",");
         if (!chave_api.empty() && ds.api_key_em == "query")
-            params[CFG.api_key_param] = chave_api;
+            params[ds.api_key_param.empty() ? CFG.api_key_param : ds.api_key_param] = chave_api;
 
         std::map<std::string, std::string> hdrs;
         for (const auto& kv : ds.headers)

@@ -46,9 +46,11 @@ struct DatasetCfg {
     std::vector<std::string> eixos; // eixos de produto cartesiano (dim:* e/ou coordenadas)
     std::map<std::string, std::string> params; // query params adicionais
     std::map<std::string, std::string> headers; // headers HTTP adicionais
-    std::string api_key_em = "query"; // query | header | basic
+    std::string api_key_em = "query"; // query | header | basic | auto | none
     std::string api_key_header = "Authorization";
     std::string api_key_prefix = "Bearer";
+    std::string api_key_param; // nome do parâmetro na query (vazio = [geral])
+    std::string api_key_env;   // variável de ambiente da chave (vazio = API_KEY)
 
     // Campos para salvamento em arquivos (APIs de arquivos/jobs assíncronos)
     std::string tipo_saida = "db"; // "db" (sqlite) ou "arquivo" (pasta)
@@ -59,6 +61,26 @@ struct DatasetCfg {
     std::string data_format;
     std::string download_format;
     std::string padrao_arquivo; // template do nome do arquivo final, ex: "{id}_{ano}_{mes}.{extensao}"
+
+    // Fluxo genérico de jobs assíncronos: o POST inicial devolve um id e o
+    // resultado é consultado depois. Templates aceitam {base}, {dataset_api}
+    // e {job_id}; caminhos relativos são prefixados com a URL base.
+    std::string job_executar;      // POST que cria o job (vazio = a própria url)
+    std::string job_status;        // consulta do estado do job
+    std::string job_resultado;     // consulta do resultado do job
+    std::string job_listar_ativos; // lista jobs em andamento (opcional)
+    std::string job_listar_ok;     // lista jobs concluídos (opcional)
+    std::string job_lista_campo = "jobs"; // campo raiz com o array de jobs
+    std::string job_campo_dataset; // campo do job com o nome do dataset
+    std::string job_campo_id;      // campo com o id do job (vazio = detecta)
+    std::string job_campo_status = "status"; // campo com o estado do job
+    std::string job_campo_asset;   // caminho (ex: metadata.results) do objeto com a URL
+    std::vector<std::string> job_status_ok;   // vazio = lista padrão
+    std::vector<std::string> job_status_erro; // vazio = lista padrão
+    std::vector<std::string> job_reenviar_se; // trechos de erro que pedem nova tentativa
+    double job_poll_intervalo = 10.0; // segundos entre consultas de status
+    bool job_sequencial = false;      // mantém 1 worker (filas com limite)
+    bool job_cancelar_duplicados = true; // cancela jobs antigos do mesmo dataset
     std::vector<std::string> horarios;
     int ano_inicial = 1940;
     int dias_atraso = 0;
