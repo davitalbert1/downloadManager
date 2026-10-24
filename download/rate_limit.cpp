@@ -65,14 +65,6 @@ struct Orcamento {
 
 static std::map<std::string, Orcamento> g_orcamento;
 
-static std::mt19937& rng() {
-    static thread_local std::mt19937 gen{
-        static_cast<std::mt19937::result_type>(std::random_device{}() ^
-                                               std::hash<std::thread::id>{}(
-                                                   std::this_thread::get_id()))};
-    return gen;
-}
-
 void iniciar_rate_limit() {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
     auto agora = std::chrono::steady_clock::now();
@@ -110,7 +102,7 @@ void esperar_envio(const std::string& grupo, double custo) {
                 std::uniform_real_distribution<double> jit(0.9, 1.1);
                 g_proximo_slot = slot + std::chrono::duration_cast<
                     std::chrono::steady_clock::duration>(
-                                     std::chrono::duration<double>(g_intervalo * jit(rng())));
+                                     std::chrono::duration<double>(g_intervalo * jit(rng_thread_local())));
                 orc.reservar(slot, custo);
                 espera = std::chrono::duration<double>(slot - agora).count();
                 reservado = true;
@@ -128,7 +120,7 @@ void esperar_envio(const std::string& grupo, double custo) {
             if (seg - ult >= 60 && g_ult_log_orc.compare_exchange_strong(ult, seg)) {
                 char buf[200];
                 std::snprintf(buf, sizeof(buf),
-                              "  [BUDGET] Cota da API atingida (grupo %s). "
+                              "[BUDGET] Cota da API atingida (grupo %s). "
                               "Aguardando %.0fs para liberar...",
                               grupo.c_str(), espera);
                 log(buf);
@@ -136,7 +128,7 @@ void esperar_envio(const std::string& grupo, double custo) {
         }
         dormir(espera > 0.0 ? espera : 0.05);
     }
-    log("  [WARNING] Budget nao liberou apos muitas esperas; seguindo.");
+    log("[WARNING] Budget nao liberou apos muitas esperas; seguindo.");
 }
 
 void tratar_429(double espera, const std::string& motivo, const std::string& endpoint) {
@@ -160,7 +152,7 @@ void tratar_429(double espera, const std::string& motivo, const std::string& end
             if (primeiro || espera > 30.0) {
                 char buf[220];
                 std::snprintf(buf, sizeof(buf),
-                              "  [429] Pausa global de %.0fs (%s; intervalo %.2fs)",
+                              "[429] Pausa global de %.0fs (%s; intervalo %.2fs)",
                               espera, motivo_final.c_str(), g_intervalo);
                 log(buf);
             }
@@ -184,5 +176,5 @@ void restaurar_taxa() {
 double backoff_exponencial(int tentativa) {
     std::uniform_real_distribution<double> dist(0.5, 1.5);
     double bruto = CFG.backoff_inicial * std::pow(2.0, tentativa - 1);
-    return std::min(CFG.backoff_maximo, bruto * dist(rng()));
+    return std::min(CFG.backoff_maximo, bruto * dist(rng_thread_local()));
 }

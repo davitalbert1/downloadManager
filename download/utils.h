@@ -1,4 +1,7 @@
 #pragma once
+#include <cstddef>
+#include <functional>
+#include <random>
 #include <string>
 #include <vector>
 #include <map>
@@ -36,6 +39,15 @@ std::string obter_nome_arquivo_da_url(const std::string& url);
 // "1.5GB", "102400", "0" = sem limite). Retorna bytes; <=0 = sem limite.
 long long parse_tamanho_bytes(const std::string& s, long long padrao = 0);
 std::string formatar_bytes(long long b);
+
+// RNG thread-local (evita disputa e resultados iguais entre workers)
+std::mt19937& rng_thread_local();
+// Formata segundos como HH:MM:SS; retorna "--:--:--" para valores invalidos.
+std::string formatar_duracao(double segundos);
+int dias_no_mes(int ano, int mes);
+
+// Executa fn(0..total-1) em n_workers threads. Se n_workers <= 1, roda inline.
+void executar_paralelo(int n_workers, size_t total, const std::function<void(size_t)>& fn);
 
 // Utilitários de Data e Hora (Howard Hinnant civil days)
 struct Data {

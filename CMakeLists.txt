@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(temperatura LANGUAGES CXX)
+project(download_manager LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -45,6 +45,7 @@ add_executable(download
     download/grib_importer.cpp
     download/google_drive.cpp
     download/wikipedia_importer.cpp
+    download/video_downloader.cpp
 )
 target_include_directories(download PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(OpenSSL REQUIRED)
@@ -58,6 +59,8 @@ target_link_libraries(clima_auditor PRIVATE SQLite3::SQLite3)
 add_executable(grib_import
     download/grib_main.cpp
     download/grib_importer.cpp
+    download/utils.cpp
+    download/config.cpp
 )
 target_include_directories(grib_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(grib_import PRIVATE GDAL::GDAL SQLite3::SQLite3 Threads::Threads)

@@ -220,8 +220,10 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
     }
     auto chave_idx = colunas_chave(ds);
     if (!chave_idx.empty()) {
+        std::vector<std::string> cols_q;
+        for (const auto& c : chave_idx) cols_q.push_back("\"" + c + "\"");
         executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_chave ON \"" +
-                               ds.tabela + "\"(" + juntar(chave_idx, ", ") + ")");
+                               ds.tabela + "\"(" + juntar(cols_q, ", ") + ")");
     }
     if (!ds.chave_data.empty() && ds.iterar_datas)
         executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_date ON \"" +
@@ -230,9 +232,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
 
 void criar_tabelas_datasets() {
     for (const auto& ds : CFG.datasets) {
-        if (ds.tipo_saida == "arquivo") continue;
-        if (ds.tipo_saida == "wikipedia" || ds.tipo_saida == "wiki") continue; // esquema proprio (paginas/progresso/...)
-        if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) continue;
+        if (!dataset_generico(ds)) continue;
         try {
             std::vector<Registro> vazio;
             garantir_tabela(ds, vazio);
@@ -268,51 +268,35 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
     if (campos.empty()) return;
 
     std::vector<std::string> chave = colunas_chave(ds);
-
-    std::string sql;
+    std::vector<std::string> alvo_conflito = chave;
     if (!ds.iterar_datas && chave.empty()) {
-        // Sem data e sem chave declarada:
-        // Verifica se a tabela possui UNIQUE na coluna 'name', 'id' ou 'url' para evitar registros duplicados
-        std::string fallback_unique;
-        for (const std::string& col_candidata : {"id", "name", "nome", "url"}) {
-            if (std::find(campos.begin(), campos.end(), col_candidata) != campos.end()) {
-                fallback_unique = col_candidata;
+        // Sem data e sem chave declarada: usa 'id'/'name'/'nome'/'url' se existir
+        // UNIQUE nessas colunas (ver garantir_tabela).
+        for (const std::string& c : {"id", "name", "nome", "url"}) {
+            if (std::find(campos.begin(), campos.end(), c) != campos.end()) {
+                alvo_conflito = {c};
                 break;
             }
         }
-        std::vector<std::string> campos_aspas;
-        for (const auto& c : campos) campos_aspas.push_back("\"" + c + "\"");
+    }
 
-        std::vector<std::string> marc(campos.size() + 1, "?");
-        sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos_aspas, ",") +
-              ", created_at) VALUES (" + juntar(marc, ",") + ")";
-        if (!fallback_unique.empty()) {
-            std::vector<std::string> upd;
-            for (const auto& c : campos) {
-                if (c != fallback_unique) upd.push_back("\"" + c + "\"=excluded.\"" + c + "\"");
-            }
-            if (!upd.empty()) {
-                sql += " ON CONFLICT(\"" + fallback_unique + "\") DO UPDATE SET " + juntar(upd, ",");
-            } else {
-                sql += " ON CONFLICT DO NOTHING";
-            }
-        }
-    } else {
-        std::vector<std::string> campos_aspas;
-        for (const auto& c : campos) campos_aspas.push_back("\"" + c + "\"");
-
-        std::vector<std::string> marc(campos.size() + 1, "?");
-        sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos_aspas, ",") +
-              ", created_at) VALUES (" + juntar(marc, ",") + ")";
+    std::vector<std::string> campos_aspas;
+    for (const auto& c : campos) campos_aspas.push_back("\"" + c + "\"");
+    std::vector<std::string> marc(campos.size() + 1, "?");
+    std::string sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos_aspas, ",") +
+                      ", created_at) VALUES (" + juntar(marc, ",") + ")";
+    if (!alvo_conflito.empty()) {
         std::vector<std::string> upd;
         for (const auto& c : campos) {
-            if (std::find(chave.begin(), chave.end(), c) == chave.end())
+            if (std::find(alvo_conflito.begin(), alvo_conflito.end(), c) == alvo_conflito.end())
                 upd.push_back("\"" + c + "\"=excluded.\"" + c + "\"");
         }
-        if (!upd.empty() && !chave.empty())
-            sql += " ON CONFLICT(\"" + juntar(chave, "\",\"") + "\") DO UPDATE SET " + juntar(upd, ",");
+        if (!upd.empty())
+            sql += " ON CONFLICT(\"" + juntar(alvo_conflito, "\",\"") + "\") DO UPDATE SET " + juntar(upd, ",");
         else
             sql += " ON CONFLICT DO NOTHING";
+    } else {
+        sql += " ON CONFLICT DO NOTHING";
     }
 
     sqlite3_stmt* stmt = nullptr;
@@ -372,8 +356,7 @@ ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas
     ExistentesGen out;
     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
         const DatasetCfg& ds = CFG.datasets[di];
-        if (ds.tipo_saida == "arquivo") continue;
-        if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) continue;
+        if (!dataset_generico(ds)) continue;
         sqlite3* conn = get_connection_para(ds.db);
         std::vector<std::string> cols = colunas_da_tabela(conn, ds.tabela);
         bool tem_data =
@@ -381,95 +364,67 @@ ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas
             std::find(cols.begin(), cols.end(), ds.chave_data) != cols.end();
         auto& mapa = out[di];
 
-        if (ds.usar_coordenadas || CFG.coordenadas.empty()) {
-            std::vector<std::pair<double, double>> lista_coords = CFG.coordenadas;
-            if (lista_coords.empty()) lista_coords.push_back({0.0, 0.0});
-            for (const auto& c : lista_coords) {
-                mapa[num_str(c.first) + "," + num_str(c.second)] = ConjuntoDatas();
-            }
+        // Mesmos contextos/chaves usados pelo engine ao montar as tarefas.
+        for (const auto& ctx : contextos_de_download(ds))
+            mapa[chave_contexto(ctx)] = ConjuntoDatas();
 
-            bool tem_lat = std::find(cols.begin(), cols.end(), "latitude") != cols.end();
-            bool tem_lon = std::find(cols.begin(), cols.end(), "longitude") != cols.end();
-            if (!tem_data || !tem_lat || !tem_lon || datas.empty()) continue;
+        if (!tem_data || datas.empty()) continue;
 
-            std::string sql = "SELECT latitude, longitude, \"" + ds.chave_data + "\" FROM \"" +
-                              ds.tabela + "\" WHERE \"" + ds.chave_data +
-                              "\" BETWEEN ? AND ?";
-            sqlite3_stmt* st = nullptr;
-            if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
-                sqlite3_finalize(st);
+        std::vector<std::string> cols_dim;
+        if (ds.usar_coordenadas) {
+            if (std::find(cols.begin(), cols.end(), "latitude") == cols.end() ||
+                std::find(cols.begin(), cols.end(), "longitude") == cols.end())
                 continue;
-            }
-            sqlite3_bind_text(st, 1, datas.front().c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, datas.back().c_str(), -1, SQLITE_TRANSIENT);
-            ConjuntoDatas periodo(datas.begin(), datas.end());
-            while (sqlite3_step(st) == SQLITE_ROW) {
-                double la = sqlite3_column_double(st, 0);
-                double lo = sqlite3_column_double(st, 1);
-                const unsigned char* tx = sqlite3_column_text(st, 2);
-                if (!tx) continue;
-                std::string dt(reinterpret_cast<const char*>(tx));
-                if (!periodo.count(dt)) continue;
-                std::string k = num_str(la) + "," + num_str(lo);
-                auto it = mapa.find(k);
-                if (it != mapa.end()) {
-                    it->second.insert(dt);
-                }
-            }
-            sqlite3_finalize(st);
+            cols_dim = {"latitude", "longitude"};
         } else {
-            // Eixos/Dimensões genéricas
-            auto contextos = expandir_contextos(ds);
-            for (const auto& ctx : contextos) {
-                std::string k_repr;
-                for (const auto& kv : ctx) {
-                    if (chave_ctx_interna(kv.first)) continue;
-                    if (!k_repr.empty()) k_repr += "|";
-                    k_repr += kv.first + "=" + kv.second;
-                }
-                mapa[k_repr] = ConjuntoDatas();
-            }
-
-            if (!tem_data || datas.empty()) continue;
-
-            // Determinar quais colunas de dimensão estão na tabela
-            std::vector<std::string> cols_dim;
             for (const auto& e : ds.eixos) {
-                std::string c_norm = normalizar_nome(e);
-                if (std::find(cols.begin(), cols.end(), c_norm) != cols.end()) {
-                    cols_dim.push_back(c_norm);
-                }
+                std::string c = normalizar_nome(e);
+                if (std::find(cols.begin(), cols.end(), c) != cols.end() &&
+                    std::find(cols_dim.begin(), cols_dim.end(), c) == cols_dim.end())
+                    cols_dim.push_back(c);
             }
-
-            std::string sql = "SELECT ";
-            for (const auto& c : cols_dim) sql += "\"" + c + "\", ";
-            sql += "\"" + ds.chave_data + "\" FROM \"" + ds.tabela + "\" WHERE \"" + ds.chave_data + "\" BETWEEN ? AND ?";
-            sqlite3_stmt* st = nullptr;
-            if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
-                sqlite3_finalize(st);
-                continue;
-            }
-            sqlite3_bind_text(st, 1, datas.front().c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, datas.back().c_str(), -1, SQLITE_TRANSIENT);
-            ConjuntoDatas periodo(datas.begin(), datas.end());
-            while (sqlite3_step(st) == SQLITE_ROW) {
-                std::string k_repr;
-                for (size_t ci = 0; ci < cols_dim.size(); ++ci) {
-                    const unsigned char* val = sqlite3_column_text(st, static_cast<int>(ci));
-                    if (!k_repr.empty()) k_repr += "|";
-                    k_repr += cols_dim[ci] + "=" + (val ? reinterpret_cast<const char*>(val) : "");
-                }
-                const unsigned char* tx = sqlite3_column_text(st, static_cast<int>(cols_dim.size()));
-                if (!tx) continue;
-                std::string dt(reinterpret_cast<const char*>(tx));
-                if (!periodo.count(dt)) continue;
-                auto it = mapa.find(k_repr);
-                if (it != mapa.end()) {
-                    it->second.insert(dt);
-                }
-            }
-            sqlite3_finalize(st);
         }
+
+        auto chave_da_linha = [&](sqlite3_stmt* st, std::string& chave) {
+            if (ds.usar_coordenadas) {
+                chave = num_str(sqlite3_column_double(st, 0)) + "," +
+                        num_str(sqlite3_column_double(st, 1));
+                return true;
+            }
+            Contexto linha;
+            for (size_t ci = 0; ci < cols_dim.size(); ++ci) {
+                const unsigned char* val = sqlite3_column_text(st, static_cast<int>(ci));
+                if (!val) return false;
+                linha[cols_dim[ci]] = reinterpret_cast<const char*>(val);
+            }
+            chave = chave_contexto(linha);
+            return true;
+        };
+
+        std::string sql = "SELECT ";
+        for (const auto& c : cols_dim) sql += "\"" + c + "\", ";
+        sql += "\"" + ds.chave_data + "\" FROM \"" + ds.tabela + "\" WHERE \"" +
+               ds.chave_data + "\" BETWEEN ? AND ?";
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            continue;
+        }
+        sqlite3_bind_text(st, 1, datas.front().c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, datas.back().c_str(), -1, SQLITE_TRANSIENT);
+        ConjuntoDatas periodo(datas.begin(), datas.end());
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            std::string chave;
+            if (!chave_da_linha(st, chave)) continue;
+            const unsigned char* tx =
+                sqlite3_column_text(st, static_cast<int>(cols_dim.size()));
+            if (!tx) continue;
+            std::string dt(reinterpret_cast<const char*>(tx));
+            if (!periodo.count(dt)) continue;
+            auto it = mapa.find(chave);
+            if (it != mapa.end()) it->second.insert(dt);
+        }
+        sqlite3_finalize(st);
     }
     return out;
 }

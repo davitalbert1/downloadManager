@@ -1,5 +1,6 @@
 #include "google_drive.h"
 #include "config.h"
+#include "http_client.h"
 #include "utils.h"
 #include <atomic>
 #include <chrono>
@@ -15,7 +16,6 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
-#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -51,27 +51,6 @@ static unsigned long long drive_tamanho_do_item(const json& item) {
     return 0;
 }
 
-static std::string drive_formatar_bytes(unsigned long long b) {
-    const char* un[] = {"B", "KB", "MB", "GB", "TB"};
-    double v = (double)b;
-    int u = 0;
-    while (v >= 1024.0 && u < 4) {
-        v /= 1024.0;
-        ++u;
-    }
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.1f %s", v, un[u]);
-    return buf;
-}
-
-static std::string drive_formatar_tempo(double seg) {
-    if (!(seg >= 0.0) || seg > 99 * 3600.0) return "--:--:--";
-    long s = (long)seg;
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%02ld:%02ld:%02ld", s / 3600, (s % 3600) / 60, s % 60);
-    return buf;
-}
-
 // Estado do download de UM arquivo: usado pelo callback de escrita e pela
 // barra de progresso por arquivo. Deve ficar ANTES de drive_log_arquivo.
 struct ProgressoArquivoDrive {
@@ -101,20 +80,20 @@ static void drive_log_arquivo(ProgressoDrive* p, const ProgressoArquivoDrive& a,
         if (pct > 100.0) pct = 100.0;
         double eta = vel > 1.0 ? ((double)(a.total > a.feito ? a.total - a.feito : 0)) / vel : -1.0;
         std::snprintf(buf, sizeof(buf),
-            "  [%zu/%zu] %s | %s/%s %5.1f%% | %s/s | ETA %s%c",
+            "[%zu/%zu] %s | %s/%s %5.1f%% | %s/s | ETA %s%c",
             p ? p->prontos_arquivos.load() + 1 : 0,
             p ? p->total_arquivos.load() : 0,
             a.nome.c_str(),
-            drive_formatar_bytes(a.feito).c_str(), drive_formatar_bytes(a.total).c_str(),
-            pct, drive_formatar_bytes((unsigned long long)vel).c_str(),
-            drive_formatar_tempo(eta).c_str(), fim ? '\n' : '\r');
+            formatar_bytes(a.feito).c_str(), formatar_bytes(a.total).c_str(),
+            pct, formatar_bytes((unsigned long long)vel).c_str(),
+            formatar_duracao(eta).c_str(), fim ? '\n' : '\r');
     } else {
         std::snprintf(buf, sizeof(buf),
             "[%zu/%zu] %s | %s baixados | %s/s%c",
             p ? p->prontos_arquivos.load() + 1 : 0,
             p ? p->total_arquivos.load() : 0,
-            a.nome.c_str(), drive_formatar_bytes(a.feito).c_str(),
-            drive_formatar_bytes((unsigned long long)vel).c_str(), fim ? '\n' : '\r');
+            a.nome.c_str(), formatar_bytes(a.feito).c_str(),
+            formatar_bytes((unsigned long long)vel).c_str(), fim ? '\n' : '\r');
     }
     if (p) {
         std::lock_guard<std::mutex> lk(p->mtx);
@@ -141,66 +120,6 @@ static constexpr std::time_t MARGEM_TOKEN = 60;
 
 static bool token_vencendo(const TokenAcessoDrive& token) {
     return std::time(nullptr) + MARGEM_TOKEN >= token.expira_em;
-}
-
-static std::string drive_find_ca_bundle() {
-    const char* env = std::getenv("CURL_CA_BUNDLE");
-    if (env && *env && fs::exists(fs::path(env))) return env;
-    const std::vector<std::string> candidates = {
-        R"(D:\msys64\mingw64\etc\ssl\certs\ca-bundle.crt)",
-        R"(C:\msys64\mingw64\etc\ssl\certs\ca-bundle.crt)",
-        R"(D:\msys64\mingw64\etc\ssl\cert.pem)",
-        R"(C:\msys64\mingw64\etc\ssl\cert.pem)",
-        R"(D:\msys64\usr\etc\ssl\certs\ca-bundle.crt)",
-        R"(C:\msys64\usr\etc\ssl\certs\ca-bundle.crt)",
-        R"(D:\msys64\usr\ssl\certs\ca-bundle.crt)",
-        R"(C:\msys64\usr\ssl\certs\ca-bundle.crt)",
-    };
-    for (const auto& c : candidates) {
-        std::error_code ec;
-        if (fs::exists(fs::path(c), ec)) return c;
-    }
-    return "";
-}
-
-static void drive_aplicar_ca_bundle(CURL* curl) {
-    static const std::string ca_bundle = drive_find_ca_bundle();
-    if (!ca_bundle.empty()) {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str());
-    } else {
-        curl_easy_setopt(curl, CURLOPT_CAPATH, nullptr);
-        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
-    }
-}
-
-static size_t drive_write_string_cb(void* contents, size_t size, size_t nmemb, void* userp) {
-    const size_t total = size * nmemb;
-    auto* output = static_cast<std::string*>(userp);
-    output->append(static_cast<char*>(contents), total);
-    return total;
-}
-
-// Callback de escrita com progresso: grava, conta bytes, atualiza o total
-// global e redesenha a barra POR ARQUIVO (via \r) a cada ~500ms.
-static size_t drive_write_file_progress_cb(void* contents, size_t size, size_t nmemb, void* userp) {
-    auto* ctx = static_cast<ProgressoArquivoDrive*>(userp);
-    if (!ctx || !ctx->file) return 0;
-    size_t n = size * nmemb;
-    if (ctx->tamanho_max > 0 && ctx->feito + (unsigned long long)n > ctx->tamanho_max) {
-        ctx->estourou_max = true;
-        return 0; // aborta (CURLE_WRITE_ERROR) sem gravar o excesso
-    }
-    size_t gravados = fwrite(contents, 1, n, ctx->file);
-    ctx->feito += (unsigned long long)gravados;
-    if (ctx->global) ctx->global->baixado_bytes.fetch_add((unsigned long long)gravados);
-    auto agora = std::chrono::steady_clock::now();
-    double desde_log = std::chrono::duration<double>(agora - ctx->ultimo_log).count();
-    if (desde_log >= 0.5 && ctx->global) {
-        ctx->ultimo_log = agora;
-        drive_log_arquivo(ctx->global, *ctx, false);
-        ctx->imprimiu = true;
-    }
-    return gravados;
 }
 
 static std::string drive_base64url_encode(const unsigned char* data, size_t len) {
@@ -243,17 +162,7 @@ static std::string drive_base64url_encode(const std::string& input) {
 }
 
 static std::string drive_url_encode(const std::string& value) {
-    CURL* curl = curl_easy_init();
-    if (!curl) throw std::runtime_error("Falha ao inicializar CURL para URL encode.");
-    char* encoded = curl_easy_escape(curl, value.c_str(), static_cast<int>(value.length()));
-    if (!encoded) {
-        curl_easy_cleanup(curl);
-        throw std::runtime_error("Falha ao fazer URL encode.");
-    }
-    std::string result(encoded);
-    curl_free(encoded);
-    curl_easy_cleanup(curl);
-    return result;
+    return escapar_url(value);
 }
 
 static std::string drive_assinar_jwt(const std::string& header, const std::string& payload, const std::string& private_key) {
@@ -298,60 +207,29 @@ static std::string drive_assinar_jwt(const std::string& header, const std::strin
     return (mensagem + "." + drive_base64url_encode(signature.data(), signature_length));
 }
 
-static std::string drive_http_post(const std::string& url, const std::string& body, const std::string& content_type) {
-    CURL* curl = curl_easy_init();
-    if (!curl) throw std::runtime_error("Nao foi possivel inicializar CURL.");
-    drive_aplicar_ca_bundle(curl);
-    std::string response;
-    struct curl_slist* headers = nullptr;
-    std::string content_header = "Content-Type: " + content_type;
-    headers = curl_slist_append(headers, content_header.c_str());
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, drive_write_string_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode result = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    if (result != CURLE_OK) {
-        throw std::runtime_error(std::string("Erro CURL: ") + curl_easy_strerror(result));
-    }
-    if (http_code < 200 || http_code >= 300) {
-        throw std::runtime_error("HTTP " + std::to_string(http_code) + ": " + response);
-    }
-    return response;
+static std::string drive_http_post(const std::string& url, const std::string& body,
+                                   const std::string& content_type) {
+    OpcoesHttp op;
+    op.metodo = "POST";
+    op.corpo = body;
+    op.headers["Content-Type"] = content_type;
+    RespostaHttp r = http_requisicao(url, op);
+    if (r.erro_rede)
+        throw std::runtime_error("Erro CURL: " + r.erro_mensagem);
+    if (r.status < 200 || r.status >= 300)
+        throw std::runtime_error("HTTP " + std::to_string(r.status) + ": " + r.corpo);
+    return r.corpo;
 }
 
 static std::string drive_http_get(const std::string& url, const std::string& access_token) {
-    CURL* curl = curl_easy_init();
-    if (!curl) throw std::runtime_error("Nao foi possivel inicializar CURL.");
-    drive_aplicar_ca_bundle(curl);
-    std::string response;
-    struct curl_slist* headers = nullptr;
-    std::string authorization = "Authorization: Bearer " + access_token;
-    headers = curl_slist_append(headers, authorization.c_str());
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, drive_write_string_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode result = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    if (result != CURLE_OK) {
-        throw std::runtime_error(std::string("Erro CURL: ") + curl_easy_strerror(result));
-    }
-    if (http_code < 200 || http_code >= 300) {
-        throw std::runtime_error("HTTP " + std::to_string(http_code) + ": " + response);
-    }
-    return response;
+    OpcoesHttp op;
+    op.headers["Authorization"] = "Bearer " + access_token;
+    RespostaHttp r = http_requisicao(url, op);
+    if (r.erro_rede)
+        throw std::runtime_error("Erro CURL: " + r.erro_mensagem);
+    if (r.status < 200 || r.status >= 300)
+        throw std::runtime_error("HTTP " + std::to_string(r.status) + ": " + r.corpo);
+    return r.corpo;
 }
 
 static TokenAcessoDrive drive_obter_access_token(const json& service_account) {
@@ -409,7 +287,7 @@ static std::vector<json> drive_listar_arquivos(const std::string& folder_id, con
         url += "&fields=" + drive_url_encode("nextPageToken,files(id,name,mimeType,size)");
         url += "&pageSize=1000";
         if (!page_token.empty()) url += "&pageToken=" + drive_url_encode(page_token);
-        log("  [DRIVE] Consultando listagem de arquivos da pasta " + folder_id + "...");
+        log("[DRIVE] Consultando listagem de arquivos da pasta " + folder_id + "...");
         std::string response = drive_http_get(url, access_token);
         json data;
         try {
@@ -438,141 +316,108 @@ static void drive_baixar_arquivo(const json& arquivo, const fs::path& destino, c
     const std::string nome = arquivo.at("name").get<std::string>();
     const std::string mime = arquivo.value("mimeType", "");
     if (mime == "application/vnd.google-apps.folder") {
-        log("  [DRIVE] Ignorando pasta: " + nome);
+        log("[DRIVE] Ignorando pasta: " + nome);
         return;
     }
     if (mime.rfind("application/vnd.google-apps.", 0) == 0) {
-        log("  [DRIVE] Ignorando arquivo nativo doc/sheet Google: " + nome);
+        log("[DRIVE] Ignorando arquivo nativo doc/sheet Google: " + nome);
         return;
     }
     fs::path nome_seguro = fs::path(sanitizar_nome_arquivo(nome)).filename();
     if (nome_seguro.empty()) throw std::runtime_error("Nome de arquivo invalido.");
     fs::path caminho_final = destino / nome_seguro;
-    fs::path caminho_temp = caminho_final.string() + ".temp";
 
-    // Se já existe e tamanho é válido, pula (e credita no progresso global)
-    std::error_code ec;
     unsigned long long tam_esperado = drive_tamanho_do_item(arquivo);
-    if (fs::exists(caminho_final, ec)) {
-        auto sz = fs::file_size(caminho_final, ec);
-        if (!ec && sz > 0 && (min_bytes <= 0 || sz >= static_cast<unsigned long long>(min_bytes))) {
-            if (max_bytes > 0 && sz > static_cast<unsigned long long>(max_bytes)) {
-                if (pulado_por_tamanho) *pulado_por_tamanho = true;
-                if (progresso) progresso->prontos_arquivos.fetch_add(1);
-                log("[DRIVE SKIP] " + nome + " (" + drive_formatar_bytes((unsigned long long)sz) +
-                    ") excede tamanho_max (" + drive_formatar_bytes((unsigned long long)max_bytes) + ")");
-                return;
-            }
-            if (progresso) {
-                progresso->baixado_bytes.fetch_add((unsigned long long)sz);
-                progresso->prontos_arquivos.fetch_add(1);
-            }
-            // "ja existe" = 1 linha curta, sem barra de progresso.
-            log("[DRIVE JA EXISTE] " + nome + " (" +
-                drive_formatar_bytes((unsigned long long)sz) + ")");
-            return;
-        }
-    }
 
-    if (tam_esperado > 0)
-        log("[DRIVE BAIXANDO] " + nome + " (" + drive_formatar_bytes(tam_esperado) + ") -> " + caminho_final.string());
-    else
-        log("[DRIVE BAIXANDO] " + nome + " (tamanho desconhecido) -> " + caminho_final.string());
-    // Skip antecipado via metadados (Drive informa size sem baixar nada)
     if (max_bytes > 0 && tam_esperado > static_cast<unsigned long long>(max_bytes)) {
         if (pulado_por_tamanho) *pulado_por_tamanho = true;
         if (progresso) progresso->prontos_arquivos.fetch_add(1);
-        log("[DRIVE SKIP] " + nome + " (" + drive_formatar_bytes(tam_esperado) +
-            ") excede tamanho_max (" + drive_formatar_bytes((unsigned long long)max_bytes) + ")");
+        log("[DRIVE SKIP] " + nome + " (" + formatar_bytes(tam_esperado) +
+            ") excede tamanho_max (" + formatar_bytes((unsigned long long)max_bytes) + ")");
         return;
     }
-    std::string url = "https://www.googleapis.com/drive/v3/files/" + drive_url_encode(id) + "?alt=media";
-    FILE* file = _wfopen(caminho_temp.wstring().c_str(), L"wb");
-    if (!file) {
-        throw std::runtime_error("Nao foi possivel criar arquivo temporario: " + caminho_temp.string());
-    }
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        fclose(file);
-        throw std::runtime_error("Nao foi possivel inicializar CURL.");
-    }
-    drive_aplicar_ca_bundle(curl);
-    struct curl_slist* headers = nullptr;
-    std::string authorization = "Authorization: Bearer " + access_token;
-    headers = curl_slist_append(headers, authorization.c_str());
+
+    if (tam_esperado > 0)
+        log("[DRIVE BAIXANDO] " + nome + " (" + formatar_bytes(tam_esperado) + ") -> " +
+            caminho_final.string());
+    else
+        log("[DRIVE BAIXANDO] " + nome + " (tamanho desconhecido) -> " + caminho_final.string());
+
     ProgressoArquivoDrive ctx_prog;
-    ctx_prog.file = file;
     ctx_prog.global = progresso;
     ctx_prog.nome = nome;
     ctx_prog.total = tam_esperado;
-    ctx_prog.tamanho_max = max_bytes > 0 ? static_cast<unsigned long long>(max_bytes) : 0;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, drive_write_file_progress_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx_prog);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode result = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    fclose(file);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    // Em erro, fecha a barra pendente (se houver) para o log nao colar na
-    // linha do progresso.
-    if (ctx_prog.estourou_max && max_bytes > 0) {
+
+    OpcoesDownload op;
+    op.url = "https://www.googleapis.com/drive/v3/files/" + drive_url_encode(id) + "?alt=media";
+    op.caminho = caminho_final.string();
+    op.tag = nome;
+    op.headers["Authorization"] = "Bearer " + access_token;
+    op.tamanho_min = min_bytes;
+    op.tamanho_max = max_bytes;
+    op.permitir_reuso = true;
+    op.progresso = false;
+    op.logar_skip = false;
+    op.ao_progresso = [&](long long atual, long long total) {
+        if (atual > 0) {
+            auto novo = static_cast<unsigned long long>(atual);
+            if (novo > ctx_prog.feito) {
+                if (progresso) progresso->baixado_bytes.fetch_add(novo - ctx_prog.feito);
+                ctx_prog.feito = novo;
+            }
+        }
+        if (total > 0) ctx_prog.total = static_cast<unsigned long long>(total);
+        auto agora = std::chrono::steady_clock::now();
+        double desde_log = std::chrono::duration<double>(agora - ctx_prog.ultimo_log).count();
+        if (progresso && desde_log >= 0.5) {
+            ctx_prog.ultimo_log = agora;
+            drive_log_arquivo(progresso, ctx_prog, false);
+            ctx_prog.imprimiu = true;
+        }
+    };
+
+    ResultadoDownload r = http_baixar_arquivo(op);
+
+    if (r.ja_existia) {
+        if (progresso) {
+            progresso->baixado_bytes.fetch_add(static_cast<unsigned long long>(r.bytes));
+            progresso->prontos_arquivos.fetch_add(1);
+        }
+        // "ja existe" = 1 linha curta, sem barra de progresso.
+        log("[DRIVE JA EXISTE] " + nome + " (" +
+            formatar_bytes(static_cast<unsigned long long>(r.bytes)) + ")");
+        return;
+    }
+    if (r.pulado_tamanho) {
         if (ctx_prog.imprimiu) {
             fputc('\n', stdout);
             fflush(stdout);
         }
-        std::error_code remove_ec;
-        fs::remove(caminho_temp, remove_ec);
         if (pulado_por_tamanho) *pulado_por_tamanho = true;
         if (progresso) progresso->prontos_arquivos.fetch_add(1);
         log("[DRIVE SKIP] " + nome + " excede tamanho_max (" +
-            drive_formatar_bytes((unsigned long long)max_bytes) + ") - interrompido no stream");
+            formatar_bytes(static_cast<unsigned long long>(max_bytes)) + ")");
         return;
     }
-    if (result != CURLE_OK) {
+    if (!r.ok) {
         if (ctx_prog.imprimiu) {
             fputc('\n', stdout);
             fflush(stdout);
         }
-        std::error_code remove_ec;
-        fs::remove(caminho_temp, remove_ec);
-        throw std::runtime_error(std::string("Erro CURL ao baixar: ") + curl_easy_strerror(result));
-    }
-    if (http_code < 200 || http_code >= 300) {
-        if (ctx_prog.imprimiu) {
-            fputc('\n', stdout);
-            fflush(stdout);
+        if (r.status >= 400) {
+            std::string mensagem = "Google Drive retornou HTTP " + std::to_string(r.status);
+            if (!r.corpo_erro.empty()) mensagem += ": " + r.corpo_erro;
+            throw ErroHttpDrive(r.status, mensagem);
         }
-        std::string corpo;
-        {
-            std::ifstream erro_file(caminho_temp, std::ios::binary);
-            if (erro_file) {
-                char buffer[512];
-                erro_file.read(buffer, sizeof(buffer));
-                corpo.assign(buffer, static_cast<size_t>(erro_file.gcount()));
-            }
-        }
-        std::error_code remove_ec;
-        fs::remove(caminho_temp, remove_ec);
-        std::string mensagem = "Google Drive retornou HTTP " + std::to_string(http_code);
-        if (!corpo.empty()) mensagem += ": " + corpo;
-        throw ErroHttpDrive(http_code, mensagem);
+        throw std::runtime_error("Erro CURL ao baixar: " + r.erro);
     }
 
-    fs::remove(caminho_final, ec);
-    fs::rename(caminho_temp, caminho_final, ec);
-    if (ec) {
-        throw std::runtime_error("Nao foi possivel renomear arquivo temporario: " + ec.message());
-    }
     if (progresso) {
         // Finaliza a barra do arquivo com '\n' e credita no progresso global.
         drive_log_arquivo(progresso, ctx_prog, true);
         progresso->prontos_arquivos.fetch_add(1);
     } else {
-        log("  [DRIVE OK] Concluido: " + nome);
+        log("[DRIVE OK] Concluido: " + nome);
     }
 }
 
@@ -598,15 +443,18 @@ static void drive_remover_temporarios(const fs::path& pasta) {
 
 static std::mutex g_drive_token_mtx;
 
-static void drive_renovar_token_se_preciso(TokenAcessoDrive& token, const json& service_account) {
+// Copia o token sob lock: a renovação pode acontecer em outra thread.
+static std::string drive_token_valido(TokenAcessoDrive& token, const json& service_account) {
     std::lock_guard<std::mutex> lk(g_drive_token_mtx);
-    if (!token_vencendo(token)) return;
-    log("  [DRIVE] Token de acesso renovando...");
-    try {
-        token = drive_obter_access_token(service_account);
-    } catch (const std::exception& e) {
-        log(std::string("  [ERRO TOKEN DRIVE] ") + e.what());
+    if (token_vencendo(token)) {
+        log("[DRIVE] Token de acesso renovando...");
+        try {
+            token = drive_obter_access_token(service_account);
+        } catch (const std::exception& e) {
+            log(std::string("[ERRO TOKEN DRIVE] ") + e.what());
+        }
     }
+    return token.valor;
 }
 
 // Baixa um item do Drive em DFS por pasta: ao entrar numa pasta, lista os
@@ -626,12 +474,12 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
                                         int profundidade = 0) {
     if (profundidade > 64) {
         erros.fetch_add(1);
-        log("  [ERRO DRIVE] Profundidade maxima excedida (possivel ciclo).");
+        log("[ERRO DRIVE] Profundidade maxima excedida (possivel ciclo).");
         return;
     }
     if (!item.contains("id") || !item.contains("name")) {
         erros.fetch_add(1);
-        log("  [ERRO ARQUIVO DRIVE] Item sem id/name retornado pelo Google.");
+        log("[ERRO ARQUIVO DRIVE] Item sem id/name retornado pelo Google.");
         return;
     }
     const std::string id = item.at("id").get<std::string>();
@@ -644,17 +492,16 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
         fs::create_directories(sub, ec);
         if (ec) {
             erros.fetch_add(1);
-            log("  [ERRO PASTA DRIVE] " + nome + ": " + ec.message());
+            log("[ERRO PASTA DRIVE] " + nome + ": " + ec.message());
             return;
         }
-        log("  [DRIVE PASTA] " + sub.string());
-        drive_renovar_token_se_preciso(token, service_account);
+        log("[DRIVE PASTA] " + sub.string());
         std::vector<json> filhos;
         try {
-            filhos = drive_listar_arquivos(id, token.valor);
+            filhos = drive_listar_arquivos(id, drive_token_valido(token, service_account));
         } catch (const std::exception& e) {
             erros.fetch_add(1);
-            log(std::string("  [ERRO LISTAR DRIVE] ") + nome + ": " + e.what());
+            log(std::string("[ERRO LISTAR DRIVE] ") + nome + ": " + e.what());
             return;
         }
         // DFS por pasta: separa arquivos e subpastas da listagem ÚNICA;
@@ -677,7 +524,7 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
                 if (f.value("mimeType", "") == "application/vnd.google-apps.folder")
                     subpastas.push_back(f);
         }
-        log("  [DRIVE] " + std::to_string(filhos.size()) + " itens em '" + nome +
+        log("[DRIVE] " + std::to_string(filhos.size()) + " itens em '" + nome +
             "' (" + std::to_string(filhos.size() - subpastas.size()) + " arquivos, " +
             std::to_string(subpastas.size()) + " subpastas)");
         // Snapshot antes do conteúdo desta pasta: resumo por pasta no fim.
@@ -696,7 +543,7 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
         int n_dl = download_workers < 1 ? 1 : download_workers;
         if ((size_t)n_dl > arquivos_pasta.size() && !arquivos_pasta.empty())
             n_dl = (int)arquivos_pasta.size();
-        log("  [DRIVE] download_workers=" + std::to_string(n_dl) +
+        log("[DRIVE] download_workers=" + std::to_string(n_dl) +
             " process_workers=" + std::to_string(CFG.process_workers) +
             " p/ " + std::to_string(arquivos_pasta.size()) + " arquivos em '" + nome + "'");
         {
@@ -724,21 +571,21 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
             // Resumo da pasta: consolidado dos arquivos concluídos aqui dentro.
             double dec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - inicio_pasta).count();
-            std::string resumo = "  [DRIVE PASTA OK] " + nome + ": " +
+            std::string resumo = "[DRIVE PASTA OK] " + nome + ": " +
                 std::to_string((progresso ? progresso->prontos_arquivos.load() : sucesso.load()) - prontos_antes) +
                 " arquivos, " +
-                drive_formatar_bytes((progresso ? progresso->baixado_bytes.load() : 0ULL) - bytes_antes) +
-                " em " + drive_formatar_tempo(dec);
+                formatar_bytes((progresso ? progresso->baixado_bytes.load() : 0ULL) - bytes_antes) +
+                " em " + formatar_duracao(dec);
             log(resumo);
         }
         return;
     }
 
     for (int tentativa = 0; tentativa < 2; ++tentativa) {
-        drive_renovar_token_se_preciso(token, service_account);
         try {
             bool pulado_max = false;
-            drive_baixar_arquivo(item, destino_local, token.valor, tamanho_min_bytes, tamanho_max_bytes,
+            drive_baixar_arquivo(item, destino_local, drive_token_valido(token, service_account),
+                                 tamanho_min_bytes, tamanho_max_bytes,
                                  &pulado_max, progresso);
             if (pulado_max) {
                 if (pulados) pulados->fetch_add(1);
@@ -748,7 +595,7 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
             return;
         } catch (const ErroHttpDrive& e) {
             if (e.codigo == 401 && tentativa == 0) {
-                log("  [DRIVE HTTP 401] Renovando token de acesso...");
+                log("[DRIVE HTTP 401] Renovando token de acesso...");
                 try {
                     std::lock_guard<std::mutex> lk(g_drive_token_mtx);
                     token = drive_obter_access_token(service_account);
@@ -756,11 +603,11 @@ static void drive_baixar_item_recursivo(const json& item, const fs::path& destin
                 continue;
             }
             erros.fetch_add(1);
-            log(std::string("  [ERRO ARQUIVO DRIVE] ") + e.what());
+            log(std::string("[ERRO ARQUIVO DRIVE] ") + e.what());
             return;
         } catch (const std::exception& e) {
             erros.fetch_add(1);
-            log(std::string("  [ERRO ARQUIVO DRIVE] ") + e.what());
+            log(std::string("[ERRO ARQUIVO DRIVE] ") + e.what());
             return;
         }
     }
@@ -842,7 +689,7 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
 
     std::vector<json> arquivos;
     try {
-        arquivos = drive_listar_arquivos(folder_id, token.valor);
+        arquivos = drive_listar_arquivos(folder_id, drive_token_valido(token, service_account));
     } catch (const std::exception& e) {
         log(std::string("[ERRO] Falha ao listar arquivos do Google Drive: ") + e.what());
         return false;
@@ -859,7 +706,7 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
     // listada (sizes conhecidos somados na entrada da pasta).
     ProgressoDrive progresso;
     progresso.inicio = std::chrono::steady_clock::now();
-    log("  [DRIVE] Baixando pasta por pasta (conclui uma antes de ir p/ proxima)...");
+    log("[DRIVE] Baixando pasta por pasta (conclui uma antes de ir p/ proxima)...");
 
     size_t sucesso = 0, erros = 0, pulados = 0;
     {
@@ -879,9 +726,9 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
                 if (sz > static_cast<unsigned long long>(ds.tamanho_max_bytes)) {
                     ++pulados;
                     progresso.prontos_arquivos.fetch_add(1);
-                    log("[DRIVE SKIP] " + a.value("name", "?") + " (" + drive_formatar_bytes(sz) +
+                    log("[DRIVE SKIP] " + a.value("name", "?") + " (" + formatar_bytes(sz) +
                         ") excede tamanho_max (" +
-                        drive_formatar_bytes((unsigned long long)ds.tamanho_max_bytes) + ")");
+                        formatar_bytes((unsigned long long)ds.tamanho_max_bytes) + ")");
                     continue;
                 }
             }
@@ -889,7 +736,7 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
             progresso.total_arquivos.fetch_add(1);
             progresso.total_bytes.fetch_add(drive_tamanho_do_item(a));
         }
-        log("  [DRIVE] Raiz: " + std::to_string(arquivos.size()) + " itens (" +
+        log("[DRIVE] Raiz: " + std::to_string(arquivos.size()) + " itens (" +
             std::to_string(arquivos_raiz.size()) + " arquivos, " +
             std::to_string(subpastas_raiz.size()) + " subpastas" +
             (pulados ? ", " + std::to_string(pulados) + " pulados (tamanho)" : "") + ")");
@@ -897,7 +744,7 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
         if ((size_t)n_dl > arquivos_raiz.size() && !arquivos_raiz.empty())
             n_dl = (int)arquivos_raiz.size();
         std::atomic<size_t> suc_at{0}, err_at{0}, pul_at{0};
-        log("  [DRIVE] download_workers=" + std::to_string(n_dl) +
+        log("[DRIVE] download_workers=" + std::to_string(n_dl) +
             " process_workers=" + std::to_string(CFG.process_workers) +
             " p/ raiz (" + std::to_string(arquivos_raiz.size()) + " arquivos)");
         {
@@ -935,9 +782,9 @@ bool executar_dataset_google_drive(const DatasetCfg& ds) {
         log("------------------------------------------------------------");
         log("CONCLUIDO DRIVE: " + std::to_string(sucesso) + " baixados/verificados, " +
             std::to_string(pulados) + " pulados (tamanho), " +
-            std::to_string(erros) + " erros em " + drive_formatar_tempo(dec) +
-            " | " + drive_formatar_bytes(progresso.baixado_bytes.load()) +
-            " a " + drive_formatar_bytes((unsigned long long)vel) + "/s");
+            std::to_string(erros) + " erros em " + formatar_duracao(dec) +
+            " | " + formatar_bytes(progresso.baixado_bytes.load()) +
+            " a " + formatar_bytes((unsigned long long)vel) + "/s");
         log("============================================================");
     }
     return erros == 0;

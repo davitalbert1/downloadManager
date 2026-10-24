@@ -1,10 +1,37 @@
 #include "db_backend.h"
 #include <chrono>
-#include <algorithm>
-#include <sstream>
-#include <iostream>
+#include <utility>
 
-DatabaseManager::DatabaseManager() {}
+namespace {
+std::string quoteIdentifier(const std::string& id) {
+    std::string out = "\"";
+    for (char c : id) {
+        out += c;
+        if (c == '"') out += '"';
+    }
+    out += '"';
+    return out;
+}
+
+void appendRow(sqlite3_stmt* stmt, int colCount, QueryResult& res) {
+    std::vector<std::string> row;
+    row.reserve(colCount);
+    for (int i = 0; i < colCount; ++i) {
+        const int type = sqlite3_column_type(stmt, i);
+        if (type == SQLITE_NULL) {
+            row.push_back("<NULL>");
+        } else if (type == SQLITE_BLOB) {
+            row.push_back("<BLOB " + std::to_string(sqlite3_column_bytes(stmt, i)) + " bytes>");
+        } else {
+            const char* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, i));
+            row.push_back(txt ? txt : "");
+        }
+    }
+    res.rows.push_back(std::move(row));
+}
+} // namespace
+
+DatabaseManager::DatabaseManager() = default;
 
 DatabaseManager::~DatabaseManager() {
     close();
@@ -16,7 +43,6 @@ bool DatabaseManager::open(const std::string& filepath) {
 
     int rc = sqlite3_open_v2(filepath.c_str(), &m_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
     if (rc != SQLITE_OK) {
-        // Tenta abrir sem readonly se falhar, ou grava o erro
         if (m_db) {
             m_lastError = sqlite3_errmsg(m_db);
             sqlite3_close(m_db);
@@ -75,7 +101,7 @@ bool DatabaseManager::refreshSchema() {
         t.name = item.second;
 
         // Inspeciona colunas com PRAGMA table_info("nome")
-        std::string pragmaSql = "PRAGMA table_info(\"" + t.name + "\");";
+        std::string pragmaSql = "PRAGMA table_info(" + quoteIdentifier(t.name) + ");";
         sqlite3_stmt* colStmt = nullptr;
         if (sqlite3_prepare_v2(m_db, pragmaSql.c_str(), -1, &colStmt, nullptr) == SQLITE_OK) {
             while (sqlite3_step(colStmt) == SQLITE_ROW) {
@@ -103,7 +129,7 @@ bool DatabaseManager::refreshSchema() {
 
 void DatabaseManager::updateRowCount(TableInfo& table) {
     if (!m_db) return;
-    std::string countSql = "SELECT COUNT(*) FROM \"" + table.name + "\";";
+    std::string countSql = "SELECT COUNT(*) FROM " + quoteIdentifier(table.name) + ";";
     sqlite3_stmt* countStmt = nullptr;
     if (sqlite3_prepare_v2(m_db, countSql.c_str(), -1, &countStmt, nullptr) == SQLITE_OK) {
         if (sqlite3_step(countStmt) == SQLITE_ROW) {
@@ -111,13 +137,6 @@ void DatabaseManager::updateRowCount(TableInfo& table) {
         }
         sqlite3_finalize(countStmt);
     }
-}
-
-int64_t DatabaseManager::getTableRowCount(const std::string& tableName) {
-    for (auto& t : m_tables) {
-        if (t.name == tableName) return t.rowCount;
-    }
-    return 0;
 }
 
 const TableInfo* DatabaseManager::getTable(const std::string& tableName) const {
@@ -142,7 +161,7 @@ QueryResult DatabaseManager::fetchTableData(const std::string& tableName,
     auto start = std::chrono::high_resolution_clock::now();
 
     // Monta query genérica segura
-    std::string baseSql = "FROM \"" + tableName + "\"";
+    std::string baseSql = "FROM " + quoteIdentifier(tableName);
     if (!filterExpr.empty()) baseSql += " WHERE " + filterExpr;
 
     // Pega contagem total com o filtro aplicado
@@ -161,7 +180,7 @@ QueryResult DatabaseManager::fetchTableData(const std::string& tableName,
     // Monta query de dados paginada
     std::string querySql = "SELECT * " + baseSql;
     if (!sortColumn.empty()) {
-        querySql += " ORDER BY \"" + sortColumn + "\" " + (sortAsc ? "ASC" : "DESC");
+        querySql += " ORDER BY " + quoteIdentifier(sortColumn) + " " + (sortAsc ? "ASC" : "DESC");
     }
     querySql += " LIMIT " + std::to_string(limit) + " OFFSET " + std::to_string(offset) + ";";
 
@@ -179,21 +198,7 @@ QueryResult DatabaseManager::fetchTableData(const std::string& tableName,
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        std::vector<std::string> row;
-        row.reserve(colCount);
-        for (int i = 0; i < colCount; ++i) {
-            int type = sqlite3_column_type(stmt, i);
-            if (type == SQLITE_NULL) {
-                row.push_back("<NULL>");
-            } else if (type == SQLITE_BLOB) {
-                int bytes = sqlite3_column_bytes(stmt, i);
-                row.push_back("<BLOB " + std::to_string(bytes) + " bytes>");
-            } else {
-                const char* txt = (const char*)sqlite3_column_text(stmt, i);
-                row.push_back(txt ? txt : "");
-            }
-        }
-        res.rows.push_back(std::move(row));
+        appendRow(stmt, colCount, res);
     }
     sqlite3_finalize(stmt);
 
@@ -227,23 +232,7 @@ QueryResult DatabaseManager::executeQuery(const std::string& sql, int maxRows) {
 
     int fetched = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (fetched < maxRows) {
-            std::vector<std::string> row;
-            row.reserve(colCount);
-            for (int i = 0; i < colCount; ++i) {
-                int type = sqlite3_column_type(stmt, i);
-                if (type == SQLITE_NULL) {
-                    row.push_back("<NULL>");
-                } else if (type == SQLITE_BLOB) {
-                    int bytes = sqlite3_column_bytes(stmt, i);
-                    row.push_back("<BLOB " + std::to_string(bytes) + " bytes>");
-                } else {
-                    const char* txt = (const char*)sqlite3_column_text(stmt, i);
-                    row.push_back(txt ? txt : "");
-                }
-            }
-            res.rows.push_back(std::move(row));
-        }
+        if (fetched < maxRows) appendRow(stmt, colCount, res);
         fetched++;
     }
 

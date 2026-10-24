@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 
 // DirectX 11 Globals
@@ -462,7 +463,6 @@ static void RenderDatabaseInfoView() {
     ImGui::Text("Arquivo: %s", g_app.currentDbPath.c_str());
     ImGui::Text("Versao SQLite da Engine: %s", sqlite3_libversion());
 
-    QueryResult pragmaRes = g_app.db.executeQuery("PRAGMA page_count; PRAGMA page_size; PRAGMA encoding;");
     QueryResult pageCountRes = g_app.db.executeQuery("PRAGMA page_count;");
     QueryResult pageSizeRes = g_app.db.executeQuery("PRAGMA page_size;");
     QueryResult encodingRes = g_app.db.executeQuery("PRAGMA encoding;");

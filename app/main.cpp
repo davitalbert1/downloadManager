@@ -23,7 +23,6 @@ class GenericoApp : public QWidget {
 private:
     QTableView *table;
     QSqlQueryModel *model;
-    QComboBox *comboDb;
     QComboBox *comboTabela;
     QComboBox *comboData;
     QComboBox *comboValor;
@@ -33,7 +32,6 @@ private:
     QDateEdit *dataInicio;
     QDateEdit *dataFim;
     QCheckBox *chkTodasColunas;
-    QStringList dbs;
     bool temLatLon = false;
 
     QString dbAtual() const {
@@ -62,12 +60,10 @@ public:
 
 GenericoApp::GenericoApp() {
     setWindowTitle("Viewer Generico - qualquer banco/tabela");
-    dbs << "clima.db";
     table = new QTableView();
     model = new QSqlQueryModel(this);
     table->setModel(model);
     inputDb = new QLineEdit("clima.db");
-    comboDb = new QComboBox();
     QPushButton *btnAbrir = new QPushButton("Open...");
     QPushButton *btnRecarregar = new QPushButton("Recarregar DBs");
     comboTabela = new QComboBox();
@@ -116,7 +112,6 @@ GenericoApp::GenericoApp() {
     setLayout(layout);
     connect(btnAbrir, &QPushButton::clicked, this, &GenericoApp::escolherDb);
     connect(btnRecarregar, &QPushButton::clicked, this, &GenericoApp::recarregarDbs);
-    connect(comboDb, &QComboBox::currentTextChanged, this, &GenericoApp::trocarDb);
     connect(comboTabela, &QComboBox::currentTextChanged, this, &GenericoApp::trocarTabela);
     connect(btnFiltrar, &QPushButton::clicked, this, &GenericoApp::filtrar);
     connect(btnReset, &QPushButton::clicked, this, &GenericoApp::carregarTudo);
@@ -126,25 +121,22 @@ GenericoApp::GenericoApp() {
 void GenericoApp::escolherDb() {
     QString f = QFileDialog::getOpenFileName(this, "Open database", "", "*.db *.sqlite");
     if (f.isEmpty()) return;
-    if (!dbs.contains(f)) dbs << f;
     inputDb->setText(f);
-    recarregarDbs();
+    trocarDb();
 }
 
 void GenericoApp::recarregarDbs() {
-    comboDb->clear();
-    for (const QString &d : dbs) comboDb->addItem(d);
-    int i = comboDb->findText(dbAtual());
-    if (i >= 0) comboDb->setCurrentIndex(i);
     trocarDb();
 }
 
 void GenericoApp::trocarDb() {
-    QString db = comboDb->currentText();
-    if (!db.isEmpty()) inputDb->setText(db);
-    if (QSqlDatabase::contains("gen")) QSqlDatabase::removeDatabase("gen");
-    QSqlDatabase c = QSqlDatabase::addDatabase("QSQLITE", "gen");
-    c.setDatabaseName(dbAtual());
+    const QString db = dbAtual();
+    if (db.isEmpty()) return;
+    QSqlDatabase c = QSqlDatabase::contains("gen")
+                         ? QSqlDatabase::database("gen")
+                         : QSqlDatabase::addDatabase("QSQLITE", "gen");
+    c.close();
+    c.setDatabaseName(db);
     if (!c.open()) {
         QMessageBox::critical(this, "Error", "Nao abriu: " + c.lastError().text());
         return;

@@ -200,6 +200,16 @@ static bool columnExists(Database& db, const std::string& table, const std::stri
     return false;
 }
 
+// Usa a coluna configurada; se nao existir, tenta os nomes usuais do projeto.
+static std::string escolherColunaData(Database& db, const std::string& table,
+                                      const std::string& configurada) {
+    if (columnExists(db, table, configurada)) return configurada;
+    for (const char* candidata : {"data", "date", "time", "datetime", "timestamp", "data_hora"}) {
+        if (columnExists(db, table, candidata)) return candidata;
+    }
+    return configurada;
+}
+
 // Relatórios
 static void listTables(Database& db) {
     std::cout << "\n=== TABELAS NO BANCO ===\n";
@@ -295,7 +305,9 @@ static void showLatest(Database& db, const std::string& table,
 
     std::vector<std::string> columns;
     for (const auto& col : preferredColumns) {
-        if (columnExists(db, table, col)) columns.push_back(col);
+        if (columnExists(db, table, col) &&
+            std::find(columns.begin(), columns.end(), col) == columns.end())
+            columns.push_back(col);
     }
 
     // Se o esquema da API for diferente do exemplo, mostra todas as colunas.
@@ -361,30 +373,60 @@ static void checkGaps(Database& db, const std::string& table,
         return;
     }
 
-    const auto rows = executeQuery(
-        db, "SELECT " + quoteIdentifier(dateColumn) + " FROM " + quoteIdentifier(table) +
-            " WHERE " + quoteIdentifier(dateColumn) + " IS NOT NULL ORDER BY " +
-            quoteIdentifier(dateColumn)
-    );
+    // Tabelas com varias coordenadas precisam ser comparadas por ponto.
+    const bool por_ponto = columnExists(db, table, "latitude") &&
+                           columnExists(db, table, "longitude");
+    // Granularidade horaria pode separar data e hora em colunas distintas.
+    bool data_com_hora = false;
+    const auto largura = executeQuery(
+        db, "SELECT MAX(length(" + quoteIdentifier(dateColumn) + ")) FROM " +
+            quoteIdentifier(table));
+    if (!largura.empty() && !largura[0].empty() && largura[0][0] != "NULL") {
+        try {
+            data_com_hora = std::stoi(largura[0][0]) > 10;
+        } catch (...) {}
+    }
+    const bool hora_separada = !data_com_hora && dateColumn != "hora" &&
+                               columnExists(db, table, "hora");
+    std::string tsExpr = quoteIdentifier(dateColumn);
+    if (hora_separada) {
+        const std::string hora = quoteIdentifier("hora");
+        tsExpr = "(" + tsExpr + " || ' ' || " + hora +
+                 " || CASE WHEN length(" + hora + ") = 5 THEN ':00' ELSE '' END)";
+    }
+
+    std::string sql = "SELECT " + tsExpr;
+    if (por_ponto) sql += ", " + quoteIdentifier("latitude") + ", " + quoteIdentifier("longitude");
+    sql += " FROM " + quoteIdentifier(table) +
+           " WHERE " + quoteIdentifier(dateColumn) + " IS NOT NULL ORDER BY ";
+    if (por_ponto) {
+        sql += quoteIdentifier("latitude") + ", " + quoteIdentifier("longitude") + ", ";
+    }
+    sql += tsExpr;
+    const auto rows = executeQuery(db, sql);
 
     bool foundGap = false;
-    for (std::size_t i = 1; i < rows.size(); ++i) {
-        const auto previous = parseTimestamp(rows[i - 1][0]);
-        const auto current = parseTimestamp(rows[i][0]);
-
-        if (previous == static_cast<std::time_t>(-1) ||
-            current == static_cast<std::time_t>(-1)) {
-            std::cout << "Data não reconhecida: " << rows[i - 1][0]
-                      << " / " << rows[i][0] << '\n';
+    std::map<std::string, std::pair<std::time_t, std::string>> ultima;
+    for (const auto& row : rows) {
+        const std::string grupo = por_ponto ? row[1] + "," + row[2] : "";
+        const auto current = parseTimestamp(row[0]);
+        if (current == static_cast<std::time_t>(-1)) {
+            std::cout << "Data não reconhecida: " << row[0] << '\n';
             continue;
         }
 
-        const auto difference = static_cast<long long>(current - previous);
-        if (difference != expectedSeconds) {
-            foundGap = true;
-            std::cout << "GAP/INTERVALO: " << rows[i - 1][0] << " -> " << rows[i][0]
-                      << " (difference: " << difference << " segundos)\n";
+        auto it = ultima.find(grupo);
+        if (it != ultima.end()) {
+            const auto difference = static_cast<long long>(current - it->second.first);
+            if (difference != expectedSeconds) {
+                foundGap = true;
+                std::cout << "GAP/INTERVALO";
+                if (por_ponto) std::cout << " [" << row[1] << ", " << row[2] << "]";
+                std::cout << ": " << it->second.second << " -> " << row[0]
+                          << " (difference: " << difference << " segundos)\n";
+            }
         }
+        ultima[grupo] = {current, row[0]};
     }
 
     if (!foundGap) std::cout << "Nenhum intervalo irregular encontrado (ou menos de dois registros).\n";
@@ -445,9 +487,7 @@ int main(int argc, char* argv[]) {
             const std::string table = config.get(section, "tabela", id);
             const fs::path dbPath = resolveDatabasePath(config.get(section, "db", defaultDb));
             const std::string granularity = config.get(section, "granularidade", "dia");
-            const std::string dateColumn = config.get(
-                section, "coluna_data", granularity == "hora" ? "team" : "date"
-            );
+            const std::string dateColumn = config.get(section, "coluna_data", "data");
 
             datasets.push_back({id, table, dbPath, granularity, dateColumn});
             databasePaths.insert(dbPath.string());
@@ -474,19 +514,21 @@ int main(int argc, char* argv[]) {
 
                 showStructure(db, dataset.table);
                 showIndexes(db, dataset.table);
-                showPeriod(db, dataset.table, dataset.dateColumn);
+                const std::string dateColumn = escolherColunaData(db, dataset.table, dataset.dateColumn);
+                showPeriod(db, dataset.table, dateColumn);
 
                 const bool hourly = dataset.granularity == "hora";
-                checkGaps(db, dataset.table, dataset.dateColumn, hourly ? 3600 : 86400);
+                checkGaps(db, dataset.table, dateColumn, hourly ? 3600 : 86400);
 
                 if (hourly) {
-                    showLatest(db, dataset.table, dataset.dateColumn,
-                        {"team", "hour", "latitude", "length", "temperature_2m",
-                         "apparent_temperature", "relativehumidity_2m", "precipitation"},
+                    showLatest(db, dataset.table, dateColumn,
+                        {"data", "date", "hora", "hour", "time", "latitude", "longitude",
+                         "temperature_2m", "apparent_temperature", "relativehumidity_2m",
+                         "precipitation"},
                         latestLimit);
                 } else {
-                    showLatest(db, dataset.table, dataset.dateColumn,
-                        {"date", "data", "latitude", "length", "weathercode",
+                    showLatest(db, dataset.table, dateColumn,
+                        {"data", "date", "latitude", "longitude", "weathercode",
                          "temperature_2m_max", "temperature_2m_min", "sunrise", "sunset",
                          "precipitation_sum"},
                         latestLimit);

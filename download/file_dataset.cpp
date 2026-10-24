@@ -1,376 +1,41 @@
 #include "file_dataset.h"
 #include "grib_importer.h"
 #include "http_client.h"
+#include "json_parser.h"
 #include "rate_limit.h"
 #include "storage_sqlite.h"
 #include "utils.h"
-#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <mutex>
-#include <queue>
 #include <thread>
 #include <vector>
 
 using json = nlohmann::json;
 
-// Autenticação declarada pelo dataset: onde a chave vai (query, header ou
-// basic), qual o nome do header/parâmetro e o prefixo (ex: "Bearer").
-struct AuthApi {
-    std::string modo = "auto"; // auto | query | header | basic | none
-    std::string header = "Authorization";
-    std::string prefixo = "Bearer";
-    std::string param = "apikey";
-};
-
-static AuthApi auth_do_dataset(const DatasetCfg& ds) {
-    AuthApi a;
-    a.modo = minusculas(ds.api_key_em);
-    if (a.modo.empty()) a.modo = "auto";
-    if (!ds.api_key_header.empty()) a.header = ds.api_key_header;
-    a.prefixo = ds.api_key_prefix;
-    a.param = ds.api_key_param.empty() ? CFG.api_key_param : ds.api_key_param;
-    return a;
-}
-
-// URLs assinadas (S3/GCS/Azure) já carregam a credencial; enviar header extra
-// costuma invalidar a assinatura.
-static bool url_presignada(const std::string& url) {
-    return url.find("X-Amz-") != std::string::npos ||
-           url.find("X-Goog-") != std::string::npos ||
-           url.find("Signature=") != std::string::npos ||
-           url.find("sig=") != std::string::npos ||
-           url.find("object-store") != std::string::npos ||
-           url.find("amazonaws.com") != std::string::npos;
-}
-
-static std::string url_com_chave(const std::string& url_entrada, const AuthApi& auth,
-                                 const std::string& chave) {
-    if (chave.empty() || auth.modo != "query" || url_presignada(url_entrada))
-        return url_entrada;
-    CURL* curl = curl_easy_init();
-    if (!curl) return url_entrada;
-    char* esc = curl_easy_escape(curl, chave.c_str(), 0);
-    std::string url = url_entrada;
-    if (esc) {
-        url += (url.find('?') == std::string::npos ? "?" : "&");
-        url += auth.param + "=" + esc;
-        curl_free(esc);
-    }
-    curl_easy_cleanup(curl);
-    return url;
-}
-
-static void aplicar_auth(CURL* curl, struct curl_slist** headers, const AuthApi& auth,
-                         const std::string& chave, const std::string& url) {
-    if (chave.empty() || auth.modo == "none" || url_presignada(url)) return;
-    std::string modo = auth.modo;
-    if (modo == "auto") modo = (chave.find(':') != std::string::npos) ? "basic" : "header";
-    if (modo == "basic") {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, chave.c_str());
-    } else if (modo == "header") {
-        std::string valor = auth.prefixo.empty() ? chave : auth.prefixo + " " + chave;
-        std::string linha = auth.header + ": " + valor;
-        *headers = curl_slist_append(*headers, linha.c_str());
-    }
-}
-
-struct RespostaHttpAvancada {
-    long status = 0;
-    bool erro_rede = false;
-    std::string erro_mensagem;
-    std::string corpo;
-    std::string header_location;
-};
-
-static size_t escrever_string_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
-    auto* s = static_cast<std::string*>(ud);
-    s->append(ptr, tam * nmemb);
-    return tam * nmemb;
-}
-
-static size_t ler_headers_cb(char* buffer, size_t tam, size_t n, void* ud) {
-    auto* resp = static_cast<RespostaHttpAvancada*>(ud);
-    std::string linha(buffer, tam * n);
-    std::string baixo = linha;
-    std::transform(baixo.begin(), baixo.end(), baixo.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (baixo.rfind("location:", 0) == 0) resp->header_location = cortar(linha.substr(9));
-    return tam * n;
-}
-
-static size_t escrever_arquivo_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
-    auto* out = static_cast<std::ofstream*>(ud);
-    out->write(ptr, tam * nmemb);
-    return tam * nmemb;
-}
-
-// Escritor com limite maximo: aborta o download assim que ultrapassar tamanho_max
-// (evita baixar GBs para so depois descartar). Retorna 0 p/ abortar o curl.
-struct EscritorLimitado {
-    std::ofstream* out = nullptr;
-    long long tamanho_max = 0; // <=0 = sem limite
-    long long escrito = 0;
-    bool estourou = false;
-};
-
-static size_t escrever_arquivo_limitado_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
-    auto* w = static_cast<EscritorLimitado*>(ud);
-    size_t n = tam * nmemb;
-    if (w->tamanho_max > 0 && w->escrito + (long long)n > w->tamanho_max) {
-        w->estourou = true;
-        return 0; // aborta CURLE_WRITE_ERROR
-    }
-    w->out->write(ptr, n);
-    w->escrito += (long long)n;
-    return n;
-}
-
-// Captura headers (Location p/ redirect manual + Content-Length p/ skip antecipado)
-struct HeadersDownload {
-    std::string location;
-    long long content_length = -1; // -1 = desconhecido
-};
-
-static size_t ler_headers_download_cb(char* buffer, size_t tam, size_t n, void* ud) {
-    auto* h = static_cast<HeadersDownload*>(ud);
-    std::string linha(buffer, tam * n);
-    std::string baixo = linha;
-    std::transform(baixo.begin(), baixo.end(), baixo.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (baixo.rfind("location:", 0) == 0) h->location = cortar(linha.substr(9));
-    else if (baixo.rfind("content-length:", 0) == 0) {
-        try {
-            h->content_length = std::stoll(cortar(linha.substr(15)));
-        } catch (...) {}
-    }
-    return tam * n;
-}
-
-// Escritor assíncrono de disco
-// O curl empurra blocos de dados para uma fila limitada; uma thread separada
-// consome e grava em disco, desacoplando rede e I/O de disco.
-class AsyncFileWriter {
-public:
-    explicit AsyncFileWriter(const std::string& caminho, size_t max_blocos = 64)
-        : arq_(caminho, std::ios::binary), max_(max_blocos), ok_(arq_.good()) {
-        if (ok_) {
-            writer_ = std::thread([this] {
-                loop_escrita();
-            });
-        }
-    }
-
-    ~AsyncFileWriter() {
-        close();
-    }
-
-    AsyncFileWriter(const AsyncFileWriter&) = delete;
-    AsyncFileWriter& operator=(const AsyncFileWriter&) = delete;
-
-    bool good() const {
-        return ok_.load();
-    }
-
-    // Chamado pelo callback do curl (thread de rede)
-    bool push(const char* dados, size_t n) {
-        if (!ok_.load()) return false;
-        std::vector<char> bloco(dados, dados + n);
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            cv_cheia_.wait(lk, [&] {
-                return fila_.size() < max_ || fechada_;
-            });
-            if (fechada_) return false;
-            fila_.push(std::move(bloco));
-        }
-        cv_vazia_.notify_one();
-        return true;
-    }
-
-    // Sinaliza que não há mais dados e espera a thread terminar
-    void close() {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            fechada_ = true;
-        }
-        cv_vazia_.notify_one();
-        cv_cheia_.notify_all();
-        if (writer_.joinable()) writer_.join();
-        if (arq_.is_open()) arq_.close();
-    }
-
-private:
-    void loop_escrita() {
-        while (true) {
-            std::vector<char> bloco;
-            {
-                std::unique_lock<std::mutex> lk(mtx_);
-                cv_vazia_.wait(lk, [&] {
-                    return !fila_.empty() || fechada_;
-                });
-                if (fila_.empty()) break; // fechada_ e vazia
-                bloco = std::move(fila_.front());
-                fila_.pop();
-            }
-            cv_cheia_.notify_one();
-            arq_.write(bloco.data(), static_cast<std::streamsize>(bloco.size()));
-            if (!arq_.good()) {
-                ok_.store(false);
-                break;
-            }
-        }
-    }
-
-    std::ofstream arq_;
-    size_t max_;
-    std::atomic<bool> ok_;
-    bool fechada_ = false;
-    std::queue<std::vector<char>> fila_;
-    std::mutex mtx_;
-    std::condition_variable cv_cheia_;
-    std::condition_variable cv_vazia_;
-    std::thread writer_;
-};
-
-static RespostaHttpAvancada http_post_json(const std::string& url_entrada,
-                                           const std::string& json_body,
-                                           const AuthApi& auth,
-                                           const std::string& api_key,
-                                           double timeout_sec = 60.0) {
-    RespostaHttpAvancada r;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        r.erro_rede = true;
-        r.erro_mensagem = "Falha ao inicializar CURL";
-        return r;
-    }
-
-    std::string url = url_com_chave(url_entrada, auth, api_key);
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "Accept: application/json");
-    aplicar_auth(curl, &headers, auth, api_key, url);
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        r.erro_rede = true;
-        r.erro_mensagem = curl_easy_strerror(rc);
-    } else {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
-    }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return r;
-}
-
-static RespostaHttpAvancada http_get_headers(const std::string& url_entrada,
-                                             const AuthApi& auth,
-                                             const std::string& api_key,
-                                             double timeout_sec = 60.0) {
-    RespostaHttpAvancada r;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        r.erro_rede = true;
-        r.erro_mensagem = "Falha ao inicializar CURL";
-        return r;
-    }
-
-    std::string url = url_com_chave(url_entrada, auth, api_key);
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Accept: application/json");
-    aplicar_auth(curl, &headers, auth, api_key, url);
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        r.erro_rede = true;
-        r.erro_mensagem = curl_easy_strerror(rc);
-    } else {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
-    }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return r;
-}
-
-static RespostaHttpAvancada http_delete(const std::string& url_entrada,
-                                        const AuthApi& auth,
-                                        const std::string& api_key) {
-    RespostaHttpAvancada r;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        r.erro_rede = true;
-        r.erro_mensagem = "Falha ao inicializar CURL";
-        return r;
-    }
-
-    std::string url = url_com_chave(url_entrada, auth, api_key);
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Accept: application/json");
-    aplicar_auth(curl, &headers, auth, api_key, url);
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 60000L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        r.erro_rede = true;
-        r.erro_mensagem = curl_easy_strerror(rc);
-    } else {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
-    }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return r;
+static RespostaHttp requisicao_api(const std::string& url, const AuthApi& auth,
+                                   const std::string& api_key,
+                                   const std::string& metodo = "GET",
+                                   const std::string& corpo = "",
+                                   double timeout_sec = 60.0) {
+    OpcoesHttp op;
+    op.metodo = metodo;
+    op.auth = &auth;
+    op.chave_api = api_key;
+    op.timeout_sec = timeout_sec;
+    op.headers["Accept"] = "application/json";
+    op.corpo = corpo;
+    return http_requisicao(url, op);
 }
 
 static std::string sanitizar_url_download(std::string url) {
-    const char* brancos = " \t\r\n";
-    size_t inicio = url.find_first_not_of(brancos);
-    if (inicio == std::string::npos) return "";
-    url = url.substr(inicio, url.find_last_not_of(brancos) - inicio + 1);
+    url = cortar(url);
+    if (url.empty()) return "";
 
     size_t corte = url.find("%22");
     if (corte == std::string::npos) corte = url.find('"');
@@ -406,90 +71,6 @@ static std::string extrair_url_download(const json& j) {
     return sanitizar_url_download(extrair_url_download_bruto(j));
 }
 
-static std::string duracao_hms(double segundos) {
-    long long s = static_cast<long long>(std::max(0.0, segundos));
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld", s / 3600, (s / 60) % 60, s % 60);
-    return std::string(buf);
-}
-
-struct DownloadProgressContext {
-    std::string tag;
-    std::chrono::steady_clock::time_point inicio;
-    std::chrono::steady_clock::time_point ult_log;
-    double ultimo_pct = -1.0;
-    int ultimo_marco = -1; // último marco de 10% impresso (0,1,...,10)
-    long long tamanho_max = 0; // >0 = aborta quando dltotal ou dlnow exceder
-    bool estourou = false;
-};
-
-static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) {
-    auto* ctx = static_cast<DownloadProgressContext*>(clientp);
-    if (ctx->tamanho_max > 0) {
-        if ((dltotal > 0 && dltotal > (curl_off_t)ctx->tamanho_max) ||
-            (dlnow > (curl_off_t)ctx->tamanho_max)) {
-            ctx->estourou = true;
-            return 1; // aborta o transfer
-        }
-    }
-    auto agora = std::chrono::steady_clock::now();
-    double dec = std::chrono::duration<double>(agora - ctx->ult_log).count();
-    double baixado_mb = static_cast<double>(dlnow) / (1024.0 * 1024.0);
-
-    if (dltotal <= 0) {
-        // Sem Content-Length: ainda assim mostra quanto ja veio e a velocidade.
-        if (dec >= 3.0 && dlnow > 0) {
-            double total_decorrido =
-                std::chrono::duration<double>(agora - ctx->inicio).count();
-            double mbps = total_decorrido > 0.0 ? baixado_mb / total_decorrido : 0.0;
-            char buf[200];
-            std::snprintf(buf, sizeof(buf),
-                          "  [BAIXANDO] %s: %.2f MB baixados - %.2f MB/s (tamanho total desconhecido)",
-                          ctx->tag.c_str(), baixado_mb, mbps);
-            log(buf);
-            ctx->ult_log = agora;
-            ctx->ultimo_pct = 0.0;
-        }
-        return 0;
-    }
-
-    bool concluido = (dlnow == dltotal);
-    double total_mb = static_cast<double>(dltotal) / (1024.0 * 1024.0);
-    double pct = (total_mb > 0.0) ? (baixado_mb / total_mb * 100.0) : 0.0;
-
-    // Com vários workers, cada atualização é impressa em sua própria linha via
-    // log(), que serializa a saída com mutex. Imprime em marcos de 10% e,
-    // no mínimo, a cada 3s para o usuario ver bytes/velocidade/ETA.
-    int marco_atual = static_cast<int>(pct / 10.0);
-    bool inicio = (ctx->ultimo_pct < 0.0);
-    bool novo_marco = (marco_atual > ctx->ultimo_marco);
-    bool tempo_suficiente = (dec >= 3.0);
-
-    if (concluido || inicio || novo_marco || tempo_suficiente) {
-        ctx->ult_log = agora;
-        ctx->ultimo_pct = pct;
-        ctx->ultimo_marco = marco_atual;
-
-        double decorrido_total = std::chrono::duration<double>(agora - ctx->inicio).count();
-        double mbps = decorrido_total > 0.0 ? baixado_mb / decorrido_total : 0.0;
-        double eta = mbps > 0.0 ? (total_mb - baixado_mb) / mbps : 0.0;
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%) - %.2f MB/s - ETA %s",
-                      ctx->tag.c_str(), baixado_mb, total_mb, pct, mbps,
-                      duracao_hms(eta).c_str());
-        log(buf);
-    }
-    return 0;
-}
-
-static size_t escrever_async_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
-    auto* writer = static_cast<AsyncFileWriter*>(ud);
-    size_t total = tam * nmemb;
-    if (!writer->push(ptr, total)) return 0; // aborta curl se escrita falhou
-    return total;
-}
-
 static bool http_download_stream(const std::string& url_entrada,
                                  const std::string& caminho_destino,
                                  const AuthApi& auth,
@@ -498,71 +79,28 @@ static bool http_download_stream(const std::string& url_entrada,
                                  double timeout_sec = 1800.0,
                                  long long tamanho_max = 0,
                                  bool* pulado_por_tamanho = nullptr) {
-    if (pulado_por_tamanho) *pulado_por_tamanho = false;
-    AsyncFileWriter writer(caminho_destino);
-    if (!writer.good()) return false;
+    OpcoesDownload op;
+    op.url = url_entrada;
+    op.caminho = caminho_destino;
+    op.tag = tag;
+    op.auth = &auth;
+    op.chave_api = api_key;
+    op.timeout_sec = timeout_sec;
+    op.tamanho_max = tamanho_max;
+    op.detectar_pagina_erro = true;
+    op.pulado_por_tamanho = pulado_por_tamanho;
 
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-
-    std::string url = url_com_chave(url_entrada, auth, api_key);
-    struct curl_slist* headers = nullptr;
-    aplicar_auth(curl, &headers, auth, api_key, url);
-
-    DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now(),
-                                     std::chrono::steady_clock::now(), -1.0, -1,
-                                     tamanho_max, false};
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_async_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &writer);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_xfer_info_cb);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &prog_ctx);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    CURLcode rc = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    writer.close(); // drena a fila pendente e fecha o arquivo
-
-    if (prog_ctx.estourou && tamanho_max > 0) {
-        std::error_code ec;
-        std::filesystem::remove(caminho_destino, ec);
-        if (pulado_por_tamanho) *pulado_por_tamanho = true;
-        log("                                   \r[SKIP] " + tag + " excede tamanho_max (" +
-            formatar_bytes(tamanho_max) + "): " + url);
-        return false;
+    ResultadoDownload r = http_baixar_arquivo(op);
+    if (r.ok) return true;
+    if (r.pulado_tamanho) return false;
+    if (r.pagina_erro) {
+        log("[ERRO] Servidor retornou mensagem de erro para " + tag + ": " +
+            r.corpo_erro.substr(0, 150));
+    } else {
+        log("[ERRO] Download HTTP " + std::to_string(r.status) + " para " + tag +
+            (r.erro.empty() ? "" : " (" + r.erro + ")"));
     }
-
-    if (rc != CURLE_OK || status < 200 || status >= 300 || !writer.good()) {
-        log("[ERRO] Download HTTP " + std::to_string(status) + " para " + tag);
-        return false;
-    }
-
-    std::ifstream checagem(caminho_destino, std::ios::binary);
-    if (!checagem) return false;
-
-    char cabecalho[512] = {0};
-    checagem.read(cabecalho, sizeof(cabecalho) - 1);
-    std::streamsize lidos = checagem.gcount();
-    checagem.close();
-
-    std::string inicio_str(cabecalho, lidos > 0 ? static_cast<size_t>(lidos) : 0);
-    if (inicio_str.rfind("<?xml", 0) == 0 || inicio_str.rfind("<html", 0) == 0 ||
-        inicio_str.rfind("<!DOCTYPE", 0) == 0 || inicio_str.rfind("{\"error\"", 0) == 0 ||
-        inicio_str.rfind("{\"code\"", 0) == 0) {
-        log("[ERRO] Servidor retornou mensagem de erro para " + tag + ": " + inicio_str.substr(0, 150));
-        return false;
-    }
-
-    return true;
+    return false;
 }
 
 static std::string extrair_asset_de_arquivo(const std::filesystem::path& arq) {
@@ -609,28 +147,11 @@ static std::string valor_do_campo(const json& j, const std::string& campo) {
     return "";
 }
 
-static const json* json_no_caminho(const json& j, const std::string& caminho) {
-    const json* atual = &j;
-    size_t inicio = 0;
-    while (inicio <= caminho.size()) {
-        size_t ponto = caminho.find('.', inicio);
-        std::string parte =
-            caminho.substr(inicio, ponto == std::string::npos ? std::string::npos : ponto - inicio);
-        if (parte.empty() || !atual->is_object()) return nullptr;
-        auto it = atual->find(parte);
-        if (it == atual->end()) return nullptr;
-        atual = &(*it);
-        if (ponto == std::string::npos) break;
-        inicio = ponto + 1;
-    }
-    return atual;
-}
-
 static const json* lista_de_jobs(const json& j, const std::string& campo) {
     if (j.is_array()) return &j;
     if (!j.is_object()) return nullptr;
-    for (const std::string& chave : std::vector<std::string>{campo, "jobs", "data", "results"}) {
-        if (chave.empty()) continue;
+    for (const char* chave : {campo.c_str(), "jobs", "data", "results"}) {
+        if (!chave || !*chave) continue;
         auto it = j.find(chave);
         if (it != j.end() && it->is_array()) return &(*it);
     }
@@ -678,7 +199,7 @@ static std::string motivo_rejeicao_job(const DatasetCfg& ds, const AuthApi& auth
                                        const std::string& job_id) {
     std::string url = url_do_job(ds.job_resultado, ds, base, job_id);
     if (url.empty()) return "";
-    RespostaHttpAvancada r = http_get_headers(url, auth, api_key);
+    RespostaHttp r = requisicao_api(url, auth, api_key);
     if (r.erro_rede || r.corpo.empty()) return "";
     std::string msg;
     try {
@@ -723,28 +244,15 @@ static bool ler_data_grib_local(const std::filesystem::path& arquivo, int& ano, 
 
 static bool ler_data_grib_remota(const std::string& url_entrada, const AuthApi& auth,
                                  const std::string& api_key, int& ano, int& mes) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-    std::string url = url_com_chave(url_entrada, auth, api_key);
-    std::string buf;
-    struct curl_slist* headers = nullptr;
-    aplicar_auth(curl, &headers, auth, api_key, url);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_RANGE, "0-63");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    CURLcode rc = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    if (rc != CURLE_OK || status < 200 || status >= 300 || buf.size() < 64) return false;
-    return decodificar_data_grib(reinterpret_cast<const unsigned char*>(buf.data()), buf.size(),
-                                 ano, mes);
+    OpcoesHttp op;
+    op.auth = &auth;
+    op.chave_api = api_key;
+    op.range = "0-63";
+    op.timeout_sec = 30.0;
+    RespostaHttp r = http_requisicao(url_entrada, op);
+    if (r.erro_rede || r.status < 200 || r.status >= 300 || r.corpo.size() < 64) return false;
+    return decodificar_data_grib(
+        reinterpret_cast<const unsigned char*>(r.corpo.data()), r.corpo.size(), ano, mes);
 }
 
 // Reaproveita o job ativo mais recente (mantém a posição já conquistada na
@@ -754,7 +262,7 @@ static std::string obter_job_ativo(const DatasetCfg& ds, const AuthApi& auth,
                                    const std::string& tag) {
     std::string url = url_do_job(ds.job_listar_ativos, ds, base, "");
     if (url.empty()) return "";
-    RespostaHttpAvancada r = http_get_headers(url, auth, api_key);
+    RespostaHttp r = requisicao_api(url, auth, api_key);
     if (r.erro_rede || r.status < 200 || r.status >= 300) return "";
 
     json j;
@@ -791,7 +299,7 @@ static std::string obter_job_ativo(const DatasetCfg& ds, const AuthApi& auth,
             if (i == manter) continue;
             std::string url_job = url_do_job(ds.job_status, ds, base, ativos[i].id);
             if (url_job.empty()) continue;
-            RespostaHttpAvancada d = http_delete(url_job, auth, api_key);
+            RespostaHttp d = requisicao_api(url_job, auth, api_key, "DELETE");
             if (!d.erro_rede && d.status >= 200 && d.status < 300)
                 log("[CANCELADO] " + tag + ": job duplicado " + ativos[i].id.substr(0, 8));
             else
@@ -881,15 +389,10 @@ static bool processar_mes_arquivo(const DatasetCfg& ds, int ano, int mes,
         }
     }
 
-    int dias_no_mes = 31;
-    if (mes == 4 || mes == 6 || mes == 9 || mes == 11) dias_no_mes = 30;
-    else if (mes == 2) {
-        bool bissexto = (ano % 4 == 0 && (ano % 100 != 0 || ano % 400 == 0));
-        dias_no_mes = bissexto ? 29 : 28;
-    }
+    int qtd_dias = dias_no_mes(ano, mes);
 
     std::vector<std::string> lista_dias;
-    for (int d = 1; d <= dias_no_mes; ++d) {
+    for (int d = 1; d <= qtd_dias; ++d) {
         char buf[8];
         std::snprintf(buf, sizeof(buf), "%02d", d);
         lista_dias.push_back(buf);
@@ -955,7 +458,7 @@ static bool processar_mes_arquivo(const DatasetCfg& ds, int ano, int mes,
             reenviar = false;
             if (job_id.empty()) {
                 while (true) {
-                    RespostaHttpAvancada resp = http_post_json(url_executar, corpo, auth, api_key);
+                    RespostaHttp resp = requisicao_api(url_executar, auth, api_key, "POST", corpo);
 
                     if (resp.erro_rede || resp.status == 429 || resp.status >= 500 ||
                         texto_contem_algum(minusculas(resp.corpo), ds.job_reenviar_se)) {
@@ -1014,7 +517,7 @@ static bool processar_mes_arquivo(const DatasetCfg& ds, int ano, int mes,
 
             while (true) {
                 dormir(std::max(1.0, ds.job_poll_intervalo));
-                RespostaHttpAvancada sresp = http_get_headers(url_status, auth, api_key);
+                RespostaHttp sresp = requisicao_api(url_status, auth, api_key);
                 if (sresp.erro_rede || sresp.status < 200 || sresp.status >= 300) {
                     if (++falhas_seguidas == 1 || falhas_seguidas % 10 == 0) {
                         std::string motivo = sresp.erro_rede
@@ -1048,12 +551,12 @@ static bool processar_mes_arquivo(const DatasetCfg& ds, int ano, int mes,
                         espera = " - aguardando o servidor processar (pode levar horas; "
                                  "nao cancele, senao perde a posicao na fila)";
                     log("[JOB] " + std::string(tag) + ": " + status + espera + " | " +
-                        duracao_hms(decorrido));
+                        formatar_duracao(decorrido));
                     status_anterior = status;
                     ultimo_log = agora;
                 } else if (std::chrono::duration<double>(agora - ultimo_log).count() >= 60.0) {
                     log("[JOB] " + std::string(tag) + ": " + status + " | " +
-                        duracao_hms(decorrido));
+                        formatar_duracao(decorrido));
                     ultimo_log = agora;
                 }
 
@@ -1062,8 +565,8 @@ static bool processar_mes_arquivo(const DatasetCfg& ds, int ano, int mes,
                     if (url_resultado.empty()) {
                         download_url = extrair_url_download(ultimo_json);
                     } else {
-                        RespostaHttpAvancada rresp =
-                            http_get_headers(url_resultado, auth, api_key);
+                        RespostaHttp rresp =
+                            requisicao_api(url_resultado, auth, api_key);
                         if (!rresp.erro_rede && rresp.status >= 200 && rresp.status < 300) {
                             try {
                                 download_url = extrair_url_download(json::parse(rresp.corpo));
@@ -1218,7 +721,7 @@ static void recuperar_resultados_job(const DatasetCfg& ds, const std::string& ba
     std::string url = url_do_job(ds.job_listar_ok, ds, cortar(base_url), "");
     if (url.empty()) return;
     AuthApi auth = auth_do_dataset(ds);
-    RespostaHttpAvancada r = http_get_headers(url, auth, api_key);
+    RespostaHttp r = requisicao_api(url, auth, api_key);
     if (r.erro_rede || r.status < 200 || r.status >= 300) return;
 
     json j;
@@ -1240,7 +743,7 @@ static void recuperar_resultados_job(const DatasetCfg& ds, const std::string& ba
 
         const json* alvo = &job;
         if (!ds.job_campo_asset.empty()) {
-            alvo = json_no_caminho(job, ds.job_campo_asset);
+            alvo = navegar_json(job, ds.job_campo_asset);
             if (!alvo) continue;
         }
         std::string href = extrair_url_download(*alvo);
@@ -1266,111 +769,21 @@ bool baixar_arquivo_seguro(const std::string& url,
                            double timeout_sec,
                            long long tamanho_max,
                            bool* pulado_por_tamanho) {
-    if (pulado_por_tamanho) *pulado_por_tamanho = false;
-    auto marcar_pulado = [&](const std::string& motivo) {
-        if (pulado_por_tamanho) *pulado_por_tamanho = true;
-        log("[SKIP] " + motivo + " (limite " + formatar_bytes(tamanho_max) + "): " + url);
-    };
-    if (tamanho_max < 0) tamanho_max = 0;
-    if (tamanho_min < 0) tamanho_min = 0;
-    std::filesystem::path dest(expandir_caminho(caminho_destino));
-    std::error_code ec_pre;
-    auto pai = dest.parent_path();
-    if (!pai.empty()) std::filesystem::create_directories(pai, ec_pre);
+    OpcoesDownload op;
+    op.url = url;
+    op.caminho = caminho_destino;
+    op.headers = headers;
+    op.chave_api = api_key;
+    op.timeout_sec = timeout_sec;
+    op.tamanho_min = tamanho_min;
+    op.tamanho_max = tamanho_max;
+    op.verificar_ssl = false; // downloads diretos costumam usar certificados proprios
+    op.user_agent_navegador = true;
+    op.permitir_reuso = true;
+    op.progresso = false;
+    op.pulado_por_tamanho = pulado_por_tamanho;
 
-    // Se já existe e é válido
-    std::error_code ec;
-    if (std::filesystem::exists(dest, ec)) {
-        auto sz = std::filesystem::file_size(dest, ec);
-        if (!ec && sz > 0 && (tamanho_min <= 0 || sz >= static_cast<unsigned long long>(tamanho_min))) {
-            if (tamanho_max > 0 && sz > static_cast<unsigned long long>(tamanho_max)) {
-                marcar_pulado("Arquivo local (" + formatar_bytes((long long)sz) + ") excede tamanho_max");
-                return false;
-            }
-            return true;
-        }
-        std::filesystem::remove(dest, ec);
-    }
-
-    std::filesystem::path temp_dest = dest;
-    temp_dest += ".temp";
-    std::filesystem::remove(temp_dest, ec);
-
-    std::ofstream arq(temp_dest, std::ios::binary);
-    if (!arq) return false;
-
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-
-    struct curl_slist* hdr = nullptr;
-    hdr = curl_slist_append(hdr, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-    for (const auto& kv : headers) {
-        std::string l = kv.first + ": " + kv.second;
-        hdr = curl_slist_append(hdr, l.c_str());
-    }
-
-    AuthApi auth_padrao;
-    std::string url_final = url_com_chave(url, auth_padrao, api_key);
-    aplicar_auth(curl, &hdr, auth_padrao, api_key, url_final);
-
-    curl_easy_setopt(curl, CURLOPT_URL, url_final.c_str());
-    if (hdr) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
-    EscritorLimitado wl{&arq, tamanho_max, 0, false};
-    HeadersDownload hdrs;
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_limitado_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &wl);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_download_cb);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hdrs);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
-    CURLcode rc = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-
-    if (hdr) curl_slist_free_all(hdr);
-    curl_easy_cleanup(curl);
-    arq.close();
-
-    // Skip por tamanho: Content-Length ja anunciava excesso, ou o stream estourou o limite.
-    if (tamanho_max > 0) {
-        if (hdrs.content_length > tamanho_max) {
-            std::filesystem::remove(temp_dest, ec);
-            marcar_pulado("Content-Length " + formatar_bytes(hdrs.content_length) + " excede tamanho_max");
-            return false;
-        }
-        if (wl.estourou || rc == CURLE_WRITE_ERROR) {
-            // Confirma: pode ser erro real de disco; checa o que foi gravado.
-            auto parcial = std::filesystem::file_size(temp_dest, ec);
-            if (wl.estourou || (!ec && parcial >= static_cast<unsigned long long>(tamanho_max))) {
-                std::filesystem::remove(temp_dest, ec);
-                marcar_pulado("Download excedeu tamanho_max durante o stream");
-                return false;
-            }
-        }
-    }
-
-    if (rc != CURLE_OK || status < 200 || status >= 300) {
-        std::filesystem::remove(temp_dest, ec);
-        return false;
-    }
-
-    auto sz = std::filesystem::file_size(temp_dest, ec);
-    if (ec || sz == 0 || (tamanho_min > 0 && sz < static_cast<unsigned long long>(tamanho_min))) {
-        std::filesystem::remove(temp_dest, ec);
-        return false;
-    }
-    if (tamanho_max > 0 && sz > static_cast<unsigned long long>(tamanho_max)) {
-        std::filesystem::remove(temp_dest, ec);
-        marcar_pulado("Arquivo final (" + formatar_bytes((long long)sz) + ") excede tamanho_max");
-        return false;
-    }
-
-    std::filesystem::rename(temp_dest, dest, ec);
-    return !ec;
+    return http_baixar_arquivo(op).ok;
 }
 
 void executar_dataset_arquivo(const DatasetCfg& ds) {
@@ -1410,7 +823,7 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
 
         if (!ds.padrao_extracao.empty() && !api_url.empty()) {
             log("[EXTRAÇÃO] Acessando " + api_url + " para extrair links (" + ds.padrao_extracao + ")...");
-            RespostaHttpAvancada r = http_get_headers(api_url, auth, api_key, CFG.http_timeout);
+            RespostaHttp r = requisicao_api(api_url, auth, api_key, "GET", "", CFG.http_timeout);
             if (r.status >= 200 && r.status < 300 && !r.corpo.empty()) {
                 auto extraidas = extrair_urls_de_conteudo(r.corpo, api_url, ds.padrao_extracao);
                 log("[EXTRAÇÃO] " + std::to_string(extraidas.size()) + " links/arquivos encontrados.");
@@ -1470,12 +883,12 @@ void executar_dataset_arquivo(const DatasetCfg& ds) {
                                                     &pulado_max);
                     if (ok) {
                         ++baixados;
-                        log("  [ARQUIVO " + std::to_string(baixados.load()) + "/" + std::to_string(urls_para_baixar.size()) + "] " + nome_arq);
+                        log("[ARQUIVO " + std::to_string(baixados.load()) + "/" + std::to_string(urls_para_baixar.size()) + "] " + nome_arq);
                     } else if (pulado_max) {
                         ++pulados;
                     } else {
                         ++falhas;
-                        log("  [FALHA] " + u);
+                        log("[FALHA] " + u);
                     }
                 }
             });

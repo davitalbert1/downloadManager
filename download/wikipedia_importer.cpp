@@ -2,41 +2,25 @@
 #include "config.h"
 #include "file_dataset.h"
 #include "http_client.h"
+#include "storage_sqlite.h"
 #include "utils.h"
 #include <bzlib.h>
 #include <sqlite3.h>
 #include <algorithm>
 #include <atomic>
-#include <cctype>
-#include <cstdio>
+#include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <mutex>
 #include <regex>
 #include <set>
+#include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 namespace fs = std::filesystem;
 
-static std::string trim_copy(std::string s) {
-    size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    size_t b = s.find_last_not_of(" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-static std::string para_minusculas(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-        [](unsigned char c) { return (char)std::tolower(c); });
-    return s;
-}
 static std::string data_do_nome(const std::string& nome) {
-    try {
-        std::regex re(R"(-(\d{4}-\d{2}-\d{2})-)");
-        std::smatch m;
-        if (std::regex_search(nome, m, re)) return m[1].str();
-    } catch (...) {}
+    static const std::regex re(R"(-(\d{4}-\d{2}-\d{2})-)");
+    std::smatch m;
+    if (std::regex_search(nome, m, re)) return m[1].str();
     return "";
 }
 static std::string projeto_do_nome(const std::string& nome) {
@@ -72,7 +56,10 @@ static std::string html_unescape_basico(std::string s) {
     for (int k = 0; k < 9; ++k) {
         size_t p = 0;
         size_t n = strlen(a[k]);
-        while ((p = s.find(a[k], p)) != std::string::npos) { s.replace(p, n, b[k]); p += strlen(b[k]); }
+        while ((p = s.find(a[k], p)) != std::string::npos) {
+            s.replace(p, n, b[k]);
+            p += strlen(b[k]);
+        }
     }
     return s;
 }
@@ -85,91 +72,99 @@ static bool eh_redirect(const std::string& texto) {
     size_t i = 0;
     while (i < texto.size() && isspace((unsigned char)texto[i])) i++;
     if (i >= texto.size() || texto[i] != '#') return false;
-    std::string ini = para_minusculas(texto.substr(i, 22));
+    std::string ini = minusculas(texto.substr(i, 22));
     return ini.rfind("#redirect", 0) == 0 || ini.rfind("#redirecionamento", 0) == 0;
 }
 
 static TextoLimpo limpar_wikitexto(const std::string& bruto) {
     TextoLimpo r;
     if (bruto.empty()) return r;
+    // Regex compiladas uma única vez (antes eram recriadas a cada página).
+    static const std::regex re_comentario(R"(<!--[^-]*-->)");
+    static const std::regex re_ref_auto(R"(<ref[^>]*/>)", std::regex::icase);
+    static const std::regex re_tag(R"(</?[a-z][^>\n]*>)", std::regex::icase);
+    static const std::regex re_cat(
+        R"(\[\[(?:Category|Categoria):([^\]|]+)(?:\|[^\]]*)?\]\])", std::regex::icase);
+    static const std::regex re_link(R"(\[\[([^|\]]+)(?:\|[^\]]*)?\]\])");
+    static const std::regex re_link_pipe(R"(\[\[[^|\]]*\|([^\]]+)\]\])");
+    static const std::regex re_link_simples(R"(\[\[([^\]]+)\]\])");
+    static const std::regex re_url_nome(R"(\[(?:https?:)?//[^\s\]]+\s+([^\]]+)\])");
+    static const std::regex re_url(R"(\[(?:https?:)?//[^\s\]]+\])");
+    static const std::regex re_tpl(R"(\{\{[^{}]+\}\})");
+
     std::string t = bruto;
-    try {
-        t = std::regex_replace(t, std::regex(R"(<!--[^-]*-->)"), std::string(" "));
-        t = std::regex_replace(t, std::regex(R"(<ref[^>]*/>)", std::regex::icase), std::string(" "));
-        t = std::regex_replace(t, std::regex(R"(</?[a-z][^>\n]*>)", std::regex::icase), std::string(" "));
-    } catch (...) {}
-    try {
-        std::regex re_cat(R"(\[\[(?:Category|Categoria):([^\]|]+)(?:\|[^\]]*)?\]\])", std::regex::icase);
-        auto ini = std::sregex_iterator(t.begin(), t.end(), re_cat);
-        auto fim = std::sregex_iterator();
-        for (auto it = ini; it != fim; ++it) {
-            std::string c = trim_copy((*it)[1].str());
-            if (!c.empty()) r.categorias.push_back(c);
-        }
-        t = std::regex_replace(t, re_cat, std::string(""));
-    } catch (...) {}
-    try {
-        std::regex re_link(R"(\[\[([^|\]]+)(?:\|[^\]]*)?\]\])");
-        auto ini = std::sregex_iterator(t.begin(), t.end(), re_link);
-        auto fim = std::sregex_iterator();
-        for (auto it = ini; it != fim; ++it) {
-            std::string d = trim_copy((*it)[1].str());
-            if (d.empty()) continue;
-            std::string dl = para_minusculas(d);
-            if (dl.rfind("category:", 0) == 0 || dl.rfind("categoria:", 0) == 0) continue;
-            if (dl.rfind("file:", 0) == 0 || dl.rfind("image:", 0) == 0) continue;
-            if (dl.rfind("imagem:", 0) == 0 || dl.rfind("ficheiro:", 0) == 0) continue;
-            r.links.push_back(d);
-        }
-        t = std::regex_replace(t, std::regex(R"(\[\[[^|\]]*\|([^\]]+)\]\])"), std::string("$1"));
-        t = std::regex_replace(t, std::regex(R"(\[\[([^\]]+)\]\])"), std::string("$1"));
-    } catch (...) {}
-    try {
-        t = std::regex_replace(t, std::regex(R"(\[(?:https?:)?//[^\s\]]+\s+([^\]]+)\])"), std::string("$1"));
-        t = std::regex_replace(t, std::regex(R"(\[(?:https?:)?//[^\s\]]+\])"), std::string(" "));
-    } catch (...) {}
-    try {
-        std::regex re_tpl(R"(\{\{[^{}]+\}\})");
-        for (int k = 0; k < 15; ++k) {
-            std::string n = std::regex_replace(t, re_tpl, std::string(""));
-            if (n == t) break;
-            t = n;
-        }
-    } catch (...) {}
+    t = std::regex_replace(t, re_comentario, std::string(" "));
+    t = std::regex_replace(t, re_ref_auto, std::string(" "));
+    t = std::regex_replace(t, re_tag, std::string(" "));
+
+    auto ini = std::sregex_iterator(t.begin(), t.end(), re_cat);
+    auto fim = std::sregex_iterator();
+    for (auto it = ini; it != fim; ++it) {
+        std::string c = cortar((*it)[1].str());
+        if (!c.empty()) r.categorias.push_back(c);
+    }
+    t = std::regex_replace(t, re_cat, std::string(""));
+
+    ini = std::sregex_iterator(t.begin(), t.end(), re_link);
+    for (auto it = ini; it != fim; ++it) {
+        std::string d = cortar((*it)[1].str());
+        if (d.empty()) continue;
+        std::string dl = minusculas(d);
+        if (dl.rfind("category:", 0) == 0 || dl.rfind("categoria:", 0) == 0) continue;
+        if (dl.rfind("file:", 0) == 0 || dl.rfind("image:", 0) == 0) continue;
+        if (dl.rfind("imagem:", 0) == 0 || dl.rfind("ficheiro:", 0) == 0) continue;
+        r.links.push_back(d);
+    }
+    t = std::regex_replace(t, re_link_pipe, std::string("$1"));
+    t = std::regex_replace(t, re_link_simples, std::string("$1"));
+
+    t = std::regex_replace(t, re_url_nome, std::string("$1"));
+    t = std::regex_replace(t, re_url, std::string(" "));
+
+    for (int k = 0; k < 15; ++k) {
+        std::string n = std::regex_replace(t, re_tpl, std::string(""));
+        if (n == t) break;
+        t = n;
+    }
     size_t p = 0;
-    while ((p = t.find("'''''", p)) != std::string::npos) { t.replace(p, 5, "***"); p += 3; }
+    while ((p = t.find("'''''", p)) != std::string::npos) {
+        t.replace(p, 5, "***");
+        p += 3;
+    }
     p = 0;
-    while ((p = t.find("'''", p)) != std::string::npos) { t.replace(p, 3, "**"); p += 2; }
+    while ((p = t.find("'''", p)) != std::string::npos) {
+        t.replace(p, 3, "**");
+        p += 2;
+    }
     p = 0;
-    while ((p = t.find("''", p)) != std::string::npos) { t.replace(p, 2, "*"); p += 1; }
+    while ((p = t.find("''", p)) != std::string::npos) {
+        t.replace(p, 2, "*");
+        p += 1;
+    }
     t = html_unescape_basico(t);
     std::string out;
     out.reserve(t.size());
     int nl = 0;
     for (char c : t) {
-        if (c == '\n') { nl++; if (nl <= 2) out.push_back(c); }
-        else { nl = 0; out.push_back(c); }
+        if (c == '\n') {
+            nl++; if (nl <= 2) out.push_back(c);
+        } else {
+            nl = 0;
+            out.push_back(c);
+        }
     }
-    t = trim_copy(out);
+    t = cortar(out);
     if (!r.categorias.empty()) {
-        t = trim_copy(t) + "\n\nCategorias: ";
+        t = cortar(t) + "\n\nCategorias: ";
         for (size_t i = 0; i < r.categorias.size(); ++i) {
             if (i) t += ", ";
             t += r.categorias[i];
         }
     }
-    r.texto = trim_copy(t);
+    r.texto = cortar(t);
     return r;
 }
 
-static void wsql_exec(sqlite3* db, const char* sql) {
-    char* err = nullptr;
-    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::string m = err ? err : "erro";
-        sqlite3_free(err);
-        throw std::runtime_error("SQLite: " + m);
-    }
-}
 struct WikiPagina {
     long long id = 0;
     std::string titulo;
@@ -194,23 +189,36 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
         if (db) sqlite3_close(db);
         throw std::runtime_error("SQLite: " + db_path + ": " + m);
     }
-    wsql_exec(db, "PRAGMA journal_mode=WAL;");
-    wsql_exec(db, "PRAGMA synchronous=NORMAL;");
-    wsql_exec(db, "PRAGMA busy_timeout=60000;");
-    wsql_exec(db, "CREATE TABLE IF NOT EXISTS paginas(page_id INTEGER PRIMARY KEY,"
+    executar_sql(db, "PRAGMA journal_mode=WAL;");
+    executar_sql(db, "PRAGMA synchronous=NORMAL;");
+    executar_sql(db, "PRAGMA busy_timeout=60000;");
+    executar_sql(db, "CREATE TABLE IF NOT EXISTS paginas(page_id INTEGER PRIMARY KEY,"
         "titulo TEXT NOT NULL,namespace INTEGER NOT NULL,projeto TEXT NOT NULL,"
         "data TEXT NOT NULL,origem TEXT NOT NULL,texto TEXT);");
-    wsql_exec(db, "CREATE TABLE IF NOT EXISTS progresso(arquivo TEXT PRIMARY KEY,"
+    executar_sql(db, "CREATE TABLE IF NOT EXISTS progresso(arquivo TEXT PRIMARY KEY,"
         "completo INTEGER NOT NULL DEFAULT 0,"
         "ultimo_page_id INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;");
-    wsql_exec(db, "CREATE TABLE IF NOT EXISTS categorias(page_id INTEGER NOT NULL,"
+    executar_sql(db, "CREATE TABLE IF NOT EXISTS categorias(page_id INTEGER NOT NULL,"
         "categoria TEXT NOT NULL,PRIMARY KEY(page_id,categoria)) WITHOUT ROWID;");
-    wsql_exec(db, "CREATE TABLE IF NOT EXISTS links(page_id INTEGER NOT NULL,"
+    executar_sql(db, "CREATE TABLE IF NOT EXISTS links(page_id INTEGER NOT NULL,"
         "destino TEXT NOT NULL,PRIMARY KEY(page_id,destino)) WITHOUT ROWID;");
 
-    std::string ins_prog = "INSERT OR IGNORE INTO progresso(arquivo,completo,ultimo_page_id)"
-        " VALUES('" + nome + "',0,0);";
-    wsql_exec(db, ins_prog.c_str());
+    auto preparar = [&](const char* sql) -> sqlite3_stmt* {
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
+            std::string m = sqlite3_errmsg(db);
+            sqlite3_finalize(st);
+            throw std::runtime_error("SQLite: " + m);
+        }
+        return st;
+    };
+    {
+        sqlite3_stmt* st = preparar(
+            "INSERT OR IGNORE INTO progresso(arquivo,completo,ultimo_page_id) VALUES(?,0,0)");
+        sqlite3_bind_text(st, 1, nome.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
     long long skip_ate = 0;
     int completo = 0;
     sqlite3_stmt* stq = nullptr;
@@ -247,16 +255,14 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
         sqlite3_close(db);
         return false;
     }
-    sqlite3_stmt* st_pag = nullptr;
-    sqlite3_stmt* st_cat = nullptr;
-    sqlite3_stmt* st_lnk = nullptr;
-    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO paginas"
-        "(page_id,titulo,namespace,projeto,data,origem,texto) VALUES(?,?,?,?,?,?,?)",
-        -1, &st_pag, nullptr);
-    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO categorias(page_id,categoria) VALUES(?,?)",
-        -1, &st_cat, nullptr);
-    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO links(page_id,destino) VALUES(?,?)",
-        -1, &st_lnk, nullptr);
+    sqlite3_stmt* st_pag = preparar("INSERT OR IGNORE INTO paginas"
+        "(page_id,titulo,namespace,projeto,data,origem,texto) VALUES(?,?,?,?,?,?,?)");
+    sqlite3_stmt* st_cat = preparar(
+        "INSERT OR IGNORE INTO categorias(page_id,categoria) VALUES(?,?)");
+    sqlite3_stmt* st_lnk = preparar(
+        "INSERT OR IGNORE INTO links(page_id,destino) VALUES(?,?)");
+    sqlite3_stmt* st_prog = preparar(
+        "UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?");
     std::vector<WikiPagina> lote;
     lote.reserve((size_t)batch_size);
     long long checkpoint = skip_ate;
@@ -267,10 +273,9 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
     carry.reserve(8 << 20);
     log("[WIKI] Importando " + nome + " (resume page_id > " + std::to_string(skip_ate) + ") ...");
 
-
     auto flush = [&]() {
         if (lote.empty()) return;
-        wsql_exec(db, "BEGIN IMMEDIATE;");
+        executar_sql(db, "BEGIN IMMEDIATE;");
         for (auto& pg : lote) {
             sqlite3_bind_int64(st_pag, 1, pg.id);
             sqlite3_bind_text(st_pag, 2, pg.titulo.c_str(), -1, SQLITE_TRANSIENT);
@@ -297,14 +302,12 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
                 sqlite3_clear_bindings(st_lnk);
             }
         }
-        sqlite3_stmt* up = nullptr;
-        sqlite3_prepare_v2(db, "UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?)"
-            " WHERE arquivo=?", -1, &up, nullptr);
-        sqlite3_bind_int64(up, 1, checkpoint);
-        sqlite3_bind_text(up, 2, nome.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(up);
-        sqlite3_finalize(up);
-        wsql_exec(db, "COMMIT;");
+        sqlite3_bind_int64(st_prog, 1, checkpoint);
+        sqlite3_bind_text(st_prog, 2, nome.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(st_prog);
+        sqlite3_reset(st_prog);
+        sqlite3_clear_bindings(st_prog);
+        executar_sql(db, "COMMIT;");
         lote.clear();
     };
 
@@ -322,7 +325,10 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
                 break;
             }
             size_t fa = carry.find('>', ini);
-            if (fa == std::string::npos) { carry = carry.substr(ini); break; }
+            if (fa == std::string::npos) {
+                carry = carry.substr(ini);
+                break;
+            }
             size_t fim = carry.find("</page>", fa);
             if (fim == std::string::npos) {
                 if (ini > 0) carry = carry.substr(ini);
@@ -331,17 +337,34 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
             std::string bloco = carry.substr(ini, fim + 7 - ini);
             carry.erase(0, fim + 7);
             lidas++;
-            std::string titulo = html_unescape_basico(trim_copy(extrair_tag(bloco, "title")));
-            std::string ns_s = trim_copy(extrair_tag(bloco, "ns"));
-            std::string id_s = trim_copy(extrair_tag(bloco, "id"));
+            std::string titulo = html_unescape_basico(cortar(extrair_tag(bloco, "title")));
+            std::string ns_s = cortar(extrair_tag(bloco, "ns"));
+            std::string id_s = cortar(extrair_tag(bloco, "id"));
             std::string traw = extrair_tag(bloco, "text");
             int ns = 0;
             long long pid = 0;
-            try { ns = ns_s.empty() ? 0 : std::stoi(ns_s); } catch (...) { ns = 0; }
-            try { pid = id_s.empty() ? 0 : std::stoll(id_s); } catch (...) { pid = 0; }
-            if (pid == 0) { puladas++; continue; }
-            if (pid <= skip_ate) { puladas++; continue; }
-            if (apenas_ns0 && ns != 0) { puladas++; continue; }
+            try {
+                ns = ns_s.empty() ? 0 : std::stoi(ns_s);
+            } catch (...) {
+                ns = 0;
+            }
+            try {
+                pid = id_s.empty() ? 0 : std::stoll(id_s);
+            } catch (...) {
+                pid = 0;
+            }
+            if (pid == 0) {
+                puladas++;
+                continue;
+            }
+            if (pid <= skip_ate) {
+                puladas++;
+                continue;
+            }
+            if (apenas_ns0 && ns != 0) {
+                puladas++;
+                continue;
+            }
             if (ignorar_redirect && eh_redirect(traw)) {
                 puladas++;
                 if (pid > checkpoint) checkpoint = pid;
@@ -381,17 +404,17 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
     BZ2_bzReadClose(&bzerr, bz);
     fclose(f);
     if (!erro_bz) {
-        sqlite3_stmt* up = nullptr;
-        sqlite3_prepare_v2(db, "UPDATE progresso SET completo=1 WHERE arquivo=?", -1, &up, nullptr);
+        sqlite3_stmt* up = preparar("UPDATE progresso SET completo=1 WHERE arquivo=?");
         sqlite3_bind_text(up, 1, nome.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(up);
         sqlite3_finalize(up);
-        wsql_exec(db, "CREATE INDEX IF NOT EXISTS idx_categorias_nome ON categorias(categoria);");
-        wsql_exec(db, "CREATE INDEX IF NOT EXISTS idx_links_destino ON links(destino);");
+        executar_sql(db, "CREATE INDEX IF NOT EXISTS idx_categorias_nome ON categorias(categoria);");
+        executar_sql(db, "CREATE INDEX IF NOT EXISTS idx_links_destino ON links(destino);");
     }
     sqlite3_finalize(st_pag);
     sqlite3_finalize(st_cat);
     sqlite3_finalize(st_lnk);
+    sqlite3_finalize(st_prog);
     sqlite3_close(db);
     log("[WIKI] " + nome + (erro_bz ? " PARCIAL" : " OK") + ": lidas=" + std::to_string(lidas)
         + " ins=" + std::to_string(inseridas) + " skip=" + std::to_string(puladas));
@@ -399,13 +422,13 @@ bool importar_arquivo_wikipedia_bz2(const std::string& caminho_bz2,
 }
 static std::vector<std::string> listar_xml_bz2_remoto(const std::string& base_url) {
     std::vector<std::string> out;
-    RespostaHttp r = http_requisicao(base_url, "GET", {}, "", "", "");
+    RespostaHttp r = http_requisicao(base_url);
     if (r.erro_rede || r.status < 200 || r.status >= 300 || r.corpo.empty()) {
         log("[WIKI][ERRO] Listagem falhou " + base_url + " http=" + std::to_string(r.status));
         return out;
     }
     try {
-        std::regex re_href("href\\s*=\\s*\"([^\"]+\\.xml\\.bz2)\"", std::regex::icase);
+        static const std::regex re_href("href\\s*=\\s*\"([^\"]+\\.xml\\.bz2)\"", std::regex::icase);
         auto ini = std::sregex_iterator(r.corpo.begin(), r.corpo.end(), re_href);
         auto fim = std::sregex_iterator();
         std::set<std::string> vistos;
@@ -442,7 +465,7 @@ void executar_dataset_wikipedia(const DatasetCfg& ds) {
             if (ec) break;
             if (!e.is_regular_file()) continue;
             std::string n2 = e.path().filename().string();
-            std::string l = para_minusculas(n2);
+            std::string l = minusculas(n2);
             if (l.size() >= 8 && l.compare(l.size() - 8, 8, ".xml.bz2") == 0) arquivos.push_back(n2);
         }
         std::sort(arquivos.begin(), arquivos.end());
@@ -460,39 +483,29 @@ void executar_dataset_wikipedia(const DatasetCfg& ds) {
             " process_workers=" + std::to_string(CFG.process_workers) +
             " p/ " + std::to_string(arquivos.size()) + " dumps");
         {
-            std::atomic<size_t> idx{0};
-            std::vector<std::thread> th;
-            th.reserve((size_t)std::max(1, n_dl));
-            for (int i = 0; i < n_dl; ++i) {
-                th.emplace_back([&] {
-                    while (true) {
-                        size_t k = idx.fetch_add(1);
-                        if (k >= arquivos.size()) break;
-                        const std::string n2 = arquivos[k];
-                        fs::path dest = fs::path(pasta) / n2;
-                        std::error_code ec2;
-                        if (fs::exists(dest, ec2) && fs::file_size(dest, ec2) > 0) {
-                            if (ds.tamanho_max_bytes > 0) {
-                                auto sz = fs::file_size(dest, ec2);
-                                if (!ec2 && sz > static_cast<unsigned long long>(ds.tamanho_max_bytes)) {
-                                    log("[WIKI][SKIP] " + n2 + " (" + std::to_string(sz) +
-                                        " bytes) excede tamanho_max");
-                                    continue;
-                                }
-                            }
-                            log("[WIKI] OK (local): " + n2);
-                            continue;
+            executar_paralelo(n_dl, arquivos.size(), [&](size_t k) {
+                const std::string n2 = arquivos[k];
+                fs::path dest = fs::path(pasta) / n2;
+                std::error_code ec2;
+                if (fs::exists(dest, ec2) && fs::file_size(dest, ec2) > 0) {
+                    if (ds.tamanho_max_bytes > 0) {
+                        auto sz = fs::file_size(dest, ec2);
+                        if (!ec2 && sz > static_cast<unsigned long long>(ds.tamanho_max_bytes)) {
+                            log("[WIKI][SKIP] " + n2 + " (" + std::to_string(sz) +
+                                " bytes) excede tamanho_max");
+                            return;
                         }
-                        log("[WIKI] Baixando: " + n2);
-                        bool pulado_max = false;
-                        bool ok = baixar_arquivo_seguro(juntar_url(base_url, n2), dest.string(),
-                            "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
-                            ds.tamanho_max_bytes, &pulado_max);
-                        if (!ok && !pulado_max) log("[WIKI][ERRO] Falha no download: " + n2);
                     }
-                });
-            }
-            for (auto& t : th) t.join();
+                    log("[WIKI] OK (local): " + n2);
+                    return;
+                }
+                log("[WIKI] Baixando: " + n2);
+                bool pulado_max = false;
+                bool ok = baixar_arquivo_seguro(juntar_url(base_url, n2), dest.string(),
+                    "", ds.tamanho_min_bytes, ds.headers, CFG.http_timeout,
+                    ds.tamanho_max_bytes, &pulado_max);
+                if (!ok && !pulado_max) log("[WIKI][ERRO] Falha no download: " + n2);
+            });
         }
     }
     // Fase 2 (CPU + SQLite): importações em paralelo com process_workers.
@@ -507,30 +520,24 @@ void executar_dataset_wikipedia(const DatasetCfg& ds) {
     log("[WIKI] Importando " + std::to_string(arquivos.size()) +
         " dumps com process_workers=" + std::to_string(n_proc));
     {
-        std::atomic<size_t> idx{0};
-        std::vector<std::thread> th;
-        th.reserve((size_t)std::max(1, n_proc));
-        for (int i = 0; i < n_proc; ++i) {
-            th.emplace_back([&] {
-                while (true) {
-                    size_t k = idx.fetch_add(1);
-                    if (k >= arquivos.size()) break;
-                    const std::string n2 = arquivos[k];
-                    fs::path p = fs::path(pasta) / n2;
-                    std::error_code ec2;
-                    if (!fs::exists(p, ec2)) { fail_n.fetch_add(1); continue; }
-                    try {
-                        bool ok = importar_arquivo_wikipedia_bz2(p.string(), db, ds.projeto, ds.data_dump,
-                            n2, ds.apenas_ns0, ds.ignorar_redirect, ds.tamanho_minimo, ds.wiki_batch);
-                        if (ok) ok_n.fetch_add(1); else fail_n.fetch_add(1);
-                    } catch (const std::exception& e) {
-                        log(std::string("[WIKI][ERRO] ") + n2 + ": " + e.what());
-                        fail_n.fetch_add(1);
-                    }
-                }
-            });
-        }
-        for (auto& t : th) t.join();
+        executar_paralelo(n_proc, arquivos.size(), [&](size_t k) {
+            const std::string n2 = arquivos[k];
+            fs::path p = fs::path(pasta) / n2;
+            std::error_code ec2;
+            if (!fs::exists(p, ec2)) {
+                fail_n.fetch_add(1);
+                return;
+            }
+            try {
+                bool ok = importar_arquivo_wikipedia_bz2(p.string(), db, ds.projeto, ds.data_dump,
+                    n2, ds.apenas_ns0, ds.ignorar_redirect, ds.tamanho_minimo, ds.wiki_batch);
+                if (ok) ok_n.fetch_add(1);
+                else fail_n.fetch_add(1);
+            } catch (const std::exception& e) {
+                log(std::string("[WIKI][ERRO] ") + n2 + ": " + e.what());
+                fail_n.fetch_add(1);
+            }
+        });
     }
     log("[WIKI] Concluido: " + std::to_string(ok_n.load()) + " OK, "
         + std::to_string(fail_n.load()) + " falhas. Banco: " + db);

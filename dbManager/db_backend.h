@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <memory>
 #include <sqlite3.h>
 
 struct ColumnInfo {
@@ -64,9 +63,6 @@ public:
 
     // Freeform SQL Execution
     QueryResult executeQuery(const std::string& sql, int maxRows = 1000);
-
-    // Get exact or cached row count for table
-    int64_t getTableRowCount(const std::string& tableName);
 
 private:
     sqlite3* m_db = nullptr;

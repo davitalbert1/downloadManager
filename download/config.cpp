@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <regex>
 #include <sstream>
 
 Config CFG;
@@ -118,6 +120,16 @@ static bool eh_secao_coordenadas(const std::string& s) {
     return s == "coordenadas" || s == "coordinates";
 }
 
+// Primeiro valor nao vazio entre os aliases PT/EN de uma chave.
+static std::string primeiro_valor(const Ini& ini, const std::string& secao,
+                                  std::initializer_list<const char*> chaves) {
+    for (const char* chave : chaves) {
+        std::string v = cortar(ini.obter_ou(secao, chave));
+        if (!v.empty()) return v;
+    }
+    return "";
+}
+
 Ini ler_ini(const std::string& caminho) {
     Ini ini;
     std::ifstream arquivo(caminho);
@@ -198,19 +210,25 @@ static const DimensaoCfg* achar_dim(const std::string& nome) {
     return nullptr;
 }
 
-std::vector<Contexto> contextos_do_eixo(const std::string& eixo) {
+static std::vector<Contexto> contextos_coordenadas(bool com_fallback) {
     std::vector<Contexto> out;
-    if (eixo == "coordenadas" || eixo == "coordinates") {
-        for (const auto& c : CFG.coordenadas) {
-            Contexto ctx;
-            ctx["latitude"] = num_str(c.first);
-            ctx["longitude"] = num_str(c.second);
-            ctx["lat"] = ctx["latitude"];
-            ctx["lon"] = ctx["longitude"];
-            out.push_back(std::move(ctx));
-        }
-        return out;
+    if (CFG.coordenadas.empty() && com_fallback)
+        out.push_back({{"latitude", num_str(0.0)}, {"longitude", num_str(0.0)},
+                       {"lat", num_str(0.0)}, {"lon", num_str(0.0)}});
+    for (const auto& c : CFG.coordenadas) {
+        Contexto ctx;
+        ctx["latitude"] = num_str(c.first);
+        ctx["longitude"] = num_str(c.second);
+        ctx["lat"] = ctx["latitude"];
+        ctx["lon"] = ctx["longitude"];
+        out.push_back(std::move(ctx));
     }
+    return out;
+}
+
+static std::vector<Contexto> contextos_do_eixo(const std::string& eixo) {
+    std::vector<Contexto> out;
+    if (eixo == "coordenadas" || eixo == "coordinates") return contextos_coordenadas(false);
     const DimensaoCfg* dim = achar_dim(eixo);
     if (!dim) {
         log("[WARNING] Eixo '" + eixo + "' nao encontrado ([dim:" + eixo + "]).");
@@ -234,7 +252,7 @@ std::vector<Contexto> contextos_do_eixo(const std::string& eixo) {
     return out;
 }
 
-std::vector<Contexto> expandir_contextos(const DatasetCfg& ds) {
+static std::vector<Contexto> expandir_contextos(const DatasetCfg& ds) {
     if (ds.eixos.empty()) return {Contexto{}};
     std::vector<Contexto> acc{{}};
     for (const auto& eixo : ds.eixos) {
@@ -252,6 +270,31 @@ std::vector<Contexto> expandir_contextos(const DatasetCfg& ds) {
         acc.swap(nxt);
     }
     return acc;
+}
+
+std::vector<Contexto> contextos_de_download(const DatasetCfg& ds) {
+    if (!ds.usar_coordenadas) return expandir_contextos(ds);
+    return contextos_coordenadas(true);
+}
+
+std::string chave_contexto(const Contexto& ctx) {
+    auto ilat = ctx.find("latitude");
+    auto ilon = ctx.find("longitude");
+    if (ilat != ctx.end() && ilon != ctx.end()) return ilat->second + "," + ilon->second;
+    std::string ch;
+    for (const auto& kv : ctx) {
+        if (chave_ctx_interna(kv.first)) continue;
+        if (!ch.empty()) ch += "|";
+        ch += kv.first + "=" + kv.second;
+    }
+    return ch;
+}
+
+bool dataset_generico(const DatasetCfg& ds) {
+    return ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" &&
+           ds.tipo_saida != "google_drive" && ds.tipo_saida != "wikipedia" &&
+           ds.tipo_saida != "wiki" && ds.tipo_saida != "video" &&
+           ds.tipo_saida != "stream" && ds.drive_folder_id.empty();
 }
 
 std::string resolver_data_limite(const std::string& v, const std::string& padrao) {
@@ -288,8 +331,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.api_keys = cortar(ini.obter_ou(secao, "api_keys"));
 
         // Campos para dataset do tipo arquivo / assíncronos
-        d.tipo_saida = cortar(ini.obter_ou(secao, "tipo_saida"));
-        if (d.tipo_saida.empty()) d.tipo_saida = cortar(ini.obter_ou(secao, "output_type"));
+        d.tipo_saida = primeiro_valor(ini, secao, {"tipo_saida", "output_type"});
         if (d.tipo_saida.empty()) {
             std::string temp_val;
             if (ini.obter(secao, "pasta_saida", temp_val) || ini.obter(secao, "dataset_api", temp_val) ||
@@ -349,13 +391,9 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.usar_yt_dlp = para_bool(ini.obter_ou(secao, "usar_yt_dlp", "0"), false);
         d.tamanho_min_bytes = para_int(ini.obter_ou(secao, "tamanho_min_bytes", "0"), 0);
         { // tamanho maximo: aceita bytes ou sufixos (KB/MB/GB/TB); aliases PT/EN
-            std::string tmax = cortar(ini.obter_ou(secao, "tamanho_max_bytes"));
-            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "tamanho_maximo"));
-            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "tamanho_max"));
-            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "max_bytes"));
-            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "max_file_size"));
-            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "max_size"));
-            if (tmax.empty()) tmax = cortar(ini.obter_ou(secao, "tamanho_limite"));
+            std::string tmax = primeiro_valor(ini, secao,
+                {"tamanho_max_bytes", "tamanho_maximo", "tamanho_max", "max_bytes",
+                 "max_file_size", "max_size", "tamanho_limite"});
             if (!tmax.empty()) d.tamanho_max_bytes = parse_tamanho_bytes(tmax, 0);
             // vazio = herda do [geral] em carregar_config()
         }
@@ -381,6 +419,42 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
             }
         }
 
+        // Expansão de episódios/faixas de URLs para vídeos ou datasets sequenciais
+        int ep_ini = para_int(ini.obter_ou(secao, "ep_inicio", ini.obter_ou(secao, "episodio_inicio", "0")), 0);
+        int ep_fim = para_int(ini.obter_ou(secao, "ep_fim", ini.obter_ou(secao, "episodio_fim", "0")), 0);
+
+        if (ep_ini == 0 && ep_fim == 0 && !d.url.empty()) {
+            static const std::regex reg_range(R"([?&]ep=[{\[]?(\d+)\.\.(\d+)[}\]]?)", std::regex::icase);
+            std::smatch m;
+            if (std::regex_search(d.url, m, reg_range)) {
+                ep_ini = std::stoi(m[1].str());
+                ep_fim = std::stoi(m[2].str());
+            }
+        }
+
+        if (ep_ini > 0 && ep_fim >= ep_ini && !d.url.empty()) {
+            for (int ep = ep_ini; ep <= ep_fim; ++ep) {
+                std::string u = d.url;
+                if (u.find("{ep}") != std::string::npos || u.find("{episodio}") != std::string::npos) {
+                    u = aplicar_ctx(u, {{"ep", std::to_string(ep)}, {"episodio", std::to_string(ep)}});
+                } else {
+                    static const std::regex reg_range_replace(R"(([?&]ep=)[{\[]?\d+\.\.\d+[}\]]?)", std::regex::icase);
+                    if (std::regex_search(u, reg_range_replace)) {
+                        u = std::regex_replace(u, reg_range_replace, "$1" + std::to_string(ep));
+                    } else {
+                        static const std::regex reg_ep(R"(([?&]ep=)\d+)");
+                        if (std::regex_search(u, reg_ep)) {
+                            u = std::regex_replace(u, reg_ep, "$1" + std::to_string(ep));
+                        } else {
+                            u += (u.find('?') == std::string::npos ? "?ep=" : "&ep=") + std::to_string(ep);
+                        }
+                    }
+                }
+                d.lista_urls.push_back(u);
+            }
+            d.url.clear();
+        }
+
         std::string hrs_str = ini.obter_ou(secao, "horarios");
         if (!hrs_str.empty()) d.horarios = dividir(hrs_str, ',');
 
@@ -392,8 +466,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.wiki_batch = para_int(ini.obter_ou(secao, "wiki_batch", "2000"), 2000);
         d.listar_remoto = para_bool(ini.obter_ou(secao, "listar_remoto", "1"), true);
 
-        d.bloco = cortar(ini.obter_ou(secao, "bloco"));
-        if (d.bloco.empty()) d.bloco = cortar(ini.obter_ou(secao, "block"));
+        d.bloco = primeiro_valor(ini, secao, {"bloco", "block"});
         d.params_chave = cortar(ini.obter_ou(secao, "params_chave", d.bloco));
 
         auto add_coluna = [&](const std::string& c, const std::string& v, const std::string& tp) {
@@ -447,18 +520,15 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
                 if (!v.empty()) d.vars_excluir.insert(v);
             }
         }
-        d.data_min = cortar(ini.obter_ou(secao, "data_min"));
-        if (d.data_min.empty()) d.data_min = cortar(ini.obter_ou(secao, "start_date"));
-        d.data_max = cortar(ini.obter_ou(secao, "data_max"));
-        if (d.data_max.empty()) d.data_max = cortar(ini.obter_ou(secao, "end_date"));
+        d.data_min = primeiro_valor(ini, secao, {"data_min", "start_date"});
+        d.data_max = primeiro_valor(ini, secao, {"data_max", "end_date"});
 
         d.chave_data = normalizar_nome(ini.obter_ou(secao, "chave_data", "data"));
         d.chave_hora = normalizar_nome(ini.obter_ou(secao, "chave_hora", "hora"));
         if (d.chave_data.empty()) d.chave_data = "data";
         if (d.chave_hora.empty()) d.chave_hora = "hora";
 
-        std::string gran = minusculas(cortar(ini.obter_ou(secao, "granularidade")));
-        if (gran.empty()) gran = minusculas(cortar(ini.obter_ou(secao, "granularity")));
+        std::string gran = minusculas(primeiro_valor(ini, secao, {"granularidade", "granularity"}));
         if (gran == "hora" || gran == "hourly" || gran == "horario" || gran == "hour")
             d.granularidade = "hora";
         else if (gran == "dia" || gran == "daily" || gran == "diario" || gran == "day")
@@ -475,14 +545,12 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         std::transform(d.metodo.begin(), d.metodo.end(), d.metodo.begin(), [](unsigned char c) {
             return static_cast<char>(std::toupper(c));
         });
-        d.corpo = ini.obter_ou(secao, "corpo");
-        if (d.corpo.empty()) d.corpo = ini.obter_ou(secao, "body");
-        d.formato = minusculas(cortar(ini.obter_ou(secao, "formato", "auto")));
-        if (d.formato.empty()) d.formato = minusculas(cortar(ini.obter_ou(secao, "format", "auto")));
+        d.corpo = primeiro_valor(ini, secao, {"corpo", "body"});
+        d.formato = minusculas(primeiro_valor(ini, secao, {"formato", "format"}));
+        if (d.formato.empty()) d.formato = "auto";
         d.chave_tempo = cortar(ini.obter_ou(secao, "chave_tempo", "time"));
         if (d.chave_tempo.empty()) d.chave_tempo = "time";
-        d.chave_unica = cortar(ini.obter_ou(secao, "chave_unica"));
-        if (d.chave_unica.empty()) d.chave_unica = cortar(ini.obter_ou(secao, "unique_key"));
+        d.chave_unica = primeiro_valor(ini, secao, {"chave_unica", "unique_key"});
         d.api_key_em = minusculas(cortar(ini.obter_ou(secao, "api_key_em", "query")));
         d.api_key_header = cortar(ini.obter_ou(secao, "api_key_header", "Authorization"));
         d.api_key_prefix = cortar(ini.obter_ou(secao, "api_key_prefix", "Bearer"));
@@ -497,15 +565,13 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
                     d.headers[kv.first.substr(7)] = kv.second;
             }
         }
-        std::string eixos_s = cortar(ini.obter_ou(secao, "eixos"));
-        if (eixos_s.empty()) eixos_s = cortar(ini.obter_ou(secao, "axes"));
+        std::string eixos_s = primeiro_valor(ini, secao, {"eixos", "axes"});
         if (!eixos_s.empty()) {
             for (auto& e : dividir(eixos_s, ',')) {
                 if (!e.empty()) d.eixos.push_back(e);
             }
         }
-        std::string uc = cortar(ini.obter_ou(secao, "usar_coordenadas"));
-        if (uc.empty()) uc = cortar(ini.obter_ou(secao, "use_coordinates"));
+        std::string uc = primeiro_valor(ini, secao, {"usar_coordenadas", "use_coordinates"});
         if (!uc.empty()) {
             d.usar_coordenadas = para_bool(uc, false);
         } else if (!d.eixos.empty()) {
@@ -517,8 +583,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
             d.usar_coordenadas = !CFG.coordenadas.empty();
         }
 
-        std::string idatas = cortar(ini.obter_ou(secao, "iterar_datas"));
-        if (idatas.empty()) idatas = cortar(ini.obter_ou(secao, "iterate_dates"));
+        std::string idatas = primeiro_valor(ini, secao, {"iterar_datas", "iterate_dates"});
         if (!idatas.empty()) d.iterar_datas = para_bool(idatas, true);
         else d.iterar_datas = (d.granularidade != "nenhuma");
 
@@ -535,12 +600,12 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         bool eh_drive = (d.tipo_saida == "drive" || d.tipo_saida == "google_drive" ||
                          !d.drive_folder_id.empty());
         bool eh_wiki = (d.tipo_saida == "wikipedia" || d.tipo_saida == "wiki");
-        if (d.url.empty() && !eh_drive && !eh_wiki) {
+        bool eh_video = (d.tipo_saida == "video" || d.tipo_saida == "stream");
+        if (d.url.empty() && !eh_drive && !eh_wiki && !eh_video && d.lista_urls.empty()) {
             std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
-        if (d.vars.empty() && d.tipo_saida != "arquivo" && !eh_drive && !eh_wiki)
-            std::cerr << "[WARNING] Dataset '" << d.id << "': sem 'vars' - a API decide o que retorna.\n";
+
         out.push_back(std::move(d));
     }
     return out;
@@ -553,7 +618,7 @@ void carregar_config(const std::string& caminho) {
     auto obter_geral = [&](const char* chave) -> bool {
         return ini.obter("geral", chave, v) || ini.obter("general", chave, v);
     };
-    auto le_texto = [&](const char* /*sec*/, const char* chave, std::string& alvo) {
+    auto le_texto = [&](const char* chave, std::string& alvo) {
         if (obter_geral(chave)) alvo = v;
     };
     auto le_int = [&](const char* chave, const char* env, const char* env_legado, int& alvo) {
@@ -567,7 +632,7 @@ void carregar_config(const std::string& caminho) {
         if (env) alvo = env_double(env, alvo);
     };
 
-    le_texto("geral", "db_path", CFG.db_path);
+    le_texto("db_path", CFG.db_path);
     le_int("max_sql_dates_por_lote", "DOWNLOAD_MAX_SQL_DATES", nullptr, CFG.max_sql_dates_por_lote);
     le_int("download_workers", "DOWNLOAD_WORKERS", "OPENMETEO_DOWNLOAD_WORKERS", CFG.download_workers);
     le_int("process_workers", "PROCESS_WORKERS", "OPENMETEO_PROCESS_WORKERS", CFG.process_workers);
@@ -589,21 +654,18 @@ void carregar_config(const std::string& caminho) {
     le_dbl("custo_dias_ref", "CUSTO_DIAS_REF", nullptr, CFG.custo_dias_ref);
     le_dbl("custo_dias_fator", "CUSTO_DIAS_FATOR", nullptr, CFG.custo_dias_fator);
     le_dbl("cooldown_quota", "COOLDOWN_QUOTA", "OPENMETEO_COOLDOWN_QUOTA", CFG.cooldown_quota);
-    le_texto("general", "api_keys", CFG.api_keys);
-    le_texto("general", "api_key_param", CFG.api_key_param);
-    le_texto("general", "fuso_horario", CFG.fuso_horario);
-    le_texto("general", "periodo_inicio", CFG.periodo_inicio);
-    le_texto("general", "periodo_fim", CFG.periodo_fim);
+    le_texto("api_keys", CFG.api_keys);
+    le_texto("api_key_param", CFG.api_key_param);
+    le_texto("fuso_horario", CFG.fuso_horario);
+    le_texto("periodo_inicio", CFG.periodo_inicio);
+    le_texto("periodo_fim", CFG.periodo_fim);
     { // limite global de tamanho (vale p/ todos os datasets que nao definirem o proprio)
         std::string gmax;
-        if (ini.obter("geral", "tamanho_max_bytes", gmax) || ini.obter("general", "tamanho_max_bytes", gmax) ||
-            ini.obter("geral", "tamanho_maximo", gmax) || ini.obter("general", "tamanho_maximo", gmax) ||
-            ini.obter("geral", "tamanho_max", gmax) || ini.obter("general", "tamanho_max", gmax) ||
-            ini.obter("geral", "max_bytes", gmax) || ini.obter("general", "max_bytes", gmax) ||
-            ini.obter("geral", "max_file_size", gmax) || ini.obter("general", "max_file_size", gmax) ||
-            ini.obter("geral", "max_size", gmax) || ini.obter("general", "max_size", gmax)) {
-            CFG.tamanho_max_bytes = parse_tamanho_bytes(gmax, 0);
+        for (const char* chave : {"tamanho_max_bytes", "tamanho_maximo", "tamanho_max",
+                                  "max_bytes", "max_file_size", "max_size"}) {
+            if (ini.obter("geral", chave, gmax) || ini.obter("general", chave, gmax)) break;
         }
+        if (!gmax.empty()) CFG.tamanho_max_bytes = parse_tamanho_bytes(gmax, 0);
         // env tem prioridade se o ini nao definiu (0 = nao definido)
         if (CFG.tamanho_max_bytes <= 0) {
             const char* ev = std::getenv("TAMANHO_MAX_BYTES");
@@ -611,7 +673,6 @@ void carregar_config(const std::string& caminho) {
             if (!ev || !*ev) ev = std::getenv("MAX_SIZE");
             if (ev && *ev) CFG.tamanho_max_bytes = parse_tamanho_bytes(ev, 0);
         }
-        if (CFG.tamanho_max_bytes < 0) CFG.tamanho_max_bytes = 0;
     }
 
     auto coord_linhas = ini.lista("coordenadas");
@@ -638,9 +699,7 @@ void carregar_config(const std::string& caminho) {
         if (!eh_secao_dim(secao)) continue;
         DimensaoCfg dim;
         dim.nome = secao.rfind("dim:", 0) == 0 ? secao.substr(4) : secao.substr(5);
-        std::string cols = ini.obter_ou(secao, "colunas");
-        if (cols.empty()) cols = ini.obter_ou(secao, "campos");
-        if (cols.empty()) cols = ini.obter_ou(secao, "keys");
+        std::string cols = primeiro_valor(ini, secao, {"colunas", "campos", "keys"});
         if (!cols.empty()) dim.campos = dividir(cols, ',');
         for (const auto& l : ini.lista(secao)) {
             auto partes = dividir(l, ',');
@@ -682,7 +741,6 @@ void carregar_config(const std::string& caminho) {
     for (auto& d : CFG.datasets) {
         if (d.db.empty()) d.db = CFG.db_path;
         if (d.api_keys.empty()) d.api_keys = CFG.api_keys;
-        if (d.tamanho_max_bytes <= 0) d.tamanho_max_bytes = CFG.tamanho_max_bytes; // herda global
-        if (d.tamanho_max_bytes < 0) d.tamanho_max_bytes = 0;
+        if (d.tamanho_max_bytes < 0) d.tamanho_max_bytes = CFG.tamanho_max_bytes; // herda global
     }
 }

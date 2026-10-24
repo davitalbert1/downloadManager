@@ -61,6 +61,6 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
                                           const std::vector<std::string>& datas,
                                           const Contexto& ctx_base);
 
-int executar_generico(const std::vector<std::string>& datas, double tempo_load,
+int executar_generico(const std::vector<std::string>& datas,
                       const ExistentesGen& existentes_inicial,
                       size_t dataset_idx);

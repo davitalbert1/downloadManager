@@ -1,4 +1,6 @@
 #include "grib_importer.h"
+#include "config.h"
+#include "utils.h"
 #include <gdal.h>
 #include <gdal_priv.h>
 #include <sqlite3.h>
@@ -6,39 +8,13 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <ctime>
 #include <filesystem>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <set>
-#include <sstream>
 #include <thread>
 
 namespace fs = std::filesystem;
-
-// Utilitários internos
-static std::string trim_str(std::string s) {
-    const auto first = s.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return "";
-    const auto last = s.find_last_not_of(" \t\r\n");
-    return s.substr(first, last - first + 1);
-}
-
-static std::string normalizar_nome_coluna(std::string s) {
-    std::string out;
-    for (char c : s) {
-        if (std::isalnum(static_cast<unsigned char>(c))) {
-            out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        } else if (c == '_' || c == '-' || c == ' ') {
-            if (!out.empty() && out.back() != '_') out += '_';
-        }
-    }
-    while (!out.empty() && out.back() == '_') out.pop_back();
-    return out.empty() ? "col" : out;
-}
 
 // Conversao civil pura de segundos Unix (UTC) que suporta timestamps anteriores a 1970
 static void unix_time_para_data_hora(int64_t unix_time, int& ano, int& mes, int& dia, int& hora, int& min, int& seg) {
@@ -53,16 +29,10 @@ static void unix_time_para_data_hora(int64_t unix_time, int& ano, int& mes, int&
     min  = static_cast<int>((seg_no_dia % 3600) / 60);
     seg  = static_cast<int>(seg_no_dia % 60);
 
-    int64_t z = dias + 719468;
-    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    unsigned doe = static_cast<unsigned>(z - era * 146097);
-    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = static_cast<int64_t>(yoe) + era * 400;
-    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    unsigned mp = (5 * doy + 2) / 153;
-    dia = static_cast<int>(doy - (153 * mp + 2) / 5 + 1);
-    mes = static_cast<int>(mp < 10 ? mp + 3 : mp - 9);
-    ano = static_cast<int>(y + (mes <= 2 ? 1 : 0));
+    Data d = civil_de_dias(static_cast<long>(dias));
+    ano = d.ano;
+    mes = d.mes;
+    dia = d.dia;
 }
 
 static std::string formatar_timestamp_data(int64_t unix_time) {
@@ -108,43 +78,24 @@ static std::string mapear_elemento_para_coluna(const std::string& elem, const st
     if (el == "SSRD") return "solar_radiation_downwards";
 
     if (!comment.empty()) {
-        std::string c_norm = normalizar_nome_coluna(comment);
+        std::string c_norm = normalizar_nome(comment);
         if (c_norm == "total_precipitation") return "precipitation";
-        if (!c_norm.empty()) return c_norm;
+        return c_norm;
     }
-    return normalizar_nome_coluna(elem);
+    return normalizar_nome(elem);
 }
 
 std::vector<std::pair<double, double>> carregar_coordenadas_ini(const std::string& ini_path) {
     std::vector<std::pair<double, double>> coords;
-    std::ifstream file(ini_path);
-    if (!file.is_open()) return coords;
-
-    std::string line;
-    bool in_coord_sec = false;
-    while (std::getline(file, line)) {
-        std::string tr = trim_str(line);
-        if (tr.empty()) continue;
-        if (tr[0] == '[' && tr.back() == ']') {
-            std::string sec = trim_str(tr.substr(1, tr.size() - 2));
-            in_coord_sec = (sec == "coordenadas");
-            continue;
-        }
-        if (!in_coord_sec) continue;
-
-        // Limpa comentários iniciados com ';' ou '#'
-        auto pos_comment = tr.find_first_of(";#");
-        if (pos_comment != std::string::npos) tr = trim_str(tr.substr(0, pos_comment));
-        if (tr.empty()) continue;
-
-        auto pos_comma = tr.find(',');
-        if (pos_comma != std::string::npos) {
-            try {
-                double lat = std::stod(trim_str(tr.substr(0, pos_comma)));
-                double lon = std::stod(trim_str(tr.substr(pos_comma + 1)));
-                coords.emplace_back(lat, lon);
-            } catch (...) {}
-        }
+    Ini ini = ler_ini(ini_path);
+    auto linhas = ini.lista("coordenadas");
+    if (linhas.empty()) linhas = ini.lista("coordinates");
+    for (const auto& linha : linhas) {
+        auto partes = dividir(linha, ',');
+        if (partes.size() < 2) continue;
+        try {
+            coords.emplace_back(std::stod(cortar(partes[0])), std::stod(cortar(partes[1])));
+        } catch (...) {}
     }
     return coords;
 }
@@ -154,29 +105,27 @@ bool grib_mes_ja_no_banco(sqlite3* db, const std::string& tabela, int ano, int m
     if (!db || coords.empty()) return false;
 
     // Checa se a tabela existe
-    std::string sql_check = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=\"" + tabela + "\"";
     sqlite3_stmt* stmt_chk = nullptr;
-    if (sqlite3_prepare_v2(db, sql_check.c_str(), -1, &stmt_chk, nullptr) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            -1, &stmt_chk, nullptr) != SQLITE_OK) {
         if (stmt_chk) sqlite3_finalize(stmt_chk);
         return false;
     }
+    sqlite3_bind_text(stmt_chk, 1, tabela.c_str(), -1, SQLITE_TRANSIENT);
     bool existe = (sqlite3_step(stmt_chk) == SQLITE_ROW);
     sqlite3_finalize(stmt_chk);
     if (!existe) return false;
 
-    int dias_no_mes = 31;
-    if (mes == 4 || mes == 6 || mes == 9 || mes == 11) dias_no_mes = 30;
-    else if (mes == 2) {
-        bool bissexto = (ano % 4 == 0 && (ano % 100 != 0 || ano % 400 == 0));
-        dias_no_mes = bissexto ? 29 : 28;
-    }
+    int qtd_dias = dias_no_mes(ano, mes);
+    if (qtd_dias <= 0) return false;
 
     size_t qtd_horarios = horarios.empty() ? 2 : horarios.size();
-    size_t esperado_por_coord = static_cast<size_t>(dias_no_mes) * qtd_horarios;
+    size_t esperado_por_coord = static_cast<size_t>(qtd_dias) * qtd_horarios;
 
     char data_ini[16], data_fim[16];
     std::snprintf(data_ini, sizeof(data_ini), "%04d-%02d-01", ano, mes);
-    std::snprintf(data_fim, sizeof(data_fim), "%04d-%02d-%02d", ano, mes, dias_no_mes);
+    std::snprintf(data_fim, sizeof(data_fim), "%04d-%02d-%02d", ano, mes, qtd_dias);
 
     std::string sql_cnt = "SELECT count(*) FROM \"" + tabela + "\" WHERE latitude = ? AND longitude = ? AND data BETWEEN ? AND ?";
     sqlite3_stmt* stmt_cnt = nullptr;
@@ -628,25 +577,15 @@ size_t importar_pasta_grib(const GribImportConfig& cfg) {
         n_proc = arquivos_grib.size();
     std::cout << "Workers de importacao (process_workers): " << n_proc << "\n"
               << "============================================================\n";
-    std::atomic<size_t> idx{0};
     std::atomic<size_t> ok_at{0};
-    std::vector<std::thread> th;
-    th.reserve(n_proc);
     GDALAllRegister();
-    for (size_t i = 0; i < n_proc; ++i) {
-        th.emplace_back([&] {
-            while (true) {
-                size_t k = idx.fetch_add(1);
-                if (k >= arquivos_grib.size()) break;
-                try {
-                    if (importar_arquivo_grib(arquivos_grib[k].string(), cfg)) ok_at.fetch_add(1);
-                } catch (const std::exception& e) {
-                    std::cerr << "[ERRO] " << arquivos_grib[k].string() << ": " << e.what() << "\n";
-                }
-            }
-        });
-    }
-    for (auto& t : th) t.join();
+    executar_paralelo((int)n_proc, arquivos_grib.size(), [&](size_t k) {
+        try {
+            if (importar_arquivo_grib(arquivos_grib[k].string(), cfg)) ok_at.fetch_add(1);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERRO] " << arquivos_grib[k].string() << ": " << e.what() << "\n";
+        }
+    });
     processados = ok_at.load();
 
     std::cout << "\n[FINALIZADO] " << processados << " de " << arquivos_grib.size()

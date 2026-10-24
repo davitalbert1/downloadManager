@@ -50,7 +50,7 @@ struct DatasetCfg {
     std::string api_key_header = "Authorization";
     std::string api_key_prefix = "Bearer";
     std::string api_key_param; // nome do parâmetro na query (vazio = [geral])
-    std::string api_key_env;   // variável de ambiente da chave (vazio = API_KEY)
+    std::string api_key_env; // variável de ambiente da chave (vazio = API_KEY)
 
     // Campos para salvamento em arquivos (APIs de arquivos/jobs assíncronos)
     std::string tipo_saida = "db"; // "db" (sqlite) ou "arquivo" (pasta)
@@ -65,21 +65,21 @@ struct DatasetCfg {
     // Fluxo genérico de jobs assíncronos: o POST inicial devolve um id e o
     // resultado é consultado depois. Templates aceitam {base}, {dataset_api}
     // e {job_id}; caminhos relativos são prefixados com a URL base.
-    std::string job_executar;      // POST que cria o job (vazio = a própria url)
-    std::string job_status;        // consulta do estado do job
-    std::string job_resultado;     // consulta do resultado do job
+    std::string job_executar; // POST que cria o job (vazio = a própria url)
+    std::string job_status; // consulta do estado do job
+    std::string job_resultado; // consulta do resultado do job
     std::string job_listar_ativos; // lista jobs em andamento (opcional)
-    std::string job_listar_ok;     // lista jobs concluídos (opcional)
+    std::string job_listar_ok; // lista jobs concluídos (opcional)
     std::string job_lista_campo = "jobs"; // campo raiz com o array de jobs
     std::string job_campo_dataset; // campo do job com o nome do dataset
-    std::string job_campo_id;      // campo com o id do job (vazio = detecta)
+    std::string job_campo_id; // campo com o id do job (vazio = detecta)
     std::string job_campo_status = "status"; // campo com o estado do job
-    std::string job_campo_asset;   // caminho (ex: metadata.results) do objeto com a URL
-    std::vector<std::string> job_status_ok;   // vazio = lista padrão
+    std::string job_campo_asset; // caminho (ex: metadata.results) do objeto com a URL
+    std::vector<std::string> job_status_ok; // vazio = lista padrão
     std::vector<std::string> job_status_erro; // vazio = lista padrão
     std::vector<std::string> job_reenviar_se; // trechos de erro que pedem nova tentativa
     double job_poll_intervalo = 10.0; // segundos entre consultas de status
-    bool job_sequencial = false;      // mantém 1 worker (filas com limite)
+    bool job_sequencial = false; // mantém 1 worker (filas com limite)
     bool job_cancelar_duplicados = true; // cancela jobs antigos do mesmo dataset
     std::vector<std::string> horarios;
     int ano_inicial = 1940;
@@ -96,7 +96,7 @@ struct DatasetCfg {
     std::string padrao_extracao; // Regex para extrair URLs em páginas HTML/texto (ou "html_imgs", "html_links", "m3u")
     bool usar_yt_dlp = false; // Se true e for stream/video suportado, usa yt-dlp como fallback
     int tamanho_min_bytes = 0; // Se > 0, descarta arquivos menores que isso (evita imagens corrompidas/placeholders)
-    long long tamanho_max_bytes = 0; // Se > 0, PULA arquivos maiores que isso (antes e durante o download). 0 = sem limite.
+    long long tamanho_max_bytes = -1; // -1 = herda do [geral]; 0 = sem limite; >0 = pula maiores.
 
     // Suporte ao Google Drive
     std::string drive_folder_id;
@@ -110,13 +110,13 @@ struct DatasetCfg {
 
     // Wikipedia/Wikimedia dumps (.xml.bz2 -> SQLite, espelha F:\wikipedia)
     // tipo_saida = wikipedia
-    std::string projeto;      // ex: enwiki (vazio = deduz do nome do arquivo)
-    std::string data_dump;    // ex: 2026-07-01 (vazio = deduz do nome/URL)
-    bool apenas_ns0 = true;       // so namespace 0 (artigos)
+    std::string projeto; // ex: enwiki (vazio = deduz do nome do arquivo)
+    std::string data_dump; // ex: 2026-07-01 (vazio = deduz do nome/URL)
+    bool apenas_ns0 = true; // so namespace 0 (artigos)
     bool ignorar_redirect = true; // pula #REDIRECT/#REDIRECIONAMENTO
-    int tamanho_minimo = 20;      // descarta texto limpo menor que isso
-    int wiki_batch = 2000;        // paginas por COMMIT
-    bool listar_remoto = true;    // lista o diretorio remoto; 0 = so pasta local
+    int tamanho_minimo = 20; // descarta texto limpo menor que isso
+    int wiki_batch = 2000; // paginas por COMMIT
+    bool listar_remoto = true; // lista o diretorio remoto; 0 = so pasta local
 };
 
 struct DimensaoCfg {
@@ -180,7 +180,11 @@ std::string obter_env_ou_config(const char* nome_env, const std::string& valor_c
 Ini ler_ini(const std::string& caminho);
 void carregar_config(const std::string& caminho);
 
-std::vector<Contexto> contextos_do_eixo(const std::string& eixo);
-std::vector<Contexto> expandir_contextos(const DatasetCfg& ds);
+// Contextos de download do dataset: coordenadas (com fallback 0,0) ou eixos [dim:*].
+std::vector<Contexto> contextos_de_download(const DatasetCfg& ds);
+// Chave estável do contexto usada em existentes/chave_existentes.
+std::string chave_contexto(const Contexto& ctx);
+// true para datasets baixados pelo engine generico (SQLite).
+bool dataset_generico(const DatasetCfg& ds);
 std::string resolver_data_limite(const std::string& v, const std::string& padrao);
 bool data_no_intervalo(const std::string& d, const DatasetCfg& ds);

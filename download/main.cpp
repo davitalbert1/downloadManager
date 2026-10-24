@@ -5,16 +5,32 @@
 #include "rate_limit.h"
 #include "storage_sqlite.h"
 #include "utils.h"
+#include "video_downloader.h"
 #include "wikipedia_importer.h"
 #include <curl/curl.h>
 #include <algorithm>
-#include <chrono>
 #include <iostream>
 #include <vector>
+
+namespace {
+    struct CurlGlobal {
+        CurlGlobal() {
+            curl_global_init(CURL_GLOBAL_DEFAULT);
+        }
+        ~CurlGlobal() {
+            curl_global_cleanup();
+        }
+    };
+}
 
 int main(int argc, char** argv) {
     std::string caminho_ini = "download.ini";
     std::vector<std::string> filtros_secao;
+    std::vector<std::string> urls_diretas;
+    std::string pasta_saida_cli;
+    std::string nome_arquivo_cli;
+    std::string qualidade_cli;
+    int max_workers_cli = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -24,8 +40,28 @@ int main(int argc, char** argv) {
         });
 
         if (arg == "-h" || arg == "--help") {
-            std::cout << "Uso: download.exe [caminho_config.ini] [-d dataset_id] [dataset1,dataset2]\n";
+            std::cout << "Uso:\n"
+                      << "  download.exe <url_ou_link_video> [-o pasta_saida] [-n nome_arquivo] [-q qualidade]\n"
+                      << "  download.exe [caminho_config.ini] [-d dataset_id] [dataset1,dataset2]\n"
+                      << "\nExemplos de Download de Video:\n"
+                      << "  download.exe https://www.enma.lol/watch/k-on-5680?ep=1\n"
+                      << "  download.exe https://www.enma.lol/watch/k-on-5680?ep=1 -o videos/k_on\n"
+                      << "  download.exe https://example.com/stream.m3u8 -o videos -n meu_video\n"
+                      << "\nExemplos de Datasets e APIs:\n"
+                      << "  download.exe download.ini -d clima_diario\n";
             return 0;
+        } else if (arg == "-u" || arg == "--url") {
+            if (i + 1 < argc) urls_diretas.push_back(argv[++i]);
+        } else if (arg == "-o" || arg == "--pasta" || arg == "--output" || arg == "--out") {
+            if (i + 1 < argc) pasta_saida_cli = argv[++i];
+        } else if (arg == "-n" || arg == "--nome" || arg == "--name") {
+            if (i + 1 < argc) nome_arquivo_cli = argv[++i];
+        } else if (arg == "-q" || arg == "--qualidade" || arg == "--quality") {
+            if (i + 1 < argc) qualidade_cli = argv[++i];
+        } else if (arg == "-w" || arg == "--workers") {
+            if (i + 1 < argc) max_workers_cli = std::atoi(argv[++i]);
+        } else if (arg.rfind("http://", 0) == 0 || arg.rfind("https://", 0) == 0) {
+            urls_diretas.push_back(arg);
         } else if (arg.size() >= 4 && arg_lower.rfind(".ini") == arg.size() - 4) {
             caminho_ini = arg;
         } else if (arg == "-d" || arg == "--dataset" || arg == "-s" || arg == "--secao") {
@@ -33,7 +69,7 @@ int main(int argc, char** argv) {
                 filtros_secao.push_back(argv[++i]);
             }
         } else {
-            if (arg.front() == '-') continue;
+            if (arg.empty() || arg.front() == '-') continue;
             for (const auto& parte : dividir(arg, ',')) {
                 if (!parte.empty()) filtros_secao.push_back(parte);
             }
@@ -41,6 +77,25 @@ int main(int argc, char** argv) {
     }
 
     carregar_env(".env");
+
+    // Se foram informadas URLs diretas via linha de comando (ex: links do enma.lol, streams ou vídeos diretos)
+    if (!urls_diretas.empty()) {
+        CurlGlobal curl_guard;
+        iniciar_rate_limit();
+        int sucesso_count = 0;
+        for (const auto& u : urls_diretas) {
+            OpcoesVideo op;
+            op.url = u;
+            if (!pasta_saida_cli.empty()) op.pasta_saida = pasta_saida_cli;
+            if (!nome_arquivo_cli.empty()) op.nome_arquivo = nome_arquivo_cli;
+            if (!qualidade_cli.empty()) op.qualidade = qualidade_cli;
+            if (max_workers_cli > 0) op.max_workers = max_workers_cli;
+            if (baixar_video(op)) {
+                ++sucesso_count;
+            }
+        }
+        return (sucesso_count > 0) ? 0 : 1;
+    }
     carregar_config(caminho_ini);
 
     if (!filtros_secao.empty()) {
@@ -65,33 +120,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CurlGlobal curl_guard;
     iniciar_rate_limit();
 
     try {
         // Executa rigorosamente na ordem declarada em download.ini (de cima para baixo)
         bool tem_db = false;
-        for (const auto& ds : CFG.datasets) {
-            if (ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" &&
-                ds.tipo_saida != "wikipedia" && ds.tipo_saida != "wiki" && ds.drive_folder_id.empty()) {
-                tem_db = true;
-                break;
-            }
-        }
-
-        // Se não houver dataset com data (apenas records/APIs sem datas), usa lista com 1 dummy
         bool tem_datas = false;
         for (const auto& ds : CFG.datasets) {
-            if (ds.iterar_datas && ds.tipo_saida != "arquivo" && ds.tipo_saida != "drive" && ds.tipo_saida != "google_drive" &&
-                ds.tipo_saida != "wikipedia" && ds.tipo_saida != "wiki" && ds.drive_folder_id.empty()) {
-                tem_datas = true;
-                break;
-            }
+            if (!dataset_generico(ds)) continue;
+            tem_db = true;
+            if (ds.iterar_datas) tem_datas = true;
         }
 
         std::vector<std::string> datas;
         ExistentesGen existentes;
-        double tload = 0.0;
 
         if (tem_db) {
             criar_tabelas_datasets();
@@ -108,14 +151,9 @@ int main(int argc, char** argv) {
                               << " | process_workers: " << CFG.process_workers << "\n";
 
                     std::cout << "\n[DB] Carregando registros existentes...\n";
-                    auto t0 = std::chrono::steady_clock::now();
                     existentes = carregar_existentes_generico(datas);
-                    tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
-                        if (CFG.datasets[di].tipo_saida == "arquivo" ||
-                            CFG.datasets[di].tipo_saida == "drive" ||
-                            CFG.datasets[di].tipo_saida == "google_drive" ||
-                            !CFG.datasets[di].drive_folder_id.empty()) continue;
+                        if (!dataset_generico(CFG.datasets[di])) continue;
                         long long tot = 0;
                         auto it = existentes.find(di);
                         if (it != existentes.end())
@@ -128,27 +166,25 @@ int main(int argc, char** argv) {
             }
         }
 
+        int codigo_saida = 0;
         for (size_t di = 0; di < CFG.datasets.size(); ++di) {
             const auto& ds = CFG.datasets[di];
             if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) {
                 executar_dataset_google_drive(ds);
             } else if (ds.tipo_saida == "wikipedia" || ds.tipo_saida == "wiki") {
                 executar_dataset_wikipedia(ds);
+            } else if (ds.tipo_saida == "video" || ds.tipo_saida == "stream" ||
+                       eh_midia_direta(ds.url) || ds.url.find("enma.lol/watch") != std::string::npos) {
+                executar_dataset_video(ds);
             } else if (ds.tipo_saida == "arquivo") {
                 executar_dataset_arquivo(ds);
             } else {
-                executar_generico(datas, tload, existentes, di);
+                if (executar_generico(datas, existentes, di) != 0) codigo_saida = 1;
             }
         }
-
-        curl_global_cleanup();
-        return 0;
+        return codigo_saida;
     } catch (const std::exception& e) {
         std::cerr << "\n[ERRO] " << e.what() << "\n";
-        curl_global_cleanup();
         return 1;
     }
-
-    curl_global_cleanup();
-    return 0;
 }

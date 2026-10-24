@@ -1,5 +1,6 @@
 #include "utils.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -298,6 +300,55 @@ long long parse_tamanho_bytes(const std::string& s, long long padrao) {
     return (long long)bytes;
 }
 
+std::mt19937& rng_thread_local() {
+    static thread_local std::mt19937 gen{
+        static_cast<std::mt19937::result_type>(std::random_device{}() ^
+                                               std::hash<std::thread::id>{}(
+                                                   std::this_thread::get_id()))};
+    return gen;
+}
+
+std::string formatar_duracao(double segundos) {
+    if (!(segundos >= 0.0) || segundos > 99 * 3600.0) return "--:--:--";
+    long long s = static_cast<long long>(segundos);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld", s / 3600, (s / 60) % 60, s % 60);
+    return buf;
+}
+
+int dias_no_mes(int ano, int mes) {
+    static const int dias[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (mes < 1 || mes > 12) return 0;
+    if (mes == 2 && ((ano % 4 == 0 && ano % 100 != 0) || ano % 400 == 0)) return 29;
+    return dias[mes - 1];
+}
+
+void executar_paralelo(int n_workers, size_t total, const std::function<void(size_t)>& fn) {
+    if (total == 0) return;
+    size_t n = static_cast<size_t>(std::max(1, n_workers));
+    n = std::min(n, total);
+    std::atomic<size_t> proximo{0};
+    auto worker = [&]() {
+        for (;;) {
+            size_t i = proximo.fetch_add(1);
+            if (i >= total) break;
+            try {
+                fn(i);
+            } catch (const std::exception& e) {
+                log(std::string("[ERROR] worker falhou: ") + e.what());
+            }
+        }
+    };
+    if (n <= 1) {
+        worker();
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (size_t i = 0; i < n; ++i) threads.emplace_back(worker);
+    for (auto& t : threads) t.join();
+}
+
 std::string formatar_bytes(long long b) {
     if (b <= 0) return "0 B";
     const char* un[] = {"B", "KB", "MB", "GB", "TB"};
@@ -512,7 +563,7 @@ std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, c
 
     if (m == "html_imgs" || m == "imgs" || m == "imagens") {
         // 1. Extração de tags <img ... src="...">
-        std::regex img_regex(R"(<img[^>]+src=["']([^"']+)["'])", std::regex::icase);
+        static const std::regex img_regex(R"(<img[^>]+src=["']([^"']+)["'])", std::regex::icase);
         auto b = std::sregex_iterator(conteudo.begin(), conteudo.end(), img_regex);
         auto e = std::sregex_iterator();
         for (auto it = b; it != e; ++it) {
@@ -522,7 +573,7 @@ std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, c
         }
 
         // 2. Extração de srcset
-        std::regex srcset_regex(R"(srcset=["']([^"']+)["'])", std::regex::icase);
+        static const std::regex srcset_regex(R"(srcset=["']([^"']+)["'])", std::regex::icase);
         b = std::sregex_iterator(conteudo.begin(), conteudo.end(), srcset_regex);
         for (auto it = b; it != e; ++it) {
             std::string ss = (*it)[1].str();
@@ -538,7 +589,7 @@ std::vector<std::string> extrair_urls_de_conteudo(const std::string& conteudo, c
     }
 
     if (m == "html_links" || m == "links" || m == "hrefs") {
-        std::regex link_regex(R"(<a[^>]+href=["']([^"']+)["'])", std::regex::icase);
+        static const std::regex link_regex(R"(<a[^>]+href=["']([^"']+)["'])", std::regex::icase);
         auto b = std::sregex_iterator(conteudo.begin(), conteudo.end(), link_regex);
         auto e = std::sregex_iterator();
         for (auto it = b; it != e; ++it) {
