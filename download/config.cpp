@@ -566,6 +566,11 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.chave_tempo = cortar(ini.obter_ou(secao, "chave_tempo", "time"));
         if (d.chave_tempo.empty()) d.chave_tempo = "time";
         d.chave_unica = primeiro_valor(ini, secao, {"chave_unica", "unique_key"});
+        d.fallback = cortar(ini.obter_ou(secao, "fallback"));
+        d.so_fallback = para_bool(ini.obter_ou(secao, "so_fallback", "0"), false);
+        d.expandir_horas = para_bool(ini.obter_ou(secao, "expandir_horas", "0"), false);
+        d.campo_horas = cortar(ini.obter_ou(secao, "campo_horas", "hours"));
+        if (d.campo_horas.empty()) d.campo_horas = "hours";
         d.api_key_em = minusculas(cortar(ini.obter_ou(secao, "api_key_em", "query")));
         d.api_key_header = cortar(ini.obter_ou(secao, "api_key_header", "Authorization"));
         d.api_key_prefix = cortar(ini.obter_ou(secao, "api_key_prefix", "Bearer"));
@@ -755,7 +760,8 @@ void carregar_config(const std::string& caminho) {
                   << " (" << CFG.tamanho_max_bytes << " bytes)\n";
     for (auto& d : CFG.datasets) {
         if (d.db.empty()) d.db = CFG.db_path;
-        if (d.api_keys.empty()) d.api_keys = CFG.api_keys;
+        // Dataset de fallback usa outro provedor; nao herda a chave do [geral].
+        if (!d.so_fallback && d.api_keys.empty()) d.api_keys = CFG.api_keys;
         if (d.tamanho_max_bytes < 0) d.tamanho_max_bytes = CFG.tamanho_max_bytes; // herda global
     }
 }

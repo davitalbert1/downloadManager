@@ -25,21 +25,41 @@ static std::string url_do_dataset(const DatasetCfg& ds, const std::string& data)
     return ds.url;
 }
 
-static std::string escolher_url(const std::string& lista) {
-    auto cands = dividir(lista, '|');
-    cands.erase(std::remove_if(cands.begin(), cands.end(), [](const std::string& s) {
-        return s.empty();
-    }), cands.end());
-    if (cands.empty()) return lista;
-    if (cands.size() == 1) return cands.front();
-    static std::atomic<unsigned> g_rr_url{0};
-    unsigned base = g_rr_url.fetch_add(1);
-    return cands[base % cands.size()];
+static std::vector<std::string> urls_candidatas(const std::string& lista, const Contexto& ctx) {
+    std::vector<std::string> out;
+    for (auto& parte : dividir(lista, '|')) {
+        std::string u = cortar(aplicar_ctx(parte, ctx));
+        if (u.empty()) continue;
+        if (std::find(out.begin(), out.end(), u) == out.end()) out.push_back(u);
+    }
+    if (out.empty()) {
+        std::string u = cortar(aplicar_ctx(lista, ctx));
+        if (!u.empty()) out.push_back(u);
+    }
+    return out;
+}
+
+static std::vector<std::string> chaves_candidatas(const std::string& lista) {
+    std::vector<std::string> out;
+    for (auto& parte : dividir(lista, '|')) {
+        std::string k = cortar(parte);
+        if (k.empty()) continue;
+        if (std::find(out.begin(), out.end(), k) == out.end()) out.push_back(k);
+    }
+    return out;
+}
+
+static const DatasetCfg* dataset_por_id(const std::string& id) {
+    if (id.empty()) return nullptr;
+    for (const auto& d : CFG.datasets)
+        if (d.id == id) return &d;
+    return nullptr;
 }
 
 std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
                                           const std::vector<std::string>& datas,
-                                          const Contexto& ctx_base) {
+                                          const Contexto& ctx_base,
+                                          int profundidade) {
     std::vector<std::string> alvo;
     for (const auto& d : datas) {
         if (data_no_intervalo(d, ds)) alvo.push_back(d);
@@ -92,17 +112,7 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
             custo = std::max(custo, static_cast<double>(grupo.size()) * CFG.custo_dias_fator / CFG.custo_dias_ref);
         }
 
-        std::string chave_api;
-        if (!ds.api_keys.empty()) {
-            auto chaves = dividir(ds.api_keys, '|');
-            chaves.erase(std::remove_if(chaves.begin(), chaves.end(), [](const std::string& s) {
-                return s.empty();
-            }), chaves.end());
-            if (!chaves.empty()) {
-                static std::atomic<unsigned> g_rr_chave{0};
-                chave_api = chaves[g_rr_chave.fetch_add(1) % chaves.size()];
-            }
-        }
+        std::vector<std::string> chaves = chaves_candidatas(ds.api_keys);
 
         Contexto ctx = ctx_base;
         ctx["start"] = grupo.empty() ? hoje() : grupo.front();
@@ -112,7 +122,7 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         ctx["hoje"] = hoje();
         ctx["timezone"] = CFG.fuso_horario;
         ctx["vars"] = juntar(vars, ",");
-        ctx["api_key"] = chave_api;
+        ctx["api_key"] = chaves.empty() ? std::string() : chaves.front();
         ctx["id"] = ds.id;
         ctx["tabela"] = ds.tabela;
 
@@ -139,10 +149,40 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         for (const auto& kv : ds.headers)
             hdrs[kv.first] = aplicar_ctx(kv.second, ctx);
 
-        std::string url_req = aplicar_ctx(escolher_url(lista), ctx);
-        std::string corpo = aplicar_ctx(ds.corpo, ctx);
-        auto dados = baixar_com_retry(url_req, params, CFG.max_retries, custo, chave_api,
-                                      ds.metodo, hdrs, corpo, auth);
+        OpcoesRetry req;
+        req.urls = urls_candidatas(lista, ctx);
+        req.chaves = chaves;
+        req.params = params;
+        req.max_tentativas = CFG.max_retries;
+        req.custo = custo;
+        req.metodo = ds.metodo;
+        req.headers = hdrs;
+        req.corpo = aplicar_ctx(ds.corpo, ctx);
+        req.auth = auth;
+        // Com fallback configurado, nao vale a pena esperar horas pelo reset
+        // da cota: falha cedo e deixa o provedor alternativo assumir. O
+        // proprio fallback tambem nao espera horas (cota pequena): se ele
+        // limitar, o bloco e apenas pulado.
+        req.permitir_espera_longa = ds.fallback.empty() && !ds.so_fallback;
+        bool esgotou_429 = false;
+        req.esgotou_429 = &esgotou_429;
+        auto dados = baixar_com_retry(req);
+
+        if (!dados && esgotou_429 && !ds.fallback.empty() && profundidade < 2 &&
+            ds.iterar_datas && !grupo.empty()) {
+            const DatasetCfg* fb = dataset_por_id(ds.fallback);
+            if (fb && fb != &ds) {
+                log("[FALLBACK] " + ds.id + " -> " + fb->id + " para " +
+                    grupo.front() + ".." + grupo.back() + " (429/cota)");
+                Contexto ctx_fb = ctx_base;
+                ctx_fb["fonte"] = fb->id;
+                auto regs_fb = baixar_dataset_bloco(*fb, grupo, ctx_fb, profundidade + 1);
+                todos.insert(todos.end(), std::make_move_iterator(regs_fb.begin()),
+                             std::make_move_iterator(regs_fb.end()));
+            } else {
+                log("[FALLBACK] Dataset nao encontrado: " + ds.fallback);
+            }
+        }
         if (dados) {
             std::set<std::string> filtro(grupo.begin(), grupo.end());
             const std::set<std::string>* pf = ds.iterar_datas ? &filtro : nullptr;
@@ -160,8 +200,15 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
                     if (!std::holds_alternative<std::string>(it_url->second)) return;
                     std::string sub_url = std::get<std::string>(it_url->second);
                     if (sub_url.rfind("http", 0) != 0) return;
-                    auto sub_dados = baixar_com_retry(sub_url, {}, CFG.max_retries, 0.5, chave_api,
-                                                      "GET", hdrs, "", auth);
+                    OpcoesRetry sub_req;
+                    sub_req.urls = {sub_url};
+                    sub_req.chaves = chaves;
+                    sub_req.max_tentativas = CFG.max_retries;
+                    sub_req.custo = 0.5;
+                    sub_req.metodo = "GET";
+                    sub_req.headers = hdrs;
+                    sub_req.auth = auth;
+                    auto sub_dados = baixar_com_retry(sub_req);
                     if (!sub_dados || !sub_dados->is_object()) return;
                     auto sub_regs = parse_objeto(*sub_dados, *sub_dados, ds, ctx);
                     if (!sub_regs.empty()) {
@@ -347,7 +394,7 @@ int executar_generico(const std::vector<std::string>& datas,
 
     for (size_t di = di_inicio; di < di_fim; ++di) {
         const DatasetCfg& ds = CFG.datasets[di];
-        if (!dataset_generico(ds)) continue;
+        if (!dataset_generico(ds) || ds.so_fallback) continue;
 
         // Datasets sem data (ex: PokeAPI records): 1 tarefa por contexto.
         // Sem isso, 1940-2025 vira 31412 dias x 1 coord = 1048 blocos
@@ -460,7 +507,7 @@ int executar_generico(const std::vector<std::string>& datas,
     log("Blocos processados: " + std::to_string(concluidos.load()) + "/" +
         std::to_string(total) + "\n--- RESUMO ---");
     for (size_t di = di_inicio; di < di_fim; ++di) {
-        if (!dataset_generico(CFG.datasets[di])) continue;
+        if (!dataset_generico(CFG.datasets[di]) || CFG.datasets[di].so_fallback) continue;
         log(CFG.datasets[di].id + " (" + CFG.datasets[di].db + "." +
             CFG.datasets[di].tabela + "): " + std::to_string(baixados[di]) +
             " registros novos | " + std::to_string(pulados[di]) + " ja existentes");

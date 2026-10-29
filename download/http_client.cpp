@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -142,13 +144,36 @@ size_t ler_header(char* buffer, size_t tam, size_t n, void* ud) {
         r->content_length = -1;
         r->content_type.clear();
         r->retry_after = -1.0;
+        r->rate_limit_reset = -1.0;
         return total;
     }
 
     std::string baixo = minusculas(linha);
+    auto valor_header = [&](size_t inicio) {
+        return cortar(linha.substr(inicio));
+    };
     if (baixo.rfind("retry-after:", 0) == 0) {
+        std::string v = valor_header(12);
+        double seg = -1.0;
         try {
-            r->retry_after = std::stod(cortar(linha.substr(12)));
+            seg = std::stod(v);
+        } catch (...) {
+            // Retry-After tambem aceita data HTTP (RFC 7231).
+            time_t alvo = curl_getdate(v.c_str(), nullptr);
+            if (alvo != -1) seg = std::difftime(alvo, std::time(nullptr));
+        }
+        if (seg >= 0.0) r->retry_after = seg;
+    } else if (baixo.rfind("x-ratelimit-reset:", 0) == 0 ||
+               baixo.rfind("x-rate-limit-reset:", 0) == 0 ||
+               baixo.rfind("ratelimit-reset:", 0) == 0) {
+        size_t inicio = baixo.rfind("x-ratelimit-reset:", 0) == 0   ? 18
+                        : baixo.rfind("x-rate-limit-reset:", 0) == 0 ? 19
+                                                                     : 16;
+        try {
+            double v = std::stod(valor_header(inicio));
+            // Alguns servidores devolvem epoch; outros, segundos restantes.
+            if (v > 1.0e9) v -= static_cast<double>(std::time(nullptr));
+            if (v >= 0.0) r->rate_limit_reset = v;
         } catch (...) {}
     } else if (baixo.rfind("location:", 0) == 0) {
         r->location = cortar(linha.substr(9));
@@ -593,51 +618,238 @@ ResultadoDownload http_baixar_arquivo(const OpcoesDownload& op) {
     return concluir();
 }
 
-std::optional<json> baixar_com_retry(const std::string& url,
-                                     const std::map<std::string, std::string>& params,
-                                     int max_tentativas, double custo,
-                                     const std::string& chave_api,
-                                     const std::string& metodo,
-                                     const std::map<std::string, std::string>& headers,
-                                     const std::string& corpo,
-                                     const AuthApi& auth) {
-    OpcoesHttp op;
-    op.metodo = metodo;
-    op.headers = headers;
-    op.corpo = corpo;
+namespace {
 
-    AuthApi auth_efetiva = auth;
-    if (auth_efetiva.modo.empty()) auth_efetiva.modo = "auto";
-    std::map<std::string, std::string> params_req = params;
-    std::string modo = minusculas(auth_efetiva.modo);
-    if (!chave_api.empty() && modo != "none") {
-        if (modo == "query") params_req.erase(auth_efetiva.param);
-        op.auth = &auth_efetiva;
-        op.chave_api = chave_api;
+std::string host_de_url(const std::string& url) {
+    size_t pos = url.find("://");
+    size_t ini = pos == std::string::npos ? 0 : pos + 3;
+    size_t fim = url.find('/', ini);
+    return url.substr(ini, fim == std::string::npos ? std::string::npos : fim - ini);
+}
+
+std::vector<std::string> normalizar_candidatos(const std::vector<std::string>& entrada) {
+    std::vector<std::string> out;
+    for (const auto& item : entrada) {
+        for (auto& parte : dividir(item, '|')) {
+            std::string v = cortar(parte);
+            if (v.empty()) continue;
+            if (std::find(out.begin(), out.end(), v) == out.end()) out.push_back(v);
+        }
     }
-    std::string url_completa = montar_url(url, params_req);
-    std::string grupo = chave_api.empty() ? std::string("anonymous") : chave_api;
+    return out;
+}
+
+std::tm tm_utc(time_t t) {
+    std::tm out{};
+#ifdef _WIN32
+    gmtime_s(&out, &t);
+#else
+    gmtime_r(&t, &out);
+#endif
+    return out;
+}
+
+double segundos_ate_meia_noite_utc() {
+    std::tm g = tm_utc(std::time(nullptr));
+    return static_cast<double>((23 - g.tm_hour) * 3600 + (59 - g.tm_min) * 60 +
+                               (60 - g.tm_sec));
+}
+
+static int dias_no_mes(int ano, int mes) {
+    static const int dias[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    bool bis = (ano % 4 == 0 && ano % 100 != 0) || (ano % 400 == 0);
+    return dias[(mes >= 1 && mes <= 12 ? mes : 1) - 1] + (mes == 2 && bis ? 1 : 0);
+}
+
+// Cota mensal nao se resolve esperando minutos: manter o host em cooldown
+// ate a virada do mes evita que cada bloco durma 15 min e tente de novo.
+double segundos_ate_proximo_mes_utc() {
+    std::tm g = tm_utc(std::time(nullptr));
+    int restantes = dias_no_mes(g.tm_year + 1900, g.tm_mon + 1) - g.tm_mday + 1;
+    return restantes * 86400.0 - (g.tm_hour * 3600 + g.tm_min * 60 + g.tm_sec) + 5.0;
+}
+
+enum class TipoCota { Nenhuma, Minuto, Hora, Dia, Mes };
+
+TipoCota classificar_cota(const std::string& corpo) {
+    std::string b = minusculas(corpo.substr(0, 2000));
+    if (b.find("monthly") != std::string::npos || b.find("per month") != std::string::npos ||
+        b.find("month") != std::string::npos)
+        return TipoCota::Mes;
+    if (b.find("daily") != std::string::npos || b.find("per day") != std::string::npos ||
+        b.find("day") != std::string::npos)
+        return TipoCota::Dia;
+    if (b.find("hourly") != std::string::npos || b.find("per hour") != std::string::npos ||
+        b.find("hour") != std::string::npos)
+        return TipoCota::Hora;
+    if (b.find("minutely") != std::string::npos || b.find("per minute") != std::string::npos ||
+        b.find("minute") != std::string::npos)
+        return TipoCota::Minuto;
+    return TipoCota::Nenhuma;
+}
+
+// Espera ideal para um 429: prioriza Retry-After/X-RateLimit-Reset e, na
+// ausencia deles, usa o reset real da cota (minuto/hora/dia UTC).
+double espera_para_429(const RespostaHttp& r, int tentativa, std::string& motivo) {
+    if (r.retry_after > 0.0) {
+        motivo = "Retry-After";
+        return r.retry_after;
+    }
+    if (r.rate_limit_reset > 0.0) {
+        motivo = "rate-limit-reset";
+        return r.rate_limit_reset;
+    }
+    time_t agora = std::time(nullptr);
+    switch (classificar_cota(r.corpo)) {
+        case TipoCota::Minuto:
+            motivo = "cota por minuto";
+            return static_cast<double>(60 - (static_cast<long long>(agora) % 60)) + 2.0;
+        case TipoCota::Hora:
+            motivo = "cota por hora";
+            return static_cast<double>(3600 - (static_cast<long long>(agora) % 3600)) + 5.0;
+        case TipoCota::Dia:
+            motivo = "cota diaria";
+            return segundos_ate_meia_noite_utc() + 5.0;
+        case TipoCota::Mes:
+            motivo = "cota mensal";
+            return segundos_ate_proximo_mes_utc();
+        default:
+            motivo = "HTTP 429";
+            return std::max(CFG.espera_min_429, backoff_exponencial(tentativa));
+    }
+}
+
+} // namespace
+
+std::optional<json> baixar_com_retry(const OpcoesRetry& op) {
+    std::vector<std::string> urls = normalizar_candidatos(op.urls);
+    std::vector<std::string> chaves = normalizar_candidatos(op.chaves);
+    if (urls.empty()) urls.push_back("");
+    if (chaves.empty()) chaves.push_back("");
+
+    if (op.esgotou_429) *op.esgotou_429 = false;
+
+    AuthApi auth_efetiva = op.auth;
+    if (auth_efetiva.modo.empty()) auth_efetiva.modo = "auto";
+    bool tem_chave = false;
+    for (const auto& c : chaves) tem_chave = tem_chave || !c.empty();
+    std::map<std::string, std::string> params_req = op.params;
+    if (tem_chave && minusculas(auth_efetiva.modo) == "query")
+        params_req.erase(auth_efetiva.param);
+
+    const int max_tentativas = std::max(1, op.max_tentativas);
+    static std::atomic<unsigned> g_rr{0};
+    size_t prox_url = g_rr.fetch_add(1) % urls.size();
+    size_t prox_chave = g_rr.fetch_add(1) % chaves.size();
+    bool houve_429 = false;
+    bool ultimo_429 = false;
+    bool cota_mensal = false;
+    int esperas = 0;
 
     for (int tentativa = 1; tentativa <= max_tentativas; ++tentativa) {
-        esperar_envio(grupo, custo);
+        // Escolhe o primeiro endpoint/chave fora de cooldown; se todos
+        // estiverem pausados, aguarda o menor prazo (ou desiste cedo para
+        // que o engine use um provedor alternativo).
+        size_t sel_url = urls.size();
+        double menor_url = 1.0e18;
+        for (size_t k = 0; k < urls.size(); ++k) {
+            size_t idx = (prox_url + k) % urls.size();
+            double restante = 0.0;
+            if (endpoint_disponivel(urls[idx], &restante)) {
+                sel_url = idx;
+                break;
+            }
+            menor_url = std::min(menor_url, restante);
+        }
+        size_t sel_chave = chaves.size();
+        double menor_chave = 1.0e18;
+        for (size_t k = 0; k < chaves.size(); ++k) {
+            size_t idx = (prox_chave + k) % chaves.size();
+            double restante = 0.0;
+            if (chave_disponivel(chaves[idx], &restante)) {
+                sel_chave = idx;
+                break;
+            }
+            menor_chave = std::min(menor_chave, restante);
+        }
 
-        RespostaHttp r = http_requisicao(url_completa, op);
+        if (sel_url == urls.size() || sel_chave == chaves.size()) {
+            double espera = std::min(sel_url == urls.size() ? menor_url : 1.0e18,
+                                     sel_chave == chaves.size() ? menor_chave : 1.0e18);
+            if (espera >= 1.0e17) espera = CFG.espera_min_429;
+            // Cooldown acima de um dia so acontece em cota mensal; dormir
+            // isso em processo nao resolve, melhor pular o bloco.
+            const double espera_maxima = 90000.0;
+            if (cota_mensal || espera > espera_maxima ||
+                (!op.permitir_espera_longa && espera > CFG.cooldown_quota)) {
+                char buf[240];
+                std::snprintf(buf, sizeof(buf),
+                              "[429] %s (cooldown %.0fs); desistindo do bloco%s",
+                              cota_mensal ? "Cota mensal esgotada" : "Endpoints/chaves em cooldown",
+                              espera, op.permitir_espera_longa ? "" : " para tentar o fallback");
+                log(buf);
+                // Cooling aqui significa 429/cota recente: sinaliza para o
+                // engine acionar o fallback tambem nos blocos seguintes.
+                if (op.esgotou_429) *op.esgotou_429 = true;
+                return std::nullopt;
+            }
+            if (++esperas > 100) {
+                log("[ERROR] Cooldown de 429 nao liberou apos muitas esperas.");
+                if (op.esgotou_429) *op.esgotou_429 = houve_429;
+                return std::nullopt;
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                          "[429] Todos os candidatos em cooldown; aguardando %.0fs...",
+                          espera);
+            log(buf);
+            dormir(espera + 1.0);
+            --tentativa; // esperar pelo reset nao consome tentativa
+            continue;
+        }
+
+        prox_url = (sel_url + 1) % urls.size();
+        prox_chave = (sel_chave + 1) % chaves.size();
+        const std::string& url_base = urls[sel_url];
+        const std::string& chave = chaves[sel_chave];
+        // Sem chave, o orcamento local e por HOST: provedores diferentes
+        // (Open-Meteo, fallback) tem limites distintos e nao podem dividir
+        // a mesma janela, senao o fallback nasce bloqueado.
+        const std::string grupo =
+            chave.empty() ? ("anonymous@" + host_de_url(url_base)) : chave;
+
+        OpcoesHttp req;
+        req.metodo = op.metodo;
+        req.headers = op.headers;
+        req.corpo = op.corpo;
+        if (!chave.empty() && minusculas(auth_efetiva.modo) != "none") {
+            req.auth = &auth_efetiva;
+            req.chave_api = chave;
+        }
+
+        std::string url_completa = montar_url(url_base, params_req);
+        esperar_envio(grupo, op.custo);
+        RespostaHttp r = http_requisicao(url_completa, req);
 
         if (!r.erro_rede && r.status < 400) {
             try {
+                json resultado = json::parse(r.corpo);
                 restaurar_taxa();
-                return json::parse(r.corpo);
+                if (op.esgotou_429) *op.esgotou_429 = false;
+                return resultado;
             } catch (const std::exception& e) {
+                ultimo_429 = false;
                 if (tentativa == max_tentativas) {
                     log("[ERROR] Resposta sem JSON valido apos " +
                         std::to_string(max_tentativas) + " tentativas: " + e.what());
+                    if (op.esgotou_429) *op.esgotou_429 = houve_429;
                     return std::nullopt;
                 }
                 double espera = backoff_exponencial(tentativa);
-                char buf[200];
+                char buf[220];
                 std::snprintf(buf, sizeof(buf),
-                              "[RETRY %d/%d] Resposta sem JSON valido. Aguardando %.1fs...",
-                              tentativa, max_tentativas, espera);
+                              "[RETRY %d/%d] JSON invalido em %s. Aguardando %.1fs...",
+                              tentativa, max_tentativas, host_de_url(url_base).c_str(), espera);
                 log(buf);
                 dormir(espera);
                 continue;
@@ -645,59 +857,75 @@ std::optional<json> baixar_com_retry(const std::string& url,
         }
 
         if (!r.erro_rede && r.status == 429) {
-            std::string corpo_resp = minusculas(r.corpo.substr(0, 1000));
-            bool quota = corpo_resp.find("daily") != std::string::npos ||
-                         corpo_resp.find("per day") != std::string::npos ||
-                         corpo_resp.find("hour") != std::string::npos ||
-                         corpo_resp.find("minute") != std::string::npos ||
-                         corpo_resp.find("month") != std::string::npos;
-            double espera;
-            if (r.retry_after > 0) espera = r.retry_after;
-            else if (quota) espera = CFG.cooldown_quota;
-            else espera = std::max(CFG.espera_min_429, backoff_exponencial(tentativa));
-
-            tratar_429(espera, quota ? "cota da API excedida" : "HTTP 429", url);
-            if (tentativa == max_tentativas) {
-                log("[ERROR] 429 persistente apos " + std::to_string(max_tentativas) +
-                    " tentativas");
-                return std::nullopt;
+            houve_429 = true;
+            ultimo_429 = true;
+            std::string motivo;
+            double espera = espera_para_429(r, tentativa, motivo);
+            // Provedor de emergencia (dataset de fallback) sem reset
+            // informado: o 429 generico costuma ser o limite de uso
+            // gratuito. Pausa o host por cooldown_quota para os blocos
+            // seguintes nao martelarem a API.
+            if (!op.permitir_espera_longa && motivo == "HTTP 429")
+                espera = std::max(espera, CFG.cooldown_quota + 1.0);
+            if (motivo == "cota mensal") cota_mensal = true;
+            // Cota por chave: pausa so a chave, para as outras continuarem
+            // rodando. Sem chave, a cota e do IP -> pausa o host.
+            if (!chave.empty()) tratar_429(espera, motivo, "", chave);
+            else tratar_429(espera, motivo, url_base, "");
+            if (tentativa == max_tentativas || (cota_mensal && chaves.size() == 1)) {
+                log("[ERROR] 429 persistente apos " + std::to_string(tentativa) +
+                    " tentativas em " + host_de_url(url_base) + " (" + motivo + ")");
+                break;
             }
-            char buf[220];
+            char buf[260];
             std::snprintf(buf, sizeof(buf),
-                          "[RETRY %d/%d] HTTP 429%s. Pausa global de %.0fs...",
-                          tentativa, max_tentativas, quota ? " (cota)" : "", espera);
+                          "[429] %s (%s): %.0fs de cooldown; alternando endpoint/chave...",
+                          host_de_url(url_base).c_str(), motivo.c_str(), espera);
             log(buf);
-        } else if (!r.erro_rede) {
-            if (r.status == 400 || r.status == 404) {
+            continue;
+        }
+
+        if (!r.erro_rede) {
+            if (r.status == 400 || r.status == 401 || r.status == 403 || r.status == 404) {
                 std::string motivo = r.corpo.substr(0, 300);
                 log("[ERROR] HTTP " + std::to_string(r.status) +
                     " (sem retry): " + motivo + " :: " + url_completa);
+                if (op.esgotou_429) *op.esgotou_429 = false;
                 return std::nullopt;
             }
+            ultimo_429 = false;
             if (tentativa == max_tentativas) {
                 log("[ERROR] Falha apos " + std::to_string(max_tentativas) +
-                    " tentativas: HTTP " + std::to_string(r.status));
+                    " tentativas: HTTP " + std::to_string(r.status) + " em " +
+                    host_de_url(url_base));
+                if (op.esgotou_429) *op.esgotou_429 = houve_429;
                 return std::nullopt;
             }
             double espera = backoff_exponencial(tentativa);
-            char buf[200];
-            std::snprintf(buf, sizeof(buf), "[RETRY %d/%d] HTTP %ld. Aguardando %.1fs...",
-                          tentativa, max_tentativas, r.status, espera);
+            char buf[220];
+            std::snprintf(buf, sizeof(buf),
+                          "[RETRY %d/%d] HTTP %ld em %s. Aguardando %.1fs...",
+                          tentativa, max_tentativas, r.status, host_de_url(url_base).c_str(),
+                          espera);
             log(buf);
             dormir(espera);
         } else {
+            ultimo_429 = false;
             if (tentativa == max_tentativas) {
                 log("[ERROR] Falha de rede apos " + std::to_string(max_tentativas) +
                     " tentativas: " + r.erro_mensagem);
+                if (op.esgotou_429) *op.esgotou_429 = houve_429;
                 return std::nullopt;
             }
             double espera = backoff_exponencial(tentativa);
-            char buf[256];
+            char buf[260];
             std::snprintf(buf, sizeof(buf), "[RETRY %d/%d] %s. Aguardando %.1fs...",
                           tentativa, max_tentativas, r.erro_mensagem.c_str(), espera);
             log(buf);
             dormir(espera);
         }
     }
+
+    if (op.esgotou_429) *op.esgotou_429 = houve_429 || ultimo_429;
     return std::nullopt;
 }

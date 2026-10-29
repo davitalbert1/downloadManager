@@ -102,15 +102,18 @@ void extrair_todas_urls_imagens(const json& j, std::vector<std::string>& urls) {
 }
 
 static void achatar_objeto(const json& obj, const std::string& prefix, Registro& reg,
-                           const DatasetCfg& ds, const std::map<std::string, ColunaCfg>& ov) {
+                           const DatasetCfg& ds, const std::map<std::string, ColunaCfg>& ov,
+                           bool sobrescrever = false) {
     if (!obj.is_object()) return;
     for (auto it = obj.begin(); it != obj.end(); ++it) {
         if (it.value().is_object()) {
             std::string p = prefix.empty() ? it.key() : prefix + "_" + it.key();
-            achatar_objeto(it.value(), p, reg, ds, ov);
+            achatar_objeto(it.value(), p, reg, ds, ov, sobrescrever);
             continue;
         }
         if (it.value().is_array()) {
+            // O array de horas e consumido por expandir_horas em parse_records.
+            if (ds.expandir_horas && it.key() == ds.campo_horas) continue;
             // Se for um array de valores primitivos ou objetos pequenos (ex: types, abilities, stats)
             // serializa em texto legível para não perder informações preciosas!
             const auto& arr = it.value();
@@ -143,9 +146,9 @@ static void achatar_objeto(const json& obj, const std::string& prefix, Registro&
                     }
                 }
                 if (!partes.empty() && partes.size() <= 200) {
-                    if (reg.find(col) == reg.end()) reg[col] = juntar(partes, ", ");
+                    if (sobrescrever || reg.find(col) == reg.end()) reg[col] = juntar(partes, ", ");
                 } else if (partes.empty() && arr.size() <= 10) {
-                    if (reg.find(col) == reg.end()) reg[col] = arr.dump();
+                    if (sobrescrever || reg.find(col) == reg.end()) reg[col] = arr.dump();
                 }
             }
             continue;
@@ -154,7 +157,7 @@ static void achatar_objeto(const json& obj, const std::string& prefix, Registro&
         std::string bruto = prefix.empty() ? it.key() : prefix + "_" + it.key();
         std::string col = ovi != ov.end() ? ovi->second.coluna : normalizar_nome(bruto);
         if (col == "created_at") continue;
-        if (reg.find(col) == reg.end()) reg[col] = json_para_valor(it.value());
+        if (sobrescrever || reg.find(col) == reg.end()) reg[col] = json_para_valor(it.value());
     }
 }
 
@@ -225,10 +228,75 @@ std::vector<Registro> parse_series(const json& bloco_json, const json& raiz,
     return regs;
 }
 
+// Alguns provedores (ex: Visual Crossing) devolvem um array de dias em que
+// cada dia carrega outro array com as horas. Cada hora vira um registro,
+// herdando os campos do dia e sobrescrevendo os campos horarios.
+static std::vector<Registro> parse_records_expandindo_horas(
+    const json& arr, const json& raiz, const DatasetCfg& ds, const Contexto& ctx,
+    const std::set<std::string>* filtro) {
+    std::map<std::string, ColunaCfg> overrides;
+    for (const auto& c : ds.colunas) overrides[c.variavel_api] = c;
+
+    auto extrair_data = [&](const json& obj) -> std::string {
+        std::vector<const char*> chaves = {ds.chave_data.c_str(), "date", "time",
+                                           "datetime", "timestamp"};
+        for (const char* k : chaves) {
+            auto it = obj.find(k);
+            if (it != obj.end() && it->is_string()) {
+                std::string v = it->get<std::string>();
+                if (v.size() >= 10) return v.substr(0, 10);
+            }
+        }
+        return "";
+    };
+
+    std::vector<Registro> regs;
+    if (!arr.is_array()) return regs;
+    for (const auto& el : arr) {
+        if (!el.is_object()) continue;
+        auto it_h = el.find(ds.campo_horas);
+        if (it_h == el.end() || !it_h->is_array()) continue;
+
+        Registro base;
+        injetar_ctx_registro(base, ds, ctx);
+        achatar_objeto(el, "", base, ds, overrides);
+        const std::string data_pai = extrair_data(el);
+        if (ds.salvar_timezone && raiz.contains("timezone") && raiz["timezone"].is_string())
+            base["timezone"] = raiz["timezone"].get<std::string>();
+        if (!data_pai.empty()) base[ds.chave_data] = data_pai;
+
+        for (const auto& h : *it_h) {
+            if (!h.is_object()) continue;
+            Registro reg = base;
+            achatar_objeto(h, "", reg, ds, overrides, true);
+            std::string hora_txt;
+            auto it_t = h.find("datetime");
+            if (it_t == h.end()) it_t = h.find("time");
+            if (it_t != h.end() && it_t->is_string()) hora_txt = it_t->get<std::string>();
+            std::string hhmm;
+            if (hora_txt.size() >= 16 && hora_txt[10] == 'T') hhmm = hora_txt.substr(11, 5);
+            else if (hora_txt.size() >= 5) hhmm = hora_txt.substr(0, 5);
+            if (!data_pai.empty()) reg[ds.chave_data] = data_pai;
+            if (ds.salvar_hora && !hhmm.empty())
+                reg[ds.chave_hora] = data_pai.empty() ? hhmm : data_pai + "T" + hhmm;
+            for (const char* k : {"date", "time", "datetime", "timestamp"}) {
+                std::string col = normalizar_nome(k);
+                if (col != ds.chave_data && col != ds.chave_hora) reg.erase(col);
+            }
+            if (!data_pai.empty() && filtro && !filtro->count(data_pai)) continue;
+            if (!data_pai.empty() && !data_no_intervalo(data_pai, ds)) continue;
+            regs.push_back(std::move(reg));
+        }
+    }
+    return regs;
+}
+
 std::vector<Registro> parse_records(const json& arr, const json& raiz,
                                     const DatasetCfg& ds, const Contexto& ctx,
                                     const std::set<std::string>* filtro,
                                     bool forcar_hora) {
+    if (ds.expandir_horas)
+        return parse_records_expandindo_horas(arr, raiz, ds, ctx, filtro);
     std::map<std::string, ColunaCfg> overrides;
     for (const auto& c : ds.colunas) overrides[c.variavel_api] = c;
     std::vector<Registro> regs;

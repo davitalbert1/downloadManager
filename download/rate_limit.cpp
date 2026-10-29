@@ -17,6 +17,20 @@ static double g_intervalo = 0.25;
 static std::chrono::steady_clock::time_point g_cooldown_fim;
 static int g_429_consecutivos = 0;
 static std::map<std::string, std::chrono::steady_clock::time_point> g_ep_cooldown;
+static std::map<std::string, std::chrono::steady_clock::time_point> g_chave_cooldown;
+
+// O cooldown vale por HOST: a cota de 429 costuma ser por host/IP e a URL
+// do bloco muda a cada intervalo (ex: {start}/{end} do fallback), entao
+// usar a URL completa faria cada bloco bater de novo na API limitada.
+static std::string chave_endpoint(const std::string& endpoint) {
+    size_t pos = endpoint.find("://");
+    if (pos == std::string::npos) return endpoint;
+    size_t ini = pos + 3;
+    size_t fim = endpoint.find('/', ini);
+    std::string host = endpoint.substr(ini, fim == std::string::npos ? std::string::npos
+                                                                    : fim - ini);
+    return host.empty() ? endpoint : host;
+}
 
 struct Janela {
     std::deque<std::pair<std::chrono::steady_clock::time_point, double>> ev;
@@ -74,6 +88,7 @@ void iniciar_rate_limit() {
     g_429_consecutivos = 0;
     g_orcamento.clear();
     g_ep_cooldown.clear();
+    g_chave_cooldown.clear();
 }
 
 void dormir(double segundos) {
@@ -131,7 +146,8 @@ void esperar_envio(const std::string& grupo, double custo) {
     log("[WARNING] Budget nao liberou apos muitas esperas; seguindo.");
 }
 
-void tratar_429(double espera, const std::string& motivo, const std::string& endpoint) {
+void tratar_429(double espera, const std::string& motivo, const std::string& endpoint,
+                const std::string& chave) {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
     auto agora = std::chrono::steady_clock::now();
     double intervalo_max = (CFG.min_rps > 0.0) ? 1.0 / CFG.min_rps : 1.0e9;
@@ -143,27 +159,53 @@ void tratar_429(double espera, const std::string& motivo, const std::string& end
         motivo_final = "circuit breaker";
         g_429_consecutivos = 0;
     }
-    if (espera > 0.0) {
-        auto novo_fim = agora + std::chrono::duration_cast<
-            std::chrono::steady_clock::duration>(std::chrono::duration<double>(espera));
-        if (novo_fim > g_cooldown_fim) {
-            bool primeiro = agora >= g_cooldown_fim;
-            g_cooldown_fim = novo_fim;
-            if (primeiro || espera > 30.0) {
-                char buf[220];
-                std::snprintf(buf, sizeof(buf),
-                              "[429] Pausa global de %.0fs (%s; intervalo %.2fs)",
-                              espera, motivo_final.c_str(), g_intervalo);
-                log(buf);
-            }
+    auto fim = agora + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<double>(espera));
+    // Pausa global apenas quando o circuit breaker dispara; 429 normal
+    // coloca somente o endpoint e a chave usados em cooldown, permitindo
+    // que os demais candidatos continuem imediatamente.
+    if (motivo_final == "circuit breaker" && espera > 0.0) {
+        if (fim > g_cooldown_fim) {
+            g_cooldown_fim = fim;
+            char buf[220];
+            std::snprintf(buf, sizeof(buf),
+                          "[429] Pausa global de %.0fs (%s; intervalo %.2fs)",
+                          espera, motivo_final.c_str(), g_intervalo);
+            log(buf);
         }
     }
     if (!endpoint.empty() && espera > 0.0) {
-        auto fim_ep = agora + std::chrono::duration_cast<
-            std::chrono::steady_clock::duration>(std::chrono::duration<double>(espera));
-        auto& c = g_ep_cooldown[endpoint];
-        if (fim_ep > c) c = fim_ep;
+        auto& c = g_ep_cooldown[chave_endpoint(endpoint)];
+        if (fim > c) c = fim;
     }
+    if (!chave.empty() && espera > 0.0) {
+        auto& c = g_chave_cooldown[chave];
+        if (fim > c) c = fim;
+    }
+}
+
+static bool disponivel_locked(
+    const std::map<std::string, std::chrono::steady_clock::time_point>& mapa,
+    const std::string& chave, std::chrono::steady_clock::time_point agora,
+    double* espera_restante) {
+    if (chave.empty()) return true;
+    auto it = mapa.find(chave);
+    if (it == mapa.end() || !(it->second > agora)) return true;
+    if (espera_restante)
+        *espera_restante = std::chrono::duration<double>(it->second - agora).count();
+    return false;
+}
+
+bool endpoint_disponivel(const std::string& endpoint, double* espera_restante) {
+    std::lock_guard<std::mutex> lk(g_rate_mtx);
+    return disponivel_locked(g_ep_cooldown, chave_endpoint(endpoint),
+                             std::chrono::steady_clock::now(), espera_restante);
+}
+
+bool chave_disponivel(const std::string& chave, double* espera_restante) {
+    std::lock_guard<std::mutex> lk(g_rate_mtx);
+    return disponivel_locked(g_chave_cooldown, chave, std::chrono::steady_clock::now(),
+                             espera_restante);
 }
 
 void restaurar_taxa() {

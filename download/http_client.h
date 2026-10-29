@@ -3,6 +3,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
 
 struct DatasetCfg;
@@ -46,6 +47,7 @@ struct RespostaHttp {
     long status = 0;
     std::string corpo;
     double retry_after = -1.0;
+    double rate_limit_reset = -1.0; // segundos ate o reset informado pelo servidor
     std::string location;
     long long content_length = -1;
     std::string content_type;
@@ -100,11 +102,22 @@ std::string escapar_url(const std::string& s);
 std::string montar_url(const std::string& base,
                        const std::map<std::string, std::string>& params);
 
-std::optional<json> baixar_com_retry(const std::string& url,
-                                     const std::map<std::string, std::string>& params,
-                                     int max_tentativas, double custo,
-                                     const std::string& chave_api,
-                                     const std::string& metodo = "GET",
-                                     const std::map<std::string, std::string>& headers = {},
-                                     const std::string& corpo = "",
-                                     const AuthApi& auth = {});
+// Requisicao JSON com rotacao automatica de endpoints e chaves. Em 429 o
+// candidato usado entra em cooldown e o proximo e tentado imediatamente;
+// se todos estiverem em cooldown, espera o menor prazo (ou desiste cedo
+// quando permitir_espera_longa=false, para o engine acionar um fallback).
+struct OpcoesRetry {
+    std::vector<std::string> urls;   // endpoints equivalentes (ja interpolados)
+    std::vector<std::string> chaves; // chaves rotativas (vazio = sem chave)
+    std::map<std::string, std::string> params;
+    int max_tentativas = 8;
+    double custo = 1.0;
+    std::string metodo = "GET";
+    std::map<std::string, std::string> headers;
+    std::string corpo;
+    AuthApi auth;
+    bool permitir_espera_longa = true;
+    bool* esgotou_429 = nullptr; // true se a ultima falha foi 429/cota
+};
+
+std::optional<json> baixar_com_retry(const OpcoesRetry& op);

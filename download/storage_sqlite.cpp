@@ -232,7 +232,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
 
 void criar_tabelas_datasets() {
     for (const auto& ds : CFG.datasets) {
-        if (!dataset_generico(ds)) continue;
+        if (!dataset_generico(ds) || ds.so_fallback) continue;
         try {
             std::vector<Registro> vazio;
             garantir_tabela(ds, vazio);
@@ -356,7 +356,7 @@ ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas
     ExistentesGen out;
     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
         const DatasetCfg& ds = CFG.datasets[di];
-        if (!dataset_generico(ds)) continue;
+        if (!dataset_generico(ds) || ds.so_fallback) continue;
         sqlite3* conn = get_connection_para(ds.db);
         std::vector<std::string> cols = colunas_da_tabela(conn, ds.tabela);
         bool tem_data =

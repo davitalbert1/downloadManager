@@ -43,6 +43,15 @@ struct DatasetCfg {
     std::string formato = "auto";// auto | series | records | object
     std::string chave_tempo = "time";
     std::string chave_unica; // colunas UNIQUE personalizadas (csv)
+    // Num 429 persistente, tenta este dataset (mesma tabela/colunas via
+    // coluna.*). Use so_fallback = 1 no dataset alternativo para ele nao
+    // ser executado por conta propria.
+    std::string fallback;
+    bool so_fallback = false;
+    // APIs como Visual Crossing devolvem varios dias, cada um com um array
+    // "hours"; expandir_horas transforma cada hora em um registro.
+    bool expandir_horas = false;
+    std::string campo_horas = "hours";
     std::vector<std::string> eixos; // eixos de produto cartesiano (dim:* e/ou coordenadas)
     std::map<std::string, std::string> params; // query params adicionais
     std::map<std::string, std::string> headers; // headers HTTP adicionais

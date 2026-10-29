@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         bool tem_db = false;
         bool tem_datas = false;
         for (const auto& ds : CFG.datasets) {
-            if (!dataset_generico(ds)) continue;
+            if (!dataset_generico(ds) || ds.so_fallback) continue;
             tem_db = true;
             if (ds.iterar_datas) tem_datas = true;
         }
@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
         int codigo_saida = 0;
         for (size_t di = 0; di < CFG.datasets.size(); ++di) {
             const auto& ds = CFG.datasets[di];
+            if (ds.so_fallback) continue;
             if (ds.tipo_saida == "drive" || ds.tipo_saida == "google_drive" || !ds.drive_folder_id.empty()) {
                 executar_dataset_google_drive(ds);
             } else if (ds.tipo_saida == "wikipedia" || ds.tipo_saida == "wiki") {

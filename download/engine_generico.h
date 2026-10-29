@@ -59,7 +59,8 @@ struct ResultadoGenerico {
 
 std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
                                           const std::vector<std::string>& datas,
-                                          const Contexto& ctx_base);
+                                          const Contexto& ctx_base,
+                                          int profundidade = 0);
 
 int executar_generico(const std::vector<std::string>& datas,
                       const ExistentesGen& existentes_inicial,
