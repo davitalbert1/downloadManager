@@ -554,6 +554,130 @@ bool eh_midia_direta(const std::string& url) {
             u_low.rfind(".avi") == u_low.size() - 4);
 }
 
+// Verifica de forma inteligente e antecipada se um vídeo ou episódio já existe no disco
+bool verificar_se_video_ja_existe(const fs::path& pasta,
+                                  const std::string& nome_arquivo,
+                                  const std::string& url) {
+    std::error_code ec;
+    if (!fs::exists(pasta, ec)) return false;
+
+    // 1. Se nome_arquivo explícito foi fornecido
+    if (!nome_arquivo.empty()) {
+        std::string base = sanitizar_nome_arquivo(nome_arquivo);
+        std::vector<fs::path> candidatos;
+        candidatos.push_back(pasta / base);
+        if (base.find('.') == std::string::npos) {
+            candidatos.push_back(pasta / (base + ".mp4"));
+            candidatos.push_back(pasta / (base + ".ts"));
+            candidatos.push_back(pasta / (base + ".mkv"));
+        }
+        for (const auto& c : candidatos) {
+            if (fs::exists(c, ec) && fs::file_size(c, ec) > 1024) {
+                std::cout << "[EXISTE] Arquivo ja baixado anteriormente: " << c.string()
+                          << " (" << formatar_bytes(fs::file_size(c, ec)) << "). Pulando download.\n";
+                return true;
+            }
+        }
+    }
+
+    // 2. Extrai pistas da URL (ex: ep=1, slug=k-on)
+    std::string ep_num;
+    static const std::regex reg_ep(R"([?&]ep=(\d+))", std::regex::icase);
+    std::smatch m_ep;
+    if (std::regex_search(url, m_ep, reg_ep)) {
+        ep_num = m_ep[1].str();
+    }
+
+    std::string slug;
+    static const std::regex reg_slug(R"(/watch/([a-zA-Z0-9_-]+))", std::regex::icase);
+    std::smatch m_slug;
+    if (std::regex_search(url, m_slug, reg_slug)) {
+        slug = m_slug[1].str();
+        static const std::regex reg_id(R"(-[0-9]+$)");
+        slug = std::regex_replace(slug, reg_id, "");
+    }
+
+    if (!ep_num.empty()) {
+        int ep_val = std::atoi(ep_num.c_str());
+        char ep_pad[16];
+        std::snprintf(ep_pad, sizeof(ep_pad), "%02d", ep_val);
+        std::string ep_pad_str = ep_pad;
+
+        std::string slug_espaco = slug;
+        std::replace(slug_espaco.begin(), slug_espaco.end(), '-', ' ');
+
+        std::vector<std::string> nomes_cand;
+        if (!slug.empty()) {
+            nomes_cand.push_back(slug_espaco + " - Ep " + ep_num);
+            nomes_cand.push_back(slug_espaco + " - Ep " + ep_pad_str);
+            nomes_cand.push_back(slug + " - Ep " + ep_num);
+            nomes_cand.push_back(slug + " - Ep " + ep_pad_str);
+            nomes_cand.push_back(slug + "_ep" + ep_num);
+            nomes_cand.push_back(slug + "_ep" + ep_pad_str);
+            nomes_cand.push_back(slug + "-ep" + ep_num);
+            nomes_cand.push_back(slug + "-ep" + ep_pad_str);
+        }
+        nomes_cand.push_back("ep" + ep_num);
+        nomes_cand.push_back("ep" + ep_pad_str);
+
+        for (const auto& nc : nomes_cand) {
+            std::string s_cand = sanitizar_nome_arquivo(nc);
+            for (const auto& ext : {".mp4", ".ts", ".mkv", ".webm"}) {
+                fs::path p_cand = pasta / (s_cand + ext);
+                if (fs::exists(p_cand, ec) && fs::file_size(p_cand, ec) > 1024) {
+                    std::cout << "[EXISTE] Episodio " << ep_num << " ja baixado anteriormente: "
+                              << p_cand.string() << " ("
+                              << formatar_bytes(fs::file_size(p_cand, ec)) << "). Pulando download.\n";
+                    return true;
+                }
+            }
+        }
+
+        // Também varre a pasta procurando arquivos de vídeo que correspondam a esse episódio
+        for (const auto& entry : fs::directory_iterator(pasta, ec)) {
+            if (!entry.is_regular_file(ec)) continue;
+            std::string ext = minusculas(entry.path().extension().string());
+            if (ext != ".mp4" && ext != ".ts" && ext != ".mkv" && ext != ".webm") continue;
+            if (fs::file_size(entry.path(), ec) <= 1024) continue;
+
+            std::string fn = minusculas(entry.path().filename().string());
+            bool mesmo_anime = true;
+            if (!slug.empty()) {
+                std::string slug_low = minusculas(slug);
+                std::string slug_espaco_low = minusculas(slug_espaco);
+                mesmo_anime = (fn.find(slug_low) != std::string::npos ||
+                               fn.find(slug_espaco_low) != std::string::npos);
+            }
+
+            bool mesmo_ep = (fn.find("ep " + ep_num + ".") != std::string::npos ||
+                             fn.find("ep " + ep_pad_str + ".") != std::string::npos ||
+                             fn.find("ep " + ep_num + " ") != std::string::npos ||
+                             fn.find("ep " + ep_pad_str + " ") != std::string::npos ||
+                             fn.find("ep" + ep_num + ".") != std::string::npos ||
+                             fn.find("ep" + ep_pad_str + ".") != std::string::npos ||
+                             fn.find("ep" + ep_num + "_") != std::string::npos ||
+                             fn.find("ep" + ep_pad_str + "_") != std::string::npos ||
+                             fn.find("ep" + ep_num + "-") != std::string::npos ||
+                             fn.find("ep" + ep_pad_str + "-") != std::string::npos ||
+                             fn.find("_" + ep_num + ".") != std::string::npos ||
+                             fn.find("_" + ep_pad_str + ".") != std::string::npos ||
+                             fn.find("- " + ep_num + ".") != std::string::npos ||
+                             fn.find("- " + ep_pad_str + ".") != std::string::npos ||
+                             fn.find(" " + ep_num + ".") != std::string::npos ||
+                             fn.find(" " + ep_pad_str + ".") != std::string::npos);
+
+            if (mesmo_anime && mesmo_ep) {
+                std::cout << "[EXISTE] Episodio " << ep_num << " ja baixado anteriormente: "
+                          << entry.path().filename().string() << " ("
+                          << formatar_bytes(fs::file_size(entry.path(), ec)) << "). Pulando download.\n";
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 bool baixar_video(const OpcoesVideo& op) {
     if (op.url.empty()) {
         std::cerr << "[ERRO] URL de vídeo vazia informada.\n";
@@ -569,6 +693,11 @@ bool baixar_video(const OpcoesVideo& op) {
     std::cout << "[VIDEO DOWNLOADER] Processando link: " << op.url << "\n";
     std::cout << "Diretório de destino: " << pasta_saida.string() << "\n";
     std::cout << "============================================================\n";
+
+    // 0. Verifica antecipadamente se o vídeo/episódio já existe no destino
+    if (verificar_se_video_ja_existe(pasta_saida, op.nome_arquivo, op.url)) {
+        return true;
+    }
 
     std::string stream_url = op.url;
     std::string titulo_video = op.nome_arquivo;
@@ -629,6 +758,23 @@ bool baixar_video(const OpcoesVideo& op) {
 
         std::cout << "[OK] Stream capturado com sucesso!\n";
         std::cout << "     Título: " << (titulo_video.empty() ? "(padrão)" : titulo_video) << "\n";
+
+        // Checagem imediata se o arquivo final já existe após obtenção do título
+        if (!titulo_video.empty()) {
+            std::string nb = sanitizar_nome_arquivo(titulo_video);
+            fs::path f_mp4 = pasta_saida / (nb + ".mp4");
+            fs::path f_ts = pasta_saida / (nb + ".ts");
+            if (fs::exists(f_mp4, ec) && fs::file_size(f_mp4, ec) > 1024) {
+                std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << f_mp4.string()
+                          << " (" << formatar_bytes(fs::file_size(f_mp4, ec)) << "). Pulando download.\n";
+                return true;
+            }
+            if (fs::exists(f_ts, ec) && fs::file_size(f_ts, ec) > 1024) {
+                std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << f_ts.string()
+                          << " (" << formatar_bytes(fs::file_size(f_ts, ec)) << "). Pulando download.\n";
+                return true;
+            }
+        }
     }
 
     // Se o link for um arquivo direto de mídia (ex: .mp4, .mkv)
@@ -644,6 +790,11 @@ bool baixar_video(const OpcoesVideo& op) {
         nome_final = sanitizar_nome_arquivo(nome_final);
 
         fs::path dest = pasta_saida / nome_final;
+        if (fs::exists(dest, ec) && fs::file_size(dest, ec) > 1024) {
+            std::cout << "[EXISTE] Arquivo de vídeo já existe: " << dest.string()
+                      << " (" << formatar_bytes(fs::file_size(dest, ec)) << "). Pulando download.\n";
+            return true;
+        }
         OpcoesDownload dl_op;
         dl_op.url = stream_url;
         dl_op.caminho = dest.string();
@@ -706,6 +857,20 @@ bool baixar_video(const OpcoesVideo& op) {
         std::replace(nome_base.begin(), nome_base.end(), ':', '-');
     }
     nome_base = sanitizar_nome_arquivo(nome_base);
+
+    // Checagem antes de baixar os segmentos da playlist
+    fs::path final_mp4 = pasta_saida / (nome_base + ".mp4");
+    fs::path final_ts = pasta_saida / (nome_base + ".ts");
+    if (fs::exists(final_mp4, ec) && fs::file_size(final_mp4, ec) > 1024) {
+        std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << final_mp4.string()
+                  << " (" << formatar_bytes(fs::file_size(final_mp4, ec)) << "). Pulando download.\n";
+        return true;
+    }
+    if (fs::exists(final_ts, ec) && fs::file_size(final_ts, ec) > 1024) {
+        std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << final_ts.string()
+                  << " (" << formatar_bytes(fs::file_size(final_ts, ec)) << "). Pulando download.\n";
+        return true;
+    }
 
     // Pasta temporária para segmentos
     fs::path tmp_dir = pasta_saida / (".tmp_" + nome_base + "_parts");
@@ -860,7 +1025,7 @@ bool baixar_video(const OpcoesVideo& op) {
     if (!ffmpeg_exe.empty()) {
         fs::path mp4_saida = pasta_saida / (nome_base + ".mp4");
         std::cout << "[FFMPEG] Remuxando para MP4 sem perda de qualidade...\n";
-        std::string cmd_ffmpeg = "\"\"" + ffmpeg_exe + "\" -y -hide_banner -loglevel warning -i \"" +
+        std::string cmd_ffmpeg = "\"\"" + ffmpeg_exe + "\" -y -hide_banner -loglevel warning -fflags +genpts -i \"" +
                                  ts_saida.string() + "\" -c copy \"" + mp4_saida.string() + "\"\"";
         int r_ff = std::system(cmd_ffmpeg.c_str());
         if (r_ff == 0 && fs::exists(mp4_saida, ec) && fs::file_size(mp4_saida, ec) > 1024) {
@@ -904,6 +1069,7 @@ void executar_dataset_video(const DatasetCfg& ds) {
     std::cout << "Pasta de saída: " << pasta << "\n";
     std::cout << "============================================================\n";
 
+    std::error_code ec;
     size_t idx = 0;
     for (const auto& u : urls) {
         ++idx;
@@ -926,6 +1092,17 @@ void executar_dataset_video(const DatasetCfg& ds) {
         op.nome_arquivo = nome_arquivo;
         op.headers = ds.headers;
         op.max_workers = CFG.download_workers;
+
+        // Pula o download se o arquivo de saída já existir (MP4 ou TS)
+        fs::path caminho_mp4 = fs::path(pasta) / (nome_arquivo.empty() ? u : nome_arquivo);
+        if (caminho_mp4.extension().empty()) caminho_mp4 += ".mp4";
+        fs::path caminho_ts = caminho_mp4;
+        caminho_ts.replace_extension(".ts");
+        if (fs::exists(caminho_mp4, ec) || fs::exists(caminho_ts, ec)) {
+            std::cout << "[SKIP] Arquivo já existe, ignorando: " << caminho_mp4.filename().string() << "\n";
+            continue;
+        }
+
         baixar_video(op);
     }
 }

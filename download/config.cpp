@@ -433,22 +433,37 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         }
 
         if (ep_ini > 0 && ep_fim >= ep_ini && !d.url.empty()) {
-            for (int ep = ep_ini; ep <= ep_fim; ++ep) {
-                std::string u = d.url;
-                if (u.find("{ep}") != std::string::npos || u.find("{episodio}") != std::string::npos) {
-                    u = aplicar_ctx(u, {{"ep", std::to_string(ep)}, {"episodio", std::to_string(ep)}});
+            std::string url_base = d.url;
+            bool tem_token_ep = (url_base.find("{ep}") != std::string::npos ||
+                                 url_base.find("{episodio}") != std::string::npos);
+
+            std::string prefixo_url;
+            char sep_ep = '?';
+
+            if (!tem_token_ep) {
+                // Remove qualquer ep=... existente da base para evitar conflitos e duplicações
+                size_t pos_ep = url_base.find("?ep=");
+                if (pos_ep != std::string::npos) {
+                    prefixo_url = url_base.substr(0, pos_ep);
+                    sep_ep = '?';
                 } else {
-                    static const std::regex reg_range_replace(R"(([?&]ep=)[{\[]?\d+\.\.\d+[}\]]?)", std::regex::icase);
-                    if (std::regex_search(u, reg_range_replace)) {
-                        u = std::regex_replace(u, reg_range_replace, "$1" + std::to_string(ep));
+                    pos_ep = url_base.find("&ep=");
+                    if (pos_ep != std::string::npos) {
+                        prefixo_url = url_base.substr(0, pos_ep);
+                        sep_ep = '&';
                     } else {
-                        static const std::regex reg_ep(R"(([?&]ep=)\d+)");
-                        if (std::regex_search(u, reg_ep)) {
-                            u = std::regex_replace(u, reg_ep, "$1" + std::to_string(ep));
-                        } else {
-                            u += (u.find('?') == std::string::npos ? "?ep=" : "&ep=") + std::to_string(ep);
-                        }
+                        prefixo_url = url_base;
+                        sep_ep = (prefixo_url.find('?') == std::string::npos) ? '?' : '&';
                     }
+                }
+            }
+
+            for (int ep = ep_ini; ep <= ep_fim; ++ep) {
+                std::string u;
+                if (tem_token_ep) {
+                    u = aplicar_ctx(url_base, {{"ep", std::to_string(ep)}, {"episodio", std::to_string(ep)}});
+                } else {
+                    u = prefixo_url + sep_ep + "ep=" + std::to_string(ep);
                 }
                 d.lista_urls.push_back(u);
             }
