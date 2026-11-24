@@ -1,5 +1,6 @@
 #include "grib_importer.h"
 #include "config.h"
+#include "i18n.h"
 #include "utils.h"
 #include <gdal.h>
 #include <gdal_priv.h>
@@ -188,7 +189,7 @@ static bool preparar_tabela_sqlite(sqlite3* db, const std::string& tabela, const
 
         char* errmsg = nullptr;
         if (sqlite3_exec(db, sql_create.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
-            std::cerr << "[ERRO SQL] Criar tabela " << tabela << ": " << (errmsg ? errmsg : "") << "\n";
+            i18n::cerr << "[ERRO SQL] Criar tabela " << tabela << ": " << (errmsg ? errmsg : "") << "\n";
             sqlite3_free(errmsg);
             return false;
         }
@@ -203,7 +204,7 @@ static bool preparar_tabela_sqlite(sqlite3* db, const std::string& tabela, const
                 std::string sql_alter = "ALTER TABLE \"" + tabela + "\" ADD COLUMN \"" + col + "\" REAL";
                 char* errmsg = nullptr;
                 if (sqlite3_exec(db, sql_alter.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
-                    std::cerr << "[AVISO SQL] Adicionar coluna " << col << ": " << (errmsg ? errmsg : "") << "\n";
+                    i18n::cerr << "[AVISO SQL] Adicionar coluna " << col << ": " << (errmsg ? errmsg : "") << "\n";
                     sqlite3_free(errmsg);
                 }
             }
@@ -238,12 +239,12 @@ struct PixelCoord {
 };
 
 bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig& cfg) {
-    std::cout << "\n[GRIB Import] Abrindo: " << grib_path << " ...\n";
+    i18n::cout << "\n[GRIB Import] Abrindo: " << grib_path << " ...\n";
 
     GDALAllRegister();
     GDALDataset* poDataset = static_cast<GDALDataset*>(GDALOpen(grib_path.c_str(), GA_ReadOnly));
     if (!poDataset) {
-        std::cerr << "[ERRO GDAL] Nao foi possivel abrir: " << grib_path << "\n";
+        i18n::cerr << "[ERRO GDAL] Nao foi possivel abrir: " << grib_path << "\n";
         return false;
     }
 
@@ -253,7 +254,7 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
 
     double geo_transform[6];
     if (poDataset->GetGeoTransform(geo_transform) != CE_None) {
-        std::cerr << "[ERRO GDAL] GeoTransform nao disponivel no arquivo GRIB.\n";
+        i18n::cerr << "[ERRO GDAL] GeoTransform nao disponivel no arquivo GRIB.\n";
         GDALClose(poDataset);
         return false;
     }
@@ -275,7 +276,7 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
         coords = carregar_coordenadas_ini(cfg.ini_path);
     }
     if (coords.empty()) {
-        std::cerr << "[AVISO] Nenhuma coordenada definida para extracao.\n";
+        i18n::cerr << "[AVISO] Nenhuma coordenada definida para extracao.\n";
         GDALClose(poDataset);
         return false;
     }
@@ -304,13 +305,13 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
             pc.valido = true;
             pixels.push_back(pc);
         } else {
-            std::cerr << "[AVISO] Ponto lat=" << lat << " lon=" << lon
+            i18n::cerr << "[AVISO] Ponto lat=" << lat << " lon=" << lon
                       << " fora da extensao da grade (" << px << ", " << py << ")\n";
         }
     }
 
     if (pixels.empty()) {
-        std::cerr << "[ERRO] Todos os pontos solicitados estao fora da grade.\n";
+        i18n::cerr << "[ERRO] Todos os pontos solicitados estao fora da grade.\n";
         GDALClose(poDataset);
         return false;
     }
@@ -379,7 +380,7 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
     } catch (...) {}
     sqlite3* db = nullptr;
     if (sqlite3_open(cfg.db_path.c_str(), &db) != SQLITE_OK) {
-        std::cerr << "[ERRO SQLite] Falha ao abrir banco: " << cfg.db_path << "\n";
+        i18n::cerr << "[ERRO SQLite] Falha ao abrir banco: " << cfg.db_path << "\n";
         GDALClose(poDataset);
         return false;
     }
@@ -408,7 +409,7 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
     std::map<std::pair<std::string, std::string>, std::vector<BandaInfo>> grupos_tempo;
     for (const auto& b : bandas) grupos_tempo[{b.data, b.hora}].push_back(b);
 
-    std::cout << "[GRIB Import] Total de bandas: " << band_count
+    i18n::cout << "[GRIB Import] Total de bandas: " << band_count
               << " | Instantes temporais: " << grupos_tempo.size()
               << " | Pontos: " << pixels.size() << "\n";
 
@@ -482,7 +483,7 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
 
     sqlite3_stmt* insert_stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql_insert.c_str(), -1, &insert_stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "[ERRO SQLite] Preparar insert: " << sqlite3_errmsg(db) << "\n";
+        i18n::cerr << "[ERRO SQLite] Preparar insert: " << sqlite3_errmsg(db) << "\n";
         sqlite3_close(db);
         return false;
     }
@@ -512,7 +513,7 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
         sqlite3_bind_text(insert_stmt, param_idx, iso_agora.c_str(), -1, SQLITE_TRANSIENT);
 
         if (sqlite3_step(insert_stmt) != SQLITE_DONE) {
-            std::cerr << "[ERRO SQLite] Inserir registro: " << sqlite3_errmsg(db) << "\n";
+            i18n::cerr << "[ERRO SQLite] Inserir registro: " << sqlite3_errmsg(db) << "\n";
         }
         sqlite3_reset(insert_stmt);
         sqlite3_clear_bindings(insert_stmt);
@@ -528,14 +529,14 @@ bool importar_arquivo_grib(const std::string& grib_path, const GribImportConfig&
     sqlite3_finalize(insert_stmt);
     sqlite3_close(db);
 
-    std::cout << "[GRIB Import] Concluido com sucesso: " << cont << " registros inseridos/atualizados na tabela '"
+    i18n::cout << "[GRIB Import] Concluido com sucesso: " << cont << " registros inseridos/atualizados na tabela '"
               << cfg.tabela << "'!\n";
     return true;
 }
 
 size_t importar_pasta_grib(const GribImportConfig& cfg) {
     if (!fs::exists(cfg.pasta_grib)) {
-        std::cerr << "[ERRO] Pasta nao encontrada: " << cfg.pasta_grib << "\n";
+        i18n::cerr << "[ERRO] Pasta nao encontrada: " << cfg.pasta_grib << "\n";
         return 0;
     }
 
@@ -553,7 +554,7 @@ size_t importar_pasta_grib(const GribImportConfig& cfg) {
 
     std::sort(arquivos_grib.begin(), arquivos_grib.end());
 
-    std::cout << "============================================================\n"
+    i18n::cout << "============================================================\n"
               << "IMPORTACAO DE DADOS GRIB -> SQLITE\n"
               << "============================================================\n"
               << "Pasta de entrada: " << cfg.pasta_grib << "\n"
@@ -575,7 +576,7 @@ size_t importar_pasta_grib(const GribImportConfig& cfg) {
     if (n_proc < 1) n_proc = 1;
     if (n_proc > arquivos_grib.size() && !arquivos_grib.empty())
         n_proc = arquivos_grib.size();
-    std::cout << "Workers de importacao (process_workers): " << n_proc << "\n"
+    i18n::cout << "Workers de importacao (process_workers): " << n_proc << "\n"
               << "============================================================\n";
     std::atomic<size_t> ok_at{0};
     GDALAllRegister();
@@ -583,12 +584,12 @@ size_t importar_pasta_grib(const GribImportConfig& cfg) {
         try {
             if (importar_arquivo_grib(arquivos_grib[k].string(), cfg)) ok_at.fetch_add(1);
         } catch (const std::exception& e) {
-            std::cerr << "[ERRO] " << arquivos_grib[k].string() << ": " << e.what() << "\n";
+            i18n::cerr << "[ERRO] " << arquivos_grib[k].string() << ": " << e.what() << "\n";
         }
     });
     processados = ok_at.load();
 
-    std::cout << "\n[FINALIZADO] " << processados << " de " << arquivos_grib.size()
+    i18n::cout << "\n[FINALIZADO] " << processados << " de " << arquivos_grib.size()
               << " arquivos importados para o banco " << cfg.db_path << ".\n";
     return processados;
 }

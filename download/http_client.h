@@ -118,6 +118,9 @@ struct OpcoesRetry {
     AuthApi auth;
     bool permitir_espera_longa = true;
     bool* esgotou_429 = nullptr; // true se a ultima falha foi 429/cota
+    int max_dias_por_requisicao = 7;   // dividir datas em blocos menores se necessario
+    bool split_query_quota_excedida = true; // se 401 "query size exceeds", tentar dividir
+    std::vector<std::string> datas; // datas originais para re-tentar em blocos menores (preenchido pelo engine)
 };
 
 std::optional<json> baixar_com_retry(const OpcoesRetry& op);

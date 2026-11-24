@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "i18n.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -23,7 +24,7 @@ void log(const std::string& msg) {
     std::lock_guard<std::mutex> lk(g_print_mtx);
     // Escreve mensagem + '\n' num único fwrite para evitar que outra thread
     // intercale saída entre a mensagem e a quebra de linha.
-    std::string linha = msg;
+    std::string linha = i18n::traduzir(msg);
     linha.push_back('\n');
     fwrite(linha.data(), 1, linha.size(), stdout);
     fflush(stdout);

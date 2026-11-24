@@ -3,18 +3,20 @@
 #include "http_client.h"
 #include "json_parser.h"
 #include "rate_limit.h"
+#include "storage_sqlite.h"
 #include "utils.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <thread>
 
 static std::mutex g_mtx_existentes;
-static std::mutex g_write_mtx;
 static std::mutex g_stats_mtx;
+// g_write_mtx removido: agora usamos lock por database em salvar_dataset.
 
 static std::string url_do_dataset(const DatasetCfg& ds, const std::string& data) {
     if (!ds.url_passado.empty() || !ds.url_futuro.empty()) {
@@ -54,6 +56,61 @@ static const DatasetCfg* dataset_por_id(const std::string& id) {
     for (const auto& d : CFG.datasets)
         if (d.id == id) return &d;
     return nullptr;
+}
+
+// Checkpoint: salva o estado das tarefas concluídas para retomada após crash.
+static std::string checkpoint_path(const std::string& dataset_id) {
+    return ".checkpoint_" + dataset_id + ".json";
+}
+
+static void salvar_checkpoint(const std::string& dataset_id, long long concluidos,
+                              long long total, long long falhas) {
+    if (CFG.checkpoint_tarefas <= 0) return;
+    std::ofstream arq(checkpoint_path(dataset_id));
+    if (!arq) return;
+    arq << "{\n";
+    arq << "  \"concluidos\": " << concluidos << ",\n";
+    arq << "  \"total\": " << total << ",\n";
+    arq << "  \"falhas\": " << falhas << ",\n";
+    arq << "  \"timestamp\": \"" << agora_iso() << "\"\n";
+    arq << "}\n";
+    arq.flush();
+}
+
+static bool carregar_checkpoint(const std::string& dataset_id,
+                                long long& concluidos_out, long long& total_out,
+                                long long& falhas_out) {
+    if (CFG.checkpoint_tarefas <= 0) return false;
+    std::ifstream arq(checkpoint_path(dataset_id));
+    if (!arq) return false;
+    std::string conteudo((std::istreambuf_iterator<char>(arq)),
+                         std::istreambuf_iterator<char>());
+    try {
+        size_t p = conteudo.find("\"concluidos\"");
+        if (p == std::string::npos) return false;
+        p = conteudo.find(':', p);
+        if (p == std::string::npos) return false;
+        concluidos_out = para_int(conteudo.substr(p + 1), 0);
+        p = conteudo.find("\"total\"", p);
+        if (p == std::string::npos) return false;
+        p = conteudo.find(':', p);
+        if (p == std::string::npos) return false;
+        total_out = para_int(conteudo.substr(p + 1), 0);
+        p = conteudo.find("\"falhas\"", p);
+        if (p == std::string::npos) return false;
+        p = conteudo.find(':', p);
+        if (p == std::string::npos) return false;
+        falhas_out = para_int(conteudo.substr(p + 1), 0);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static void remover_checkpoint(const std::string& dataset_id) {
+    if (CFG.checkpoint_tarefas <= 0) return;
+    std::error_code ec;
+    std::filesystem::remove(checkpoint_path(dataset_id), ec);
 }
 
 std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
@@ -159,6 +216,9 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         req.headers = hdrs;
         req.corpo = aplicar_ctx(ds.corpo, ctx);
         req.auth = auth;
+        req.max_dias_por_requisicao = CFG.max_dias_por_requisicao;
+        req.split_query_quota_excedida = CFG.split_query_quota_excedida;
+        req.datas = grupo; // datas originais para re-tentar em blocos menores se houver 401 quota
         // Com fallback configurado, nao vale a pena esperar horas pelo reset
         // da cota: falha cedo e deixa o provedor alternativo assumir. O
         // proprio fallback tambem nao espera horas (cota pequena): se ele
@@ -247,6 +307,24 @@ std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
     return todos;
 }
 
+// Deduplicação prévia: remove registros cuja data já consta no conjunto de existentes.
+static std::vector<Registro> filtrar_registros_existentes(
+    const DatasetCfg& ds, const std::vector<Registro>& registros,
+    const std::set<std::string>& datas_existentes) {
+    if (datas_existentes.empty()) return registros;
+    std::string col = ds.chave_data.empty() ? "data" : ds.chave_data;
+    std::vector<Registro> out;
+    out.reserve(registros.size());
+    for (const auto& reg : registros) {
+        auto it = reg.find(col);
+        if (it != reg.end() && std::holds_alternative<std::string>(it->second)) {
+            if (datas_existentes.count(std::get<std::string>(it->second))) continue;
+        }
+        out.push_back(reg);
+    }
+    return out;
+}
+
 static ResultadoGenerico baixar_bloco_generico(
     size_t dataset_idx, const std::vector<std::string>& datas, const std::string& chave_existentes,
     const Contexto& ctx_tarefa) {
@@ -264,18 +342,46 @@ static ResultadoGenerico baixar_bloco_generico(
 
 static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existentes,
                                std::map<size_t, long long>& baixados,
-                               std::map<size_t, long long>& pulados) {
+                               std::map<size_t, long long>& pulados,
+                               std::map<size_t, std::atomic<long long>>& requisicoes_ok,
+                               std::map<size_t, std::atomic<long long>>& requisicoes_erro,
+                               std::atomic<long long>& total_bytes) {
     const DatasetCfg& ds = CFG.datasets[r.dataset_idx];
     // Datasets sem data: "baixados" = nº de registros; sem conta de dias.
     if (!ds.iterar_datas) {
-        if (r.registros.empty()) return;
-        {
-            std::lock_guard<std::mutex> lk(g_write_mtx);
-            salvar_dataset(ds, r.registros);
+        if (r.registros.empty()) {
+            requisicoes_erro[r.dataset_idx] += 1;
+            return;
         }
+        // Deduplicação prévia para datasets sem data
+        std::vector<Registro> regs_novos;
+        if (ds.chave_unica.empty()) {
+            // Sem chave única declarada: tenta dedup por 'id' ou 'name' se existir
+            std::set<std::string> ids_vistos;
+            for (const auto& reg : r.registros) {
+                std::string idv;
+                for (const char* ck : {"id", "name", "nome", "url"}) {
+                    auto it = reg.find(ck);
+                    if (it != reg.end() && std::holds_alternative<std::string>(it->second)) {
+                        idv = std::get<std::string>(it->second);
+                        break;
+                    }
+                }
+                if (!idv.empty() && !ids_vistos.insert(idv).second) continue;
+                regs_novos.push_back(reg);
+            }
+        } else {
+            regs_novos = r.registros;
+        }
+        if (regs_novos.empty()) {
+            requisicoes_ok[r.dataset_idx] += 1;
+            return;
+        }
+        salvar_dataset(ds, regs_novos);
+        requisicoes_ok[r.dataset_idx] += 1;
         {
             std::lock_guard<std::mutex> lk(g_stats_mtx);
-            baixados[r.dataset_idx] += static_cast<long long>(r.registros.size());
+            baixados[r.dataset_idx] += static_cast<long long>(regs_novos.size());
         }
         return;
     }
@@ -290,16 +396,36 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
         }
         dias_retornados = static_cast<long long>(dias.size());
     }
+    // r é const: trabalha com uma cópia local para filtragem de existentes.
+    std::vector<Registro> registros = r.registros;
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         pulados[r.dataset_idx] += std::max(0LL, static_cast<long long>(r.datas_pedidas.size()) -
                                                     dias_retornados);
     }
-    if (r.registros.empty()) return;
-    {
-        std::lock_guard<std::mutex> lk(g_write_mtx);
-        salvar_dataset(ds, r.registros);
+    if (r.registros.empty()) {
+        requisicoes_erro[r.dataset_idx] += 1;
+        return;
     }
+
+    // Deduplicação prévia: pular datas já existentes no banco antes de salvar.
+    {
+        std::lock_guard<std::mutex> lk(g_mtx_existentes);
+        auto it_ds = existentes.find(r.dataset_idx);
+        if (it_ds != existentes.end()) {
+            auto it_chave = it_ds->second.find(r.chave_existentes);
+            if (it_chave != it_ds->second.end()) {
+                registros = filtrar_registros_existentes(ds, registros, it_chave->second);
+            }
+        }
+    }
+    if (registros.empty()) {
+        requisicoes_ok[r.dataset_idx] += 1;
+        return;
+    }
+
+    salvar_dataset(ds, registros);
+    requisicoes_ok[r.dataset_idx] += 1;
 
     // Se o dataset tiver baixar_arquivos_vinculados ativado (como imagens de pokemons, assets, etc.)
     // Downloads em paralelo com download_workers (rede).
@@ -310,8 +436,8 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
             std::string nome;
         };
         std::vector<AlvoVinc> alvos;
-        alvos.reserve(r.registros.size());
-        for (const auto& reg : r.registros) {
+        alvos.reserve(registros.size());
+        for (const auto& reg : registros) {
             auto it_u = reg.find(ds.campo_url_arquivo);
             if (it_u != reg.end() && std::holds_alternative<std::string>(it_u->second)) {
                 std::string file_url = std::get<std::string>(it_u->second);
@@ -340,7 +466,7 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
         std::lock_guard<std::mutex> lk(g_mtx_existentes);
         auto& conj = existentes[r.dataset_idx][r.chave_existentes];
         std::string col = ds.chave_data.empty() ? "data" : ds.chave_data;
-        for (const auto& reg : r.registros) {
+        for (const auto& reg : registros) {
             auto it = reg.find(col);
             if (it != reg.end() && std::holds_alternative<std::string>(it->second))
                 conj.insert(std::get<std::string>(it->second));
@@ -362,11 +488,26 @@ int executar_generico(const std::vector<std::string>& datas,
         std::string chave_existentes;
         Contexto ctx;
     };
+    struct TarefaStatus {
+        bool concluida = false;
+        bool falhou = false;
+        int tentativas = 0;
+    };
     std::vector<TarefaGen> tarefas;
+    std::vector<TarefaStatus> tarefa_status;
     long long falt = 0;
 
     size_t di_inicio = (dataset_idx < CFG.datasets.size()) ? dataset_idx : 0;
     size_t di_fim = (dataset_idx < CFG.datasets.size()) ? (dataset_idx + 1) : CFG.datasets.size();
+
+    const std::string dataset_id = (di_inicio < CFG.datasets.size())
+                                       ? CFG.datasets[di_inicio].id
+                                       : "todos";
+
+    // Checkpoint: retomar de execução anterior se houver.
+    long long checkpoint_concluidos = 0, checkpoint_total = 0, checkpoint_falhas = 0;
+    bool tem_checkpoint = carregar_checkpoint(dataset_id, checkpoint_concluidos,
+                                              checkpoint_total, checkpoint_falhas);
 
     // Chave = coordenada "lat,lon" ou combinação de eixos "k=v|k=v" (mesma
     // usada por storage_sqlite ao carregar o que já existe).
@@ -389,12 +530,19 @@ int executar_generico(const std::vector<std::string>& datas,
         for (size_t i = 0; i < f.size(); i += chunk) {
             size_t e = std::min(i + chunk, f.size());
             tarefas.push_back({di, std::vector<std::string>(f.begin() + i, f.begin() + e), chave, ctx});
+            tarefa_status.push_back({});
         }
     };
 
     for (size_t di = di_inicio; di < di_fim; ++di) {
         const DatasetCfg& ds = CFG.datasets[di];
         if (!dataset_generico(ds) || ds.so_fallback) continue;
+
+        // evitar_download_se_no_banco: pula dataset inteiro se já tem dados.
+        if (ds.evitar_download_se_no_banco && tabela_tem_dados(ds)) {
+            log("[SKIP] " + ds.id + " ja possui dados no banco (evitar_download_se_no_banco=1).");
+            continue;
+        }
 
         // Datasets sem data (ex: PokeAPI records): 1 tarefa por contexto.
         // Sem isso, 1940-2025 vira 31412 dias x 1 coord = 1048 blocos
@@ -403,6 +551,7 @@ int executar_generico(const std::vector<std::string>& datas,
             if (contar_linhas_tabela(ds) > 0) continue; // idempotente
             for (const auto& ctx : contextos_de_download(ds)) {
                 tarefas.push_back({di, {}, chave_contexto(ctx), ctx});
+                tarefa_status.push_back({});
                 falt += 1;
             }
             continue;
@@ -425,7 +574,19 @@ int executar_generico(const std::vector<std::string>& datas,
         return 0;
     }
 
+    // Se houver checkpoint e for retomada, ajusta o índice inicial.
+    size_t idx_inicial = 0;
+    if (tem_checkpoint && checkpoint_concluidos > 0 &&
+        checkpoint_concluidos < (long long)tarefas.size()) {
+        log("[CHECKPOINT] Retomando da tarefa " +
+            std::to_string(checkpoint_concluidos) + " de " +
+            std::to_string(tarefas.size()) + "...");
+        idx_inicial = (size_t)checkpoint_concluidos;
+    }
+
     std::map<size_t, long long> baixados, pulados;
+    std::map<size_t, std::atomic<long long>> requisicoes_ok, requisicoes_erro;
+    std::atomic<long long> total_bytes{0};
     std::atomic<long long> concluidos{0};
     std::atomic<long long> falhas{0};
     long long total = (long long)tarefas.size();
@@ -433,7 +594,7 @@ int executar_generico(const std::vector<std::string>& datas,
     const int n_download = std::max(1, CFG.download_workers);
     const int n_process = std::max(1, CFG.process_workers);
     Fila<ResultadoGenerico> fila((size_t)n_download * 2);
-    std::atomic<size_t> idx_t{0};
+    std::atomic<size_t> idx_t{idx_inicial};
     std::atomic<long long> feitas{0};
 
     log("\nIniciando " + std::to_string(total) + " tarefas (" +
@@ -446,25 +607,44 @@ int executar_generico(const std::vector<std::string>& datas,
             try {
                 ResultadoGenerico r;
                 while (fila.get(r)) {
+                    bool ok = false;
                     try {
-                        processar_generico(r, existentes, baixados, pulados);
+                        processar_generico(r, existentes, baixados, pulados,
+                                           requisicoes_ok, requisicoes_erro,
+                                           total_bytes);
+                        ok = true;
                     } catch (const std::exception& e) {
                         ++falhas;
                         log(std::string("[ERROR] Falha ao processar bloco: ") + e.what());
                     }
                     long long c = ++concluidos;
+                    // Atualiza status da tarefa para retry posterior
+                    {
+                        std::lock_guard<std::mutex> lk(g_stats_mtx);
+                        if (r.dataset_idx < tarefa_status.size()) {
+                            tarefa_status[r.dataset_idx].concluida = true;
+                            if (!ok) tarefa_status[r.dataset_idx].falhou = true;
+                            tarefa_status[r.dataset_idx].tentativas++;
+                        }
+                    }
+                    // Checkpoint periodico
+                    if (CFG.checkpoint_tarefas > 0 &&
+                        c % (long long)CFG.checkpoint_tarefas == 0) {
+                        salvar_checkpoint(dataset_id, c, total, falhas.load());
+                    }
                     if (c % 5 == 0 || c == total) {
                         double pct = 100.0 * (double)c / (double)total;
                         double dec = std::chrono::duration<double>(
                                          std::chrono::steady_clock::now() - inicio)
                                          .count();
                         double eta = c > 0 ? dec * (double)(total - c) / (double)c : 0.0;
+                        double req_s = dec > 0.0 ? (double)c / dec : 0.0;
                         std::string dec_txt = formatar_duracao(dec);
                         std::string eta_txt = formatar_duracao(eta);
-                        char buf[220];
+                        char buf[260];
                         std::snprintf(buf, sizeof(buf),
-                                      "[PROGRESSO] %lld/%lld blocos (%.1f%%) - %s decorridos - ETA %s",
-                                      c, total, pct, dec_txt.c_str(), eta_txt.c_str());
+                                      "[PROGRESSO] %lld/%lld tarefas (%.1f%%) - %s decorridos - ETA %s - %.1f req/s",
+                                      c, total, pct, dec_txt.c_str(), eta_txt.c_str(), req_s);
                         log(buf);
                     }
                 }
@@ -497,6 +677,60 @@ int executar_generico(const std::vector<std::string>& datas,
     for (auto& t : produtores) t.join();
     for (auto& t : consumidores) t.join();
 
+    // Retry de tarefas falhadas
+    int max_retry = CFG.retry_tarefas_falhadas;
+    if (max_retry > 0 && falhas.load() > 0) {
+        log("\n[RETRY] " + std::to_string(falhas.load()) +
+            " tarefa(s) falharam. Tentando novamente (max " +
+            std::to_string(max_retry) + " tentativas)...");
+        for (int tentativa = 1; tentativa <= max_retry; ++tentativa) {
+            long long falhas_antes = falhas.load();
+            // Re-coletar tarefas que falharam
+            std::vector<TarefaGen> retry_tarefas;
+            {
+                std::lock_guard<std::mutex> lk(g_stats_mtx);
+                for (size_t i = 0; i < tarefa_status.size(); ++i) {
+                    if (tarefa_status[i].falhou &&
+                        tarefa_status[i].tentativas < max_retry) {
+                        retry_tarefas.push_back(tarefas[i]);
+                        tarefa_status[i].tentativas++;
+                    }
+                }
+            }
+            if (retry_tarefas.empty()) break;
+            log("[RETRY] Tentativa " + std::to_string(tentativa) +
+                ": reprocessando " + std::to_string(retry_tarefas.size()) +
+                " tarefa(s)...");
+            for (const auto& rt : retry_tarefas) {
+                try {
+                    auto resultado = baixar_bloco_generico(
+                        rt.ds, rt.datas, rt.chave_existentes, rt.ctx);
+                    processar_generico(resultado, existentes, baixados, pulados,
+                                       requisicoes_ok, requisicoes_erro,
+                                       total_bytes);
+                    ++concluidos;
+                    --falhas;
+                    {
+                        std::lock_guard<std::mutex> lk(g_stats_mtx);
+                        if (rt.ds < tarefa_status.size()) {
+                            tarefa_status[rt.ds].falhou = false;
+                            tarefa_status[rt.ds].concluida = true;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    log(std::string("[RETRY] Falha persistente: ") + e.what());
+                }
+            }
+            long long falhas_depois = falhas.load();
+            if (falhas_depois >= falhas_antes) break; // sem progresso, para
+        }
+    }
+
+    // Salvar checkpoint final se houver
+    if (CFG.checkpoint_tarefas > 0) {
+        salvar_checkpoint(dataset_id, concluidos.load(), total, falhas.load());
+    }
+
     double tt = std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();
     char tt_buf[32];
     std::snprintf(tt_buf, sizeof(tt_buf), "%.1f", tt);
@@ -504,15 +738,40 @@ int executar_generico(const std::vector<std::string>& datas,
     log("DOWNLOAD CONCLUIDO: " + CFG.datasets[di_inicio].id);
     log("============================================================");
     log("Tempo: " + std::string(tt_buf) + "s");
-    log("Blocos processados: " + std::to_string(concluidos.load()) + "/" +
-        std::to_string(total) + "\n--- RESUMO ---");
+    log("Tarefas processadas: " + std::to_string(concluidos.load()) + "/" +
+        std::to_string(total) +
+        " | Falhas: " + std::to_string(falhas.load()) +
+        " | Sucesso: " +
+        std::to_string(concluidos.load() - falhas.load()) +
+        "\n--- RESUMO ---");
     for (size_t di = di_inicio; di < di_fim; ++di) {
         if (!dataset_generico(CFG.datasets[di]) || CFG.datasets[di].so_fallback) continue;
+        long long ok = requisicoes_ok[di].load();
+        long long err = requisicoes_erro[di].load();
+        double taxa = (ok + err) > 0
+                          ? (100.0 * (double)ok / (double)(ok + err))
+                          : 0.0;
         log(CFG.datasets[di].id + " (" + CFG.datasets[di].db + "." +
             CFG.datasets[di].tabela + "): " + std::to_string(baixados[di]) +
-            " registros novos | " + std::to_string(pulados[di]) + " ja existentes");
+            " registros novos | " + std::to_string(pulados[di]) +
+            " ja existentes | req OK=" + std::to_string(ok) +
+            " | req ERRO=" + std::to_string(err) +
+            " | taxa=" + std::to_string((int)taxa) + "%");
     }
     log("============================================================");
-    if (falhas.load() > 0) log("Falhas: " + std::to_string(falhas.load()));
+    if (CFG.estatisticas_detalhadas) {
+        double dec = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - inicio)
+                         .count();
+        double req_s = dec > 0.0 ? (double)concluidos.load() / dec : 0.0;
+        log("[ESTATISTICAS] " + std::to_string(concluidos.load()) +
+            " tarefas em " + std::to_string((int)dec) + "s = " +
+            std::to_string((int)(req_s * 10.0) / 10.0) + " req/s");
+    }
+    if (falhas.load() > 0) log("Falhas restantes: " + std::to_string(falhas.load()));
+    // Remover checkpoint se tudo concluiu com sucesso
+    if (falhas.load() == 0 && CFG.checkpoint_tarefas > 0) {
+        remover_checkpoint(dataset_id);
+    }
     return falhas.load() > 0 ? 1 : 0;
 }

@@ -627,6 +627,81 @@ std::string host_de_url(const std::string& url) {
     return url.substr(ini, fim == std::string::npos ? std::string::npos : fim - ini);
 }
 
+// Extrai o valor de um parametro de query de uma URL (ex: start_date=1980-08-06).
+static std::string extrair_param_url(const std::string& url, const std::string& param) {
+    size_t q = url.find('?');
+    if (q == std::string::npos) return "";
+    std::string query = url.substr(q + 1);
+    size_t pos = 0;
+    while (pos < query.size()) {
+        size_t amp = query.find('&', pos);
+        size_t fim = (amp == std::string::npos) ? query.size() : amp;
+        std::string par = query.substr(pos, fim - pos);
+        size_t eq = par.find('=');
+        if (eq != std::string::npos && par.substr(0, eq) == param) {
+            return par.substr(eq + 1);
+        }
+        pos = (amp == std::string::npos) ? query.size() : amp + 1;
+    }
+    return "";
+}
+
+// Substitui (ou adiciona, se nao existir) um parametro de query na URL.
+static std::string substituir_param_url(std::string url, const std::string& param,
+                                        const std::string& valor) {
+    size_t q = url.find('?');
+    std::string base, query;
+    if (q == std::string::npos) {
+        base = url;
+        query = "";
+    } else {
+        base = url.substr(0, q);
+        query = url.substr(q + 1);
+    }
+    std::string nova_query;
+    bool achou = false;
+    size_t pos = 0;
+    while (pos < query.size()) {
+        size_t amp = query.find('&', pos);
+        size_t fim = (amp == std::string::npos) ? query.size() : amp;
+        std::string par = query.substr(pos, fim - pos);
+        size_t eq = par.find('=');
+        if (eq != std::string::npos && par.substr(0, eq) == param) {
+            par = param + "=" + valor;
+            achou = true;
+        }
+        if (!nova_query.empty()) nova_query += "&";
+        nova_query += par;
+        pos = (amp == std::string::npos) ? query.size() : amp + 1;
+    }
+    if (!achou) {
+        if (!nova_query.empty()) nova_query += "&";
+        nova_query += param + "=" + valor;
+    }
+    return base + "?" + nova_query;
+}
+
+// Divide uma lista de datas em blocos de no max max_dias dias consecutivos.
+static std::vector<std::vector<std::string>> dividir_datas_em_blocos(
+    const std::vector<std::string>& datas, int max_dias) {
+    std::vector<std::vector<std::string>> blocos;
+    if (datas.empty() || max_dias < 1) return blocos;
+    std::vector<std::string> atual;
+    atual.push_back(datas[0]);
+    for (size_t i = 1; i < datas.size(); ++i) {
+        // Se a data e consecutiva (diferenca de 1 dia) e ainda cabe no bloco, adiciona.
+        // Para simplicidade, usamos contagem de elementos: quando o bloco atinge
+        // max_dias, fecha e inicia um novo.
+        if ((int)atual.size() >= max_dias) {
+            blocos.push_back(std::move(atual));
+            atual.clear();
+        }
+        atual.push_back(datas[i]);
+    }
+    if (!atual.empty()) blocos.push_back(std::move(atual));
+    return blocos;
+}
+
 std::vector<std::string> normalizar_candidatos(const std::vector<std::string>& entrada) {
     std::vector<std::string> out;
     for (const auto& item : entrada) {
@@ -828,6 +903,24 @@ std::optional<json> baixar_com_retry(const OpcoesRetry& op) {
         }
 
         std::string url_completa = montar_url(url_base, params_req);
+        const std::string host_atual = host_de_url(url_base);
+
+        // Controle de concorrencia por host: se ja ha max_concurrent_por_host
+        // requisicoes em voo para este host, aguarda um pouco e tenta outro
+        // candidato em vez de bloquear o worker.
+
+        // Host ocupado: tenta o próximo candidato (outra URL/chave) na mesma
+        // iteracao. Se todos estiverem ocupados, o loop cai no espera de cooldown.
+        if (!host_disponivel(host_atual)) continue;
+        // RAII: libera o host ao sair deste escopo (qualquer caminho de saida).
+        struct HostReserva {
+            std::string h;
+            ~HostReserva() {
+                liberar_host(h);
+            }
+        } guarda_host{host_atual};
+        reservar_host(host_atual);
+
         esperar_envio(grupo, op.custo);
         RespostaHttp r = http_requisicao(url_completa, req);
 
@@ -888,6 +981,52 @@ std::optional<json> baixar_com_retry(const OpcoesRetry& op) {
         if (!r.erro_rede) {
             if (r.status == 400 || r.status == 401 || r.status == 403 || r.status == 404) {
                 std::string motivo = r.corpo.substr(0, 300);
+                // Se a API rejeitou por "query size exceeds" (custo da consulta
+                // maior que o permitido) e o split estiver habilitado, dividimos
+                // as datas em blocos menores e tentamos cada um separadamente.
+                bool split_erro_quota = op.split_query_quota_excedida &&
+                    !op.datas.empty() && op.max_dias_por_requisicao > 0 &&
+                    (motivo.find("query size") != std::string::npos ||
+                     motivo.find("exceeds the maximum") != std::string::npos ||
+                     motivo.find("maxima") != std::string::npos);
+                if (split_erro_quota) {
+                    char buf[220];
+                    std::snprintf(buf, sizeof(buf),
+                                  "[INFO] Query excedeu quota (%s); dividindo datas em blocos de %d dias...",
+                                  motivo.c_str(), op.max_dias_por_requisicao);
+                    log(buf);
+                    auto blocos = dividir_datas_em_blocos(op.datas, op.max_dias_por_requisicao);
+                    json resultado = json::array();
+                    bool algum_sucesso = false;
+                    for (const auto& bloco : blocos) {
+                        // Monta novas URLs com start_date/end_date do bloco
+                        std::vector<std::string> novas_urls;
+                        for (const auto& u : op.urls) {
+                            std::string nu = substituir_param_url(u, "start_date", bloco.front());
+                            nu = substituir_param_url(nu, "end_date", bloco.back());
+                            novas_urls.push_back(nu);
+                        }
+                        OpcoesRetry sub_op = op;
+                        sub_op.urls = novas_urls;
+                        sub_op.datas = bloco;
+                        sub_op.split_query_quota_excedida = false; // evita recursao infinita
+                        sub_op.esgotou_429 = nullptr;
+                        auto sub_dados = baixar_com_retry(sub_op);
+                        if (sub_dados) {
+                            algum_sucesso = true;
+                            if (sub_dados->is_array()) {
+                                for (auto& el : *sub_dados) resultado.push_back(el);
+                            } else {
+                                resultado.push_back(*sub_dados);
+                            }
+                        }
+                    }
+                    if (algum_sucesso) {
+                        if (op.esgotou_429) *op.esgotou_429 = false;
+                        return resultado;
+                    }
+                    // Se nenhum bloco obteve sucesso, cai no log de erro abaixo.
+                }
                 log("[ERROR] HTTP " + std::to_string(r.status) +
                     " (sem retry): " + motivo + " :: " + url_completa);
                 if (op.esgotou_429) *op.esgotou_429 = false;

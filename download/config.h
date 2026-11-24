@@ -96,6 +96,10 @@ struct DatasetCfg {
     std::string modo_api = "auto";
     bool auto_importar_banco = false; // Importa para o banco SQLite se suportado
     bool evitar_download_se_no_banco = false; // Não baixa se dados já existirem no banco
+    int salvar_lote_tamanho = 1000;           // Registros acumulados antes de COMMIT no SQLite
+    int checkpoint_tarefas = 0;               // Salvar progresso a cada N tarefas (0 = desativado)
+    int retry_tarefas_falhadas = 3;           // Tentativas de retry para tarefas que falharam
+    bool estatisticas_detalhadas = true;      // Mostrar req/s, erro/s, taxa de sucesso
 
     // Suporte genérico a extração de mídias, links e arquivos em cascata (HTML, regex, JSON assets, M3U/M3U8)
     bool baixar_arquivos_vinculados = false; // Baixa URLs encontradas no corpo ou nos campos
@@ -139,7 +143,7 @@ struct Config {
     int max_sql_dates_por_lote = 900;
     int download_workers = 5;
     int process_workers = 2;
-    int chunk_dias = 30;
+    int chunk_dias = 1;
     double requests_per_second = 4.0;
     int max_retries = 8;
     double http_timeout = 120.0;
@@ -158,9 +162,17 @@ struct Config {
     double custo_dias_fator = 1.5;
     double cooldown_quota = 300.0;
     long long tamanho_max_bytes = 0; // Limite global (bytes). Dataset pode sobrescrever.
+    int max_dias_por_requisicao = 7;   // Max dias por chamada API (evita "query size exceeds")
+    bool split_query_quota_excedida = true; // Divide automaticamente quando 401 quota excedida
+    int max_concurrent_por_host = 2; // Max requisicoes concorrentes pelo mesmo host
+    int salvar_lote_tamanho = 1000;  // Registros acumulados antes de COMMIT no SQLite
+    int checkpoint_tarefas = 0;      // Salvar progresso a cada N tarefas (0 = desativado)
+    int retry_tarefas_falhadas = 3;  // Tentativas de retry para tarefas que falharam
+    bool estatisticas_detalhadas = true; // Mostrar req/s, erro/s, taxa de sucesso
     std::string api_keys;
     std::string api_key_param = "apikey";
     std::string fuso_horario = "America/Sao_Paulo";
+    std::string idioma = "auto"; // auto | pt | en | es
     std::string periodo_inicio = "1940-01-01";
     std::string periodo_fim = "2025-12-31";
 

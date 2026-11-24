@@ -34,6 +34,7 @@ find_package(Threads REQUIRED)
 
 add_executable(download
     download/main.cpp
+    download/i18n.cpp
     download/utils.cpp
     download/config.cpp
     download/rate_limit.cpp
@@ -59,6 +60,7 @@ target_link_libraries(clima_auditor PRIVATE SQLite3::SQLite3)
 add_executable(grib_import
     download/grib_main.cpp
     download/grib_importer.cpp
+    download/i18n.cpp
     download/utils.cpp
     download/config.cpp
 )
@@ -70,12 +72,14 @@ target_link_libraries(grib_import PRIVATE GDAL::GDAL SQLite3::SQLite3 Threads::T
 find_package(nlohmann_json CONFIG QUIET)
 if(nlohmann_json_FOUND)
     target_link_libraries(download PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(grib_import PRIVATE nlohmann_json::nlohmann_json)
 else()
     find_path(NLOHMANN_JSON_INCLUDE_DIR NAMES nlohmann/json.hpp)
     if(NOT NLOHMANN_JSON_INCLUDE_DIR)
         message(FATAL_ERROR "nlohmann/json.hpp nao encontrado. Instale mingw-w64-x86_64-nlohmann-json (MSYS2).")
     endif()
     target_include_directories(download PRIVATE ${NLOHMANN_JSON_INCLUDE_DIR})
+    target_include_directories(grib_import PRIVATE ${NLOHMANN_JSON_INCLUDE_DIR})
 endif()
 
 # db_manager.exe - visualizador grafico generico SQLite Dear ImGui + DirectX 11
@@ -108,9 +112,11 @@ target_link_libraries(db_manager PRIVATE
 # Copia executaveis para a raiz do projeto para conveniencia
 add_custom_command(TARGET download POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:download> ${CMAKE_SOURCE_DIR}/download.exe
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/i18n $<TARGET_FILE_DIR:download>/i18n
 )
 add_custom_command(TARGET grib_import POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:grib_import> ${CMAKE_SOURCE_DIR}/grib_import.exe
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/i18n $<TARGET_FILE_DIR:grib_import>/i18n
 )
 add_custom_command(TARGET clima_auditor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:clima_auditor> ${CMAKE_SOURCE_DIR}/clima_auditor.exe

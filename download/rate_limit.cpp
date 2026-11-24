@@ -18,6 +18,7 @@ static std::chrono::steady_clock::time_point g_cooldown_fim;
 static int g_429_consecutivos = 0;
 static std::map<std::string, std::chrono::steady_clock::time_point> g_ep_cooldown;
 static std::map<std::string, std::chrono::steady_clock::time_point> g_chave_cooldown;
+static std::map<std::string, int> g_host_concurrent; // host -> requisicoes em voo
 
 // O cooldown vale por HOST: a cota de 429 costuma ser por host/IP e a URL
 // do bloco muda a cada intervalo (ex: {start}/{end} do fallback), entao
@@ -89,6 +90,7 @@ void iniciar_rate_limit() {
     g_orcamento.clear();
     g_ep_cooldown.clear();
     g_chave_cooldown.clear();
+    g_host_concurrent.clear();
 }
 
 void dormir(double segundos) {
@@ -219,4 +221,24 @@ double backoff_exponencial(int tentativa) {
     std::uniform_real_distribution<double> dist(0.5, 1.5);
     double bruto = CFG.backoff_inicial * std::pow(2.0, tentativa - 1);
     return std::min(CFG.backoff_maximo, bruto * dist(rng_thread_local()));
+}
+
+bool host_disponivel(const std::string& host) {
+    std::lock_guard<std::mutex> lk(g_rate_mtx);
+    auto it = g_host_concurrent.find(host);
+    int ativo = (it == g_host_concurrent.end()) ? 0 : it->second;
+    return ativo < CFG.max_concurrent_por_host;
+}
+
+void reservar_host(const std::string& host) {
+    std::lock_guard<std::mutex> lk(g_rate_mtx);
+    g_host_concurrent[host]++;
+}
+
+void liberar_host(const std::string& host) {
+    std::lock_guard<std::mutex> lk(g_rate_mtx);
+    auto it = g_host_concurrent.find(host);
+    if (it != g_host_concurrent.end() && it->second > 0) {
+        if (--it->second == 0) g_host_concurrent.erase(it);
+    }
 }

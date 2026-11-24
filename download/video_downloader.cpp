@@ -1,5 +1,6 @@
 #include "video_downloader.h"
 #include "http_client.h"
+#include "i18n.h"
 #include "rate_limit.h"
 #include "utils.h"
 #include <nlohmann/json.hpp>
@@ -477,7 +478,7 @@ namespace {
 
         const auto& escolhida = variantes.front();
         if (escolhida.altura > 0) {
-            std::cout << "[STREAM] Qualidade selecionada: " << escolhida.altura << "p ("
+            i18n::cout << "[STREAM] Qualidade selecionada: " << escolhida.altura << "p ("
                     << escolhida.resolucao << ", " << (escolhida.bandwidth / 1000) << " kbps)\n";
         }
         return escolhida.uri;
@@ -573,7 +574,7 @@ bool verificar_se_video_ja_existe(const fs::path& pasta,
         }
         for (const auto& c : candidatos) {
             if (fs::exists(c, ec) && fs::file_size(c, ec) > 1024) {
-                std::cout << "[EXISTE] Arquivo ja baixado anteriormente: " << c.string()
+                i18n::cout << "[EXISTE] Arquivo ja baixado anteriormente: " << c.string()
                           << " (" << formatar_bytes(fs::file_size(c, ec)) << "). Pulando download.\n";
                 return true;
             }
@@ -625,7 +626,7 @@ bool verificar_se_video_ja_existe(const fs::path& pasta,
             for (const auto& ext : {".mp4", ".ts", ".mkv", ".webm"}) {
                 fs::path p_cand = pasta / (s_cand + ext);
                 if (fs::exists(p_cand, ec) && fs::file_size(p_cand, ec) > 1024) {
-                    std::cout << "[EXISTE] Episodio " << ep_num << " ja baixado anteriormente: "
+                    i18n::cout << "[EXISTE] Episodio " << ep_num << " ja baixado anteriormente: "
                               << p_cand.string() << " ("
                               << formatar_bytes(fs::file_size(p_cand, ec)) << "). Pulando download.\n";
                     return true;
@@ -667,7 +668,7 @@ bool verificar_se_video_ja_existe(const fs::path& pasta,
                              fn.find(" " + ep_pad_str + ".") != std::string::npos);
 
             if (mesmo_anime && mesmo_ep) {
-                std::cout << "[EXISTE] Episodio " << ep_num << " ja baixado anteriormente: "
+                i18n::cout << "[EXISTE] Episodio " << ep_num << " ja baixado anteriormente: "
                           << entry.path().filename().string() << " ("
                           << formatar_bytes(fs::file_size(entry.path(), ec)) << "). Pulando download.\n";
                 return true;
@@ -680,7 +681,7 @@ bool verificar_se_video_ja_existe(const fs::path& pasta,
 
 bool baixar_video(const OpcoesVideo& op) {
     if (op.url.empty()) {
-        std::cerr << "[ERRO] URL de vídeo vazia informada.\n";
+        i18n::cerr << "[ERRO] URL de vídeo vazia informada.\n";
         return false;
     }
 
@@ -689,10 +690,10 @@ bool baixar_video(const OpcoesVideo& op) {
     std::error_code ec;
     fs::create_directories(pasta_saida, ec);
 
-    std::cout << "\n============================================================\n";
-    std::cout << "[VIDEO DOWNLOADER] Processando link: " << op.url << "\n";
-    std::cout << "Diretório de destino: " << pasta_saida.string() << "\n";
-    std::cout << "============================================================\n";
+    i18n::cout << "\n============================================================\n";
+    i18n::cout << "[VIDEO DOWNLOADER] Processando link: " << op.url << "\n";
+    i18n::cout << "Diretório de destino: " << pasta_saida.string() << "\n";
+    i18n::cout << "============================================================\n";
 
     // 0. Verifica antecipadamente se o vídeo/episódio já existe no destino
     if (verificar_se_video_ja_existe(pasta_saida, op.nome_arquivo, op.url)) {
@@ -707,21 +708,21 @@ bool baixar_video(const OpcoesVideo& op) {
     if (!eh_midia_direta(op.url)) {
         std::string node_exe = localizar_node();
         if (node_exe.empty()) {
-            std::cerr << "[ERRO] Node.js não foi encontrado no sistema (necessário para extrair links dinâmicos como enma.lol).\n";
+            i18n::cerr << "[ERRO] Node.js não foi encontrado no sistema (necessário para extrair links dinâmicos como enma.lol).\n";
             return false;
         }
 
         std::string extrator = obter_caminho_extrator();
         if (extrator.empty()) {
-            std::cerr << "[ERRO] Não foi possível preparar o script extrator.\n";
+            i18n::cerr << "[ERRO] Não foi possível preparar o script extrator.\n";
             return false;
         }
 
-        std::cout << "[EXTRATOR] Resolvendo stream de vídeo via navegador headless...\n";
+        i18n::cout << "[EXTRATOR] Resolvendo stream de vídeo via navegador headless...\n";
         std::string cmd = "\"\"" + node_exe + "\" \"" + extrator + "\" \"" + op.url + "\"\"";
         FILE* pipe = POPEN_FN(cmd.c_str(), "r");
         if (!pipe) {
-            std::cerr << "[ERRO] Falha ao iniciar processo do extrator.\n";
+            i18n::cerr << "[ERRO] Falha ao iniciar processo do extrator.\n";
             return false;
         }
 
@@ -736,13 +737,13 @@ bool baixar_video(const OpcoesVideo& op) {
         try {
             j = json::parse(saida_json);
         } catch (...) {
-            std::cerr << "[ERRO] Resposta inválida do extrator: " << saida_json << "\n";
+            i18n::cerr << "[ERRO] Resposta inválida do extrator: " << saida_json << "\n";
             return false;
         }
 
         if (status_pipe != 0 || !j.value("ok", false)) {
             std::string err_msg = j.value("error", "Falha desconhecida na extração do vídeo");
-            std::cerr << "[ERRO] " << err_msg << "\n";
+            i18n::cerr << "[ERRO] " << err_msg << "\n";
             return false;
         }
 
@@ -756,8 +757,8 @@ bool baixar_video(const OpcoesVideo& op) {
         std::string origin = j.value("origin", "");
         if (!origin.empty()) headers_stream["Origin"] = origin;
 
-        std::cout << "[OK] Stream capturado com sucesso!\n";
-        std::cout << "     Título: " << (titulo_video.empty() ? "(padrão)" : titulo_video) << "\n";
+        i18n::cout << "[OK] Stream capturado com sucesso!\n";
+        i18n::cout << "     Título: " << (titulo_video.empty() ? i18n::t("(padrão)") : titulo_video) << "\n";
 
         // Checagem imediata se o arquivo final já existe após obtenção do título
         if (!titulo_video.empty()) {
@@ -765,12 +766,12 @@ bool baixar_video(const OpcoesVideo& op) {
             fs::path f_mp4 = pasta_saida / (nb + ".mp4");
             fs::path f_ts = pasta_saida / (nb + ".ts");
             if (fs::exists(f_mp4, ec) && fs::file_size(f_mp4, ec) > 1024) {
-                std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << f_mp4.string()
+                i18n::cout << "[EXISTE] Vídeo já baixado anteriormente: " << f_mp4.string()
                           << " (" << formatar_bytes(fs::file_size(f_mp4, ec)) << "). Pulando download.\n";
                 return true;
             }
             if (fs::exists(f_ts, ec) && fs::file_size(f_ts, ec) > 1024) {
-                std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << f_ts.string()
+                i18n::cout << "[EXISTE] Vídeo já baixado anteriormente: " << f_ts.string()
                           << " (" << formatar_bytes(fs::file_size(f_ts, ec)) << "). Pulando download.\n";
                 return true;
             }
@@ -791,7 +792,7 @@ bool baixar_video(const OpcoesVideo& op) {
 
         fs::path dest = pasta_saida / nome_final;
         if (fs::exists(dest, ec) && fs::file_size(dest, ec) > 1024) {
-            std::cout << "[EXISTE] Arquivo de vídeo já existe: " << dest.string()
+            i18n::cout << "[EXISTE] Arquivo de vídeo já existe: " << dest.string()
                       << " (" << formatar_bytes(fs::file_size(dest, ec)) << "). Pulando download.\n";
             return true;
         }
@@ -802,25 +803,25 @@ bool baixar_video(const OpcoesVideo& op) {
         dl_op.headers = headers_stream;
         dl_op.progresso = true;
 
-        std::cout << "[DOWNLOAD] Baixando arquivo de mídia direto: " << nome_final << "\n";
+        i18n::cout << "[DOWNLOAD] Baixando arquivo de mídia direto: " << nome_final << "\n";
         ResultadoDownload r = http_baixar_arquivo(dl_op);
         if (r.ok) {
-            std::cout << "\n[SUCESSO] Vídeo baixado com sucesso: " << dest.string()
+            i18n::cout << "\n[SUCESSO] Vídeo baixado com sucesso: " << dest.string()
                       << " (" << formatar_bytes(r.bytes) << ")\n";
             return true;
         }
-        std::cerr << "\n[ERRO] Falha no download do vídeo: " << r.erro << "\n";
+        i18n::cerr << "\n[ERRO] Falha no download do vídeo: " << r.erro << "\n";
         return false;
     }
 
     // Processamento de Stream HLS (.m3u8)
-    std::cout << "[HLS] Baixando playlist m3u8...\n";
+    i18n::cout << "[HLS] Baixando playlist m3u8...\n";
     OpcoesHttp req_op;
     req_op.headers = headers_stream;
     req_op.timeout_sec = 30.0;
     RespostaHttp resp_m3u8 = http_requisicao(stream_url, req_op);
     if (resp_m3u8.erro_rede || resp_m3u8.status < 200 || resp_m3u8.status >= 300 || resp_m3u8.corpo.empty()) {
-        std::cerr << "[ERRO] Falha ao obter playlist m3u8 (HTTP " << resp_m3u8.status << ")\n";
+        i18n::cerr << "[ERRO] Falha ao obter playlist m3u8 (HTTP " << resp_m3u8.status << ")\n";
         return false;
     }
 
@@ -835,7 +836,7 @@ bool baixar_video(const OpcoesVideo& op) {
             if (resp_var.status >= 200 && resp_var.status < 300 && !resp_var.corpo.empty()) {
                 media_conteudo = resp_var.corpo;
             } else {
-                std::cerr << "[ERRO] Falha ao baixar variante HLS selecionada.\n";
+                i18n::cerr << "[ERRO] Falha ao baixar variante HLS selecionada.\n";
                 return false;
             }
         }
@@ -843,12 +844,12 @@ bool baixar_video(const OpcoesVideo& op) {
 
     InfoStreamHLS stream_info;
     if (!analisar_media_playlist(media_conteudo, media_playlist_url, stream_info)) {
-        std::cerr << "[ERRO] Não foi possível extrair segmentos da playlist HLS.\n";
+        i18n::cerr << "[ERRO] Não foi possível extrair segmentos da playlist HLS.\n";
         return false;
     }
 
     size_t total_segmentos = stream_info.segmentos.size();
-    std::cout << "[HLS] " << total_segmentos << " segmentos encontrados na playlist.\n";
+    i18n::cout << "[HLS] " << total_segmentos << " segmentos encontrados na playlist.\n";
 
     // Nome base do arquivo de saída
     std::string nome_base = titulo_video;
@@ -862,12 +863,12 @@ bool baixar_video(const OpcoesVideo& op) {
     fs::path final_mp4 = pasta_saida / (nome_base + ".mp4");
     fs::path final_ts = pasta_saida / (nome_base + ".ts");
     if (fs::exists(final_mp4, ec) && fs::file_size(final_mp4, ec) > 1024) {
-        std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << final_mp4.string()
+        i18n::cout << "[EXISTE] Vídeo já baixado anteriormente: " << final_mp4.string()
                   << " (" << formatar_bytes(fs::file_size(final_mp4, ec)) << "). Pulando download.\n";
         return true;
     }
     if (fs::exists(final_ts, ec) && fs::file_size(final_ts, ec) > 1024) {
-        std::cout << "[EXISTE] Vídeo já baixado anteriormente: " << final_ts.string()
+        i18n::cout << "[EXISTE] Vídeo já baixado anteriormente: " << final_ts.string()
                   << " (" << formatar_bytes(fs::file_size(final_ts, ec)) << "). Pulando download.\n";
         return true;
     }
@@ -884,7 +885,7 @@ bool baixar_video(const OpcoesVideo& op) {
             if (r_key.status == 200 && r_key.corpo.size() == 16) {
                 cache_chaves[seg.key_uri] = std::vector<uint8_t>(r_key.corpo.begin(), r_key.corpo.end());
             } else {
-                std::cerr << "[AVISO] Falha ao obter chave AES-128 para o stream.\n";
+                i18n::cerr << "[AVISO] Falha ao obter chave AES-128 para o stream.\n";
             }
         }
     }
@@ -901,7 +902,7 @@ bool baixar_video(const OpcoesVideo& op) {
     auto t_inicio = std::chrono::steady_clock::now();
     std::mutex mtx_log;
 
-    std::cout << "[DOWNLOAD] Baixando " << total_segmentos << " segmentos com "
+    i18n::cout << "[DOWNLOAD] Baixando " << total_segmentos << " segmentos com "
               << workers_count << " workers...\n";
 
     std::vector<std::thread> workers;
@@ -973,9 +974,11 @@ bool baixar_video(const OpcoesVideo& op) {
                         double pct = (double)cnt * 100.0 / (double)total_segmentos;
                         double vel_mbs = (segs > 0) ? ((double)total_bytes_baixados.load() / (1024.0 * 1024.0 * segs)) : 0.0;
                         std::lock_guard<std::mutex> lock(mtx_log);
-                        std::cout << "\r[HLS] " << cnt << "/" << total_segmentos
-                                  << " (" << std::fixed << std::setprecision(1) << pct << "%) "
-                                  << std::setprecision(2) << vel_mbs << " MB/s   " << std::flush;
+                        std::ostringstream linha_progresso;
+                        linha_progresso << "\r[HLS] " << cnt << "/" << total_segmentos
+                                        << " (" << std::fixed << std::setprecision(1) << pct << "%) "
+                                        << std::setprecision(2) << vel_mbs << " MB/s   ";
+                        i18n::cout << linha_progresso.str() << std::flush;
                     }
                 } else {
                     falhas.fetch_add(1);
@@ -985,18 +988,18 @@ bool baixar_video(const OpcoesVideo& op) {
     }
 
     for (auto& t : workers) t.join();
-    std::cout << "\n";
+    i18n::cout << "\n";
 
     if (falhas.load() > (total_segmentos / 20)) { // mais de 5% de falhas
-        std::cerr << "[ERRO] Muitos segmentos falharam no download (" << falhas.load() << "). Abortando união.\n";
+        i18n::cerr << "[ERRO] Muitos segmentos falharam no download (" << falhas.load() << "). Abortando união.\n";
         return false;
     }
 
-    std::cout << "[STITCH] Unindo " << baixados.load() << " segmentos no arquivo final...\n";
+    i18n::cout << "[STITCH] Unindo " << baixados.load() << " segmentos no arquivo final...\n";
     fs::path ts_saida = pasta_saida / (nome_base + ".ts");
     std::ofstream out_ts(ts_saida, std::ios::binary);
     if (!out_ts) {
-        std::cerr << "[ERRO] Não foi possível criar arquivo .ts final: " << ts_saida.string() << "\n";
+        i18n::cerr << "[ERRO] Não foi possível criar arquivo .ts final: " << ts_saida.string() << "\n";
         return false;
     }
 
@@ -1024,25 +1027,25 @@ bool baixar_video(const OpcoesVideo& op) {
     std::string ffmpeg_exe = localizar_ffmpeg();
     if (!ffmpeg_exe.empty()) {
         fs::path mp4_saida = pasta_saida / (nome_base + ".mp4");
-        std::cout << "[FFMPEG] Remuxando para MP4 sem perda de qualidade...\n";
+        i18n::cout << "[FFMPEG] Remuxando para MP4 sem perda de qualidade...\n";
         std::string cmd_ffmpeg = "\"\"" + ffmpeg_exe + "\" -y -hide_banner -loglevel warning -fflags +genpts -i \"" +
                                  ts_saida.string() + "\" -c copy \"" + mp4_saida.string() + "\"\"";
         int r_ff = std::system(cmd_ffmpeg.c_str());
         if (r_ff == 0 && fs::exists(mp4_saida, ec) && fs::file_size(mp4_saida, ec) > 1024) {
             fs::remove(ts_saida, ec);
             long long mp4_size = fs::file_size(mp4_saida, ec);
-            std::cout << "\n============================================================\n";
-            std::cout << "[SUCESSO] Vídeo concluído: " << mp4_saida.string() << "\n";
-            std::cout << "Tamanho final: " << formatar_bytes(mp4_size) << "\n";
-            std::cout << "============================================================\n";
+            i18n::cout << "\n============================================================\n";
+            i18n::cout << "[SUCESSO] Vídeo concluído: " << mp4_saida.string() << "\n";
+            i18n::cout << "Tamanho final: " << formatar_bytes(mp4_size) << "\n";
+            i18n::cout << "============================================================\n";
             return true;
         }
     }
 
-    std::cout << "\n============================================================\n";
-    std::cout << "[SUCESSO] Vídeo MPEG-TS concluído: " << ts_saida.string() << "\n";
-    std::cout << "Tamanho final: " << formatar_bytes(ts_size) << "\n";
-    std::cout << "============================================================\n";
+    i18n::cout << "\n============================================================\n";
+    i18n::cout << "[SUCESSO] Vídeo MPEG-TS concluído: " << ts_saida.string() << "\n";
+    i18n::cout << "Tamanho final: " << formatar_bytes(ts_size) << "\n";
+    i18n::cout << "============================================================\n";
     return true;
 }
 
@@ -1060,20 +1063,20 @@ void executar_dataset_video(const DatasetCfg& ds) {
     if (!ds.url.empty()) urls.push_back(ds.url);
 
     if (urls.empty()) {
-        std::cerr << "[ERRO] Dataset de vídeo " << ds.id << " não possui URL configurada.\n";
+        i18n::cerr << "[ERRO] Dataset de vídeo " << ds.id << " não possui URL configurada.\n";
         return;
     }
 
-    std::cout << "\n============================================================\n";
-    std::cout << "[DATASET VIDEO] " << ds.id << ": Baixando " << urls.size() << " episódios/vídeos...\n";
-    std::cout << "Pasta de saída: " << pasta << "\n";
-    std::cout << "============================================================\n";
+    i18n::cout << "\n============================================================\n";
+    i18n::cout << "[DATASET VIDEO] " << ds.id << ": Baixando " << urls.size() << " episódios/vídeos...\n";
+    i18n::cout << "Pasta de saída: " << pasta << "\n";
+    i18n::cout << "============================================================\n";
 
     std::error_code ec;
     size_t idx = 0;
     for (const auto& u : urls) {
         ++idx;
-        std::cout << "\n>>> [" << idx << "/" << urls.size() << "] " << u << "\n";
+        i18n::cout << "\n>>> [" << idx << "/" << urls.size() << "] " << u << "\n";
         OpcoesVideo op;
         op.url = u;
         op.pasta_saida = pasta;
@@ -1099,7 +1102,7 @@ void executar_dataset_video(const DatasetCfg& ds) {
         fs::path caminho_ts = caminho_mp4;
         caminho_ts.replace_extension(".ts");
         if (fs::exists(caminho_mp4, ec) || fs::exists(caminho_ts, ec)) {
-            std::cout << "[SKIP] Arquivo já existe, ignorando: " << caminho_mp4.filename().string() << "\n";
+            i18n::cout << "[SKIP] Arquivo já existe, ignorando: " << caminho_mp4.filename().string() << "\n";
             continue;
         }
 

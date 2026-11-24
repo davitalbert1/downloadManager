@@ -1,6 +1,8 @@
 #include "config.h"
+#include "i18n.h"
 #include "utils.h"
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <initializer_list>
@@ -134,7 +136,7 @@ Ini ler_ini(const std::string& caminho) {
     Ini ini;
     std::ifstream arquivo(caminho);
     if (!arquivo) {
-        std::cerr << "[WARNING] Arquivo de configuracao nao encontrado: " << caminho
+        i18n::cerr << "[WARNING] Arquivo de configuracao nao encontrado: " << caminho
                   << " (usando valores padrao)\n";
         return ini;
     }
@@ -622,7 +624,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         bool eh_wiki = (d.tipo_saida == "wikipedia" || d.tipo_saida == "wiki");
         bool eh_video = (d.tipo_saida == "video" || d.tipo_saida == "stream");
         if (d.url.empty() && !eh_drive && !eh_wiki && !eh_video && d.lista_urls.empty()) {
-            std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
+            i18n::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
 
@@ -667,6 +669,21 @@ void carregar_config(const std::string& caminho) {
     le_dbl("cooldown_429", "COOLDOWN_429", "OPENMETEO_COOLDOWN_429", CFG.cooldown_429);
     le_int("circuit_limit_429", "CIRCUIT_LIMIT_429", "OPENMETEO_429_CIRCUIT_LIMIT", CFG.circuit_limit_429);
     le_dbl("espera_min_429", "ESPERA_MIN_429", "OPENMETEO_429_ESPERA_MIN", CFG.espera_min_429);
+    le_int("max_dias_por_requisicao", "MAX_DIAS_POR_REQUISICAO", "OPENMETEO_MAX_DIAS_POR_REQ", CFG.max_dias_por_requisicao);
+    {
+        int _tmp = CFG.split_query_quota_excedida ? 1 : 0;
+        le_int("split_query_quota_excedida", "SPLIT_QUERY_QUOTA_EXCEDIDA", "OPENMETEO_SPLIT_QUERY_QUOTA", _tmp);
+        CFG.split_query_quota_excedida = _tmp != 0;
+    }
+    le_int("max_concurrent_por_host", "MAX_CONCURRENT_POR_HOST", "OPENMETEO_MAX_CONCURRENT_HOST", CFG.max_concurrent_por_host);
+    le_int("salvar_lote_tamanho", "SALVAR_LOTE_TAMANHO", "OPENMETEO_SALVAR_LOTE", CFG.salvar_lote_tamanho);
+    le_int("checkpoint_tarefas", "CHECKPOINT_TAREFAS", "OPENMETEO_CHECKPOINT", CFG.checkpoint_tarefas);
+    le_int("retry_tarefas_falhadas", "RETRY_TAREFAS_FALHADAS", "OPENMETEO_RETRY_FALHADAS", CFG.retry_tarefas_falhadas);
+    {
+        int _tmp = CFG.estatisticas_detalhadas ? 1 : 0;
+        le_int("estatisticas_detalhadas", "ESTATISTICAS_DETALHADAS", "OPENMETEO_ESTATISTICAS", _tmp);
+        CFG.estatisticas_detalhadas = _tmp != 0;
+    }
     le_dbl("limite_minuto", "LIMITE_MINUTO", "OPENMETEO_LIMITE_MINUTO", CFG.limite_minuto);
     le_dbl("limite_hora", "LIMITE_HORA", "OPENMETEO_LIMITE_HORA", CFG.limite_hora);
     le_dbl("limite_dia", "LIMITE_DIA", "OPENMETEO_LIMITE_DIA", CFG.limite_dia);
@@ -677,6 +694,7 @@ void carregar_config(const std::string& caminho) {
     le_texto("api_keys", CFG.api_keys);
     le_texto("api_key_param", CFG.api_key_param);
     le_texto("fuso_horario", CFG.fuso_horario);
+    le_texto("idioma", CFG.idioma);
     le_texto("periodo_inicio", CFG.periodo_inicio);
     le_texto("periodo_fim", CFG.periodo_fim);
     { // limite global de tamanho (vale p/ todos os datasets que nao definirem o proprio)
@@ -698,18 +716,26 @@ void carregar_config(const std::string& caminho) {
     auto coord_linhas = ini.lista("coordenadas");
     if (coord_linhas.empty()) coord_linhas = ini.lista("coordinates");
     if (!coord_linhas.empty()) {
+        auto numero = [](const std::string& s, double& out) {
+            const char* inicio = s.c_str();
+            char* fim = nullptr;
+            out = std::strtod(inicio, &fim);
+            if (fim == inicio) return false;
+            while (*fim && std::isspace(static_cast<unsigned char>(*fim))) ++fim;
+            return *fim == '\0';
+        };
         std::vector<std::pair<double, double>> coords;
-        for (const auto& l : coord_linhas) {
+        for (size_t i = 0; i < coord_linhas.size(); ++i) {
+            const auto& l = coord_linhas[i];
             auto partes = dividir(l, ',');
-            if (partes.size() < 2) {
-                std::cerr << "[WARNING] Coordenada invalida ignorada: " << l << "\n";
+            double lat = 0.0, lon = 0.0;
+            if (partes.size() >= 2 && numero(partes[0], lat) && numero(partes[1], lon)) {
+                coords.emplace_back(lat, lon);
                 continue;
             }
-            try {
-                coords.emplace_back(std::stod(partes[0]), std::stod(partes[1]));
-            } catch (...) {
-                std::cerr << "[WARNING] Coordenada invalida ignorada: " << l << "\n";
-            }
+            // A primeira linha pode ser o cabecalho documental ("latitude, longitude").
+            if (i == 0) continue;
+            i18n::cerr << "[WARNING] Coordenada invalida ignorada: " << l << "\n";
         }
         CFG.coordenadas = std::move(coords);
     }
@@ -729,7 +755,7 @@ void carregar_config(const std::string& caminho) {
             if (!partes.empty()) dim.linhas.push_back(std::move(partes));
         }
         if (dim.linhas.empty()) {
-            std::cerr << "[WARNING] Dimensao '" << dim.nome << "' vazia, ignorada.\n";
+            i18n::cerr << "[WARNING] Dimensao '" << dim.nome << "' vazia, ignorada.\n";
             continue;
         }
         CFG.dimensoes.push_back(std::move(dim));
@@ -748,15 +774,20 @@ void carregar_config(const std::string& caminho) {
     if (CFG.custo_dias_ref <= 0.0) CFG.custo_dias_ref = 14.0;
     if (CFG.custo_dias_fator <= 0.0) CFG.custo_dias_fator = 1.5;
     if (CFG.cooldown_quota <= 0.0) CFG.cooldown_quota = 300.0;
+    if (CFG.max_dias_por_requisicao < 1) CFG.max_dias_por_requisicao = 7;
+    if (CFG.max_concurrent_por_host < 1) CFG.max_concurrent_por_host = 2;
     if (CFG.api_key_param.empty()) CFG.api_key_param = "apikey";
+    if (CFG.salvar_lote_tamanho < 1) CFG.salvar_lote_tamanho = 1000;
+    if (CFG.checkpoint_tarefas < 0) CFG.checkpoint_tarefas = 0;
+    if (CFG.retry_tarefas_falhadas < 0) CFG.retry_tarefas_falhadas = 3;
     if (CFG.min_rps <= 0.0) CFG.min_rps = CFG.requests_per_second * 0.1;
     if (CFG.min_rps > CFG.requests_per_second) CFG.min_rps = CFG.requests_per_second;
     CFG.datasets = montar_datasets_genericos(ini);
-    std::cout << "[CFG] download_workers=" << CFG.download_workers
+    i18n::cout << "[CFG] download_workers=" << CFG.download_workers
               << " process_workers=" << CFG.process_workers
               << " (fonte: " << caminho << ")\n";
     if (CFG.tamanho_max_bytes > 0)
-        std::cout << "[CFG] tamanho_max_bytes global=" << formatar_bytes(CFG.tamanho_max_bytes)
+        i18n::cout << "[CFG] tamanho_max_bytes global=" << formatar_bytes(CFG.tamanho_max_bytes)
                   << " (" << CFG.tamanho_max_bytes << " bytes)\n";
     for (auto& d : CFG.datasets) {
         if (d.db.empty()) d.db = CFG.db_path;

@@ -2,6 +2,7 @@
 #include "engine_generico.h"
 #include "file_dataset.h"
 #include "google_drive.h"
+#include "i18n.h"
 #include "rate_limit.h"
 #include "storage_sqlite.h"
 #include "utils.h"
@@ -30,7 +31,20 @@ int main(int argc, char** argv) {
     std::string pasta_saida_cli;
     std::string nome_arquivo_cli;
     std::string qualidade_cli;
+    std::string idioma_cli;
     int max_workers_cli = 0;
+
+    carregar_env(".env");
+
+    // O idioma precisa estar definido antes de qualquer mensagem, inclusive
+    // no --help; por isso lemos --lang antes do laço principal de argumentos.
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "-l" || arg == "--lang" || arg == "--idioma") && i + 1 < argc) {
+            idioma_cli = argv[i + 1];
+        }
+    }
+    i18n::iniciar(idioma_cli);
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -40,16 +54,20 @@ int main(int argc, char** argv) {
         });
 
         if (arg == "-h" || arg == "--help") {
-            std::cout << "Uso:\n"
-                      << "  download.exe <url_ou_link_video> [-o pasta_saida] [-n nome_arquivo] [-q qualidade]\n"
-                      << "  download.exe [caminho_config.ini] [-d dataset_id] [dataset1,dataset2]\n"
-                      << "\nExemplos de Download de Video:\n"
-                      << "  download.exe https://www.enma.lol/watch/k-on-5680?ep=1\n"
-                      << "  download.exe https://www.enma.lol/watch/k-on-5680?ep=1 -o videos/k_on\n"
-                      << "  download.exe https://example.com/stream.m3u8 -o videos -n meu_video\n"
-                      << "\nExemplos de Datasets e APIs:\n"
-                      << "  download.exe download.ini -d clima_diario\n";
+            i18n::cout << "Uso:\n"
+                       << "  download.exe <url_ou_link_video> [-o pasta_saida] [-n nome_arquivo] [-q qualidade]\n"
+                       << "  download.exe [caminho_config.ini] [-d dataset_id] [dataset1,dataset2]\n"
+                       << "\nExemplos de Download de Video:\n"
+                       << "  download.exe https://www.enma.lol/watch/k-on-5680?ep=1\n"
+                       << "  download.exe https://www.enma.lol/watch/k-on-5680?ep=1 -o videos/k_on\n"
+                       << "  download.exe https://example.com/stream.m3u8 -o videos -n meu_video\n"
+                       << "\nExemplos de Datasets e APIs:\n"
+                       << "  download.exe download.ini -d clima_diario\n"
+                       << "\nOpcoes gerais:\n"
+                       << "  -l, --lang <pt|en|es>  Idioma da interface (padrao: auto)\n";
             return 0;
+        } else if (arg == "-l" || arg == "--lang" || arg == "--idioma") {
+            if (i + 1 < argc) ++i; // valor já lido no pré-scan
         } else if (arg == "-u" || arg == "--url") {
             if (i + 1 < argc) urls_diretas.push_back(argv[++i]);
         } else if (arg == "-o" || arg == "--pasta" || arg == "--output" || arg == "--out") {
@@ -76,8 +94,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    carregar_env(".env");
-
     // Se foram informadas URLs diretas via linha de comando (ex: links do enma.lol, streams ou vídeos diretos)
     if (!urls_diretas.empty()) {
         CurlGlobal curl_guard;
@@ -98,6 +114,11 @@ int main(int argc, char** argv) {
     }
     carregar_config(caminho_ini);
 
+    // Precedência: --lang > download.ini ([geral] idioma) > ambiente.
+    if (idioma_cli.empty() && !CFG.idioma.empty() && CFG.idioma != "auto") {
+        i18n::definir_idioma(CFG.idioma);
+    }
+
     if (!filtros_secao.empty()) {
         std::vector<DatasetCfg> filtrados;
         for (const auto& ds : CFG.datasets) {
@@ -116,7 +137,7 @@ int main(int argc, char** argv) {
     }
 
     if (CFG.datasets.empty()) {
-        std::cerr << "[ERROR] Nenhum dataset correspondente encontrado em " << caminho_ini << "\n";
+        i18n::cerr << "[ERROR] Nenhum dataset correspondente encontrado em " << caminho_ini << "\n";
         return 1;
     }
 
@@ -141,7 +162,7 @@ int main(int argc, char** argv) {
             if (tem_datas) {
                 datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
                 if (!datas.empty()) {
-                    std::cout << "============================================================\n"
+                    i18n::cout << "============================================================\n"
                               << "DOWNLOAD GENERICO DE DADOS E APIS\n"
                               << "============================================================\n"
                               << "Configuracao: " << caminho_ini << "\n"
@@ -150,7 +171,7 @@ int main(int argc, char** argv) {
                               << "download_workers: " << CFG.download_workers
                               << " | process_workers: " << CFG.process_workers << "\n";
 
-                    std::cout << "\n[DB] Carregando registros existentes...\n";
+                    i18n::cout << "\n[DB] Carregando registros existentes...\n";
                     existentes = carregar_existentes_generico(datas);
                     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
                         if (!dataset_generico(CFG.datasets[di])) continue;
@@ -158,11 +179,11 @@ int main(int argc, char** argv) {
                         auto it = existentes.find(di);
                         if (it != existentes.end())
                             for (const auto& kv : it->second) tot += (long long)kv.second.size();
-                        std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias existentes\n";
+                        i18n::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " existentes\n";
                     }
                 }
             } else {
-                datas = { hoje() };
+                datas = {hoje()};
             }
         }
 
@@ -185,7 +206,7 @@ int main(int argc, char** argv) {
         }
         return codigo_saida;
     } catch (const std::exception& e) {
-        std::cerr << "\n[ERRO] " << e.what() << "\n";
+        i18n::cerr << "\n[ERRO] " << e.what() << "\n";
         return 1;
     }
 }

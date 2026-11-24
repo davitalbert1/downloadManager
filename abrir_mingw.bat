@@ -129,12 +129,28 @@ echo Bash encontrado:
 echo !BASH_EXE!
 echo.
 
-:: 2. SALVA (OU ATUALIZA) O config.ini COM O CAMINHO ENCONTRADO
-(
+:: 2. SALVA (OU ATUALIZA) O config.ini PRESERVANDO AS OUTRAS SECOES
+::    Apenas o bloco [mingw] e reescrito; o restante do arquivo e mantido.
+set "NEWCFG=%CONFIG_FILE%.new"
+> "!NEWCFG!" (
     echo [mingw]
     echo bash=!BASH_EXE!
-) > "%CONFIG_FILE%"
-echo Caminho salvo em:
+)
+if exist "%CONFIG_FILE%" (
+    for /f "usebackq delims=" %%L in ("%CONFIG_FILE%") do (
+        set "LINE=%%L"
+        set "TRIMMED="
+        for /f "tokens=* delims= " %%T in ("!LINE!") do set "TRIMMED=%%T"
+        set "SKIP="
+        if /I "!TRIMMED!"=="[mingw]" set "SKIP=1"
+        if /I "!TRIMMED:~0,5!"=="bash=" set "SKIP=1"
+        if not defined SKIP (
+            if not "!TRIMMED!"=="" >> "!NEWCFG!" echo !TRIMMED!
+        )
+    )
+)
+move /y "!NEWCFG!" "%CONFIG_FILE%" >nul
+echo Caminho salvo em (secoes [database]/[download]/... preservadas):
 echo    %CONFIG_FILE%
 echo.
 

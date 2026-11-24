@@ -117,15 +117,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo ============================================================
 echo  TODOS OS EXECUTAVEIS COMPILADOS COM SUCESSO VIA CMAKE!
-echo ============================================================
-echo   - download.exe       (Download generico, ERA5 e Google Drive)
-echo   - era5_import.exe    (Importador GRIB ERA5 para SQLite)
-echo   - dbManager.exe      (Interface grafica ImGui DirectX 11)
-echo   - clima_auditor.exe  (Auditor e verificador SQLite)
-if exist "build\clima_viewer.exe" (
-echo   - clima_viewer.exe   (Interface Qt 6)
-)
-echo ============================================================
 endlocal

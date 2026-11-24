@@ -3,7 +3,21 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+
+static std::mutex g_db_mtx; // protege o mapa g_db_mutexes
+static std::map<std::string, std::mutex*> g_db_mutexes; // um mutex por arquivo .db
+
+static std::mutex* mutex_para_db(const std::string& db_path) {
+    std::lock_guard<std::mutex> lk(g_db_mtx);
+    auto it = g_db_mutexes.find(db_path);
+    if (it != g_db_mutexes.end()) return it->second;
+    auto* m = new std::mutex();
+    g_db_mutexes[db_path] = m;
+    return m;
+}
 
 void executar_sql(sqlite3* conn, const char* sql) {
     char* erro = nullptr;
@@ -110,6 +124,156 @@ std::vector<std::string> colunas_da_tabela(sqlite3* conn, const std::string& tab
     return out;
 }
 
+// Colunas de um índice existente, na ordem. Vazio se o índice não existir.
+static std::vector<std::string> colunas_do_indice(sqlite3* conn, const std::string& indice) {
+    std::vector<std::string> out;
+    sqlite3_stmt* st = nullptr;
+    std::string sql = "PRAGMA index_info(\"" + indice + "\")";
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return out;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char* nome = sqlite3_column_text(st, 2);
+        if (nome) out.emplace_back(reinterpret_cast<const char*>(nome));
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+struct IndiceInfo {
+    std::string nome;
+    std::vector<std::string> colunas;
+    bool unico = false;
+};
+
+static std::vector<IndiceInfo> indices_da_tabela(sqlite3* conn, const std::string& tabela) {
+    std::vector<IndiceInfo> out;
+    sqlite3_stmt* st = nullptr;
+    std::string sql = "PRAGMA index_list(\"" + tabela + "\")";
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return out;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char* nome = sqlite3_column_text(st, 1);
+        if (!nome) continue;
+        IndiceInfo info;
+        info.nome = reinterpret_cast<const char*>(nome);
+        info.unico = sqlite3_column_int(st, 2) != 0;
+        out.push_back(std::move(info));
+    }
+    sqlite3_finalize(st);
+    for (auto& i : out) i.colunas = colunas_do_indice(conn, i.nome);
+    return out;
+}
+
+static void criar_indice(sqlite3* conn, const std::string& nome, const std::string& tabela,
+                         const std::vector<std::string>& colunas) {
+    std::vector<std::string> q;
+    q.reserve(colunas.size());
+    for (const auto& c : colunas) q.push_back("\"" + c + "\"");
+    executar_sql(conn, "CREATE INDEX IF NOT EXISTS \"" + nome + "\" ON \"" + tabela +
+                           "\"(" + juntar(q, ", ") + ")");
+    log("[DB] Indice criado: " + tabela + "." + nome);
+}
+
+// Mantém o índice com exatamente as colunas pedidas; se a config mudou,
+// recria em vez de acumular índices antigos.
+static void garantir_indice(sqlite3* conn, const std::string& nome,
+                            const std::string& tabela,
+                            const std::vector<std::string>& colunas) {
+    std::vector<std::string> atuais = colunas_do_indice(conn, nome);
+    if (!colunas.empty() && atuais == colunas) return;
+    if (!atuais.empty()) executar_sql(conn, "DROP INDEX \"" + nome + "\"");
+    if (!colunas.empty()) criar_indice(conn, nome, tabela, colunas);
+}
+
+// Dimensões que identificam cada série temporal (coordenadas ou eixos),
+// exatamente como carregar_existentes_generico lê do banco.
+static std::vector<std::string> colunas_dimensao_progresso(
+    const DatasetCfg& ds, const std::vector<std::string>& cols_tabela) {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& c) {
+        if (c.empty()) return;
+        if (std::find(cols_tabela.begin(), cols_tabela.end(), c) == cols_tabela.end()) return;
+        if (std::find(out.begin(), out.end(), c) == out.end()) out.push_back(c);
+    };
+    if (ds.usar_coordenadas) {
+        add("latitude");
+        add("longitude");
+    } else {
+        for (const auto& e : ds.eixos) {
+            if (e == "coordenadas" || e == "coordinates") continue;
+            add(normalizar_nome(e));
+        }
+    }
+    return out;
+}
+
+// Colunas lidas para saber o que já existe: data + dimensões.
+static std::vector<std::string> colunas_progresso(
+    const DatasetCfg& ds, const std::vector<std::string>& cols_tabela) {
+    if (!ds.iterar_datas || ds.chave_data.empty()) return {};
+    if (std::find(cols_tabela.begin(), cols_tabela.end(), ds.chave_data) == cols_tabela.end())
+        return {};
+    std::vector<std::string> out{ds.chave_data};
+    for (const auto& c : colunas_dimensao_progresso(ds, cols_tabela))
+        if (c != ds.chave_data) out.push_back(c);
+    return out;
+}
+
+// Índices do dataset: chave de UPSERT e retomada de download. O índice de
+// retomada é sempre garantido; o de chave é dispensado quando o autoindex do
+// UNIQUE já o cobre, para não inflar o banco.
+static void garantir_indices(sqlite3* conn, const DatasetCfg& ds,
+                             const std::vector<std::string>& cols_tabela) {
+    const std::string& tb = ds.tabela;
+    const std::string nome_chave = "idx_" + tb + "_chave";
+    const std::string nome_prog = "idx_" + tb + "_retomada";
+    const std::string nome_data = "idx_" + tb + "_date";
+    const std::vector<IndiceInfo> indices = indices_da_tabela(conn, tb);
+
+    auto existe = [&](const std::string& nome) {
+        for (const auto& i : indices)
+            if (i.nome == nome) return true;
+        return false;
+    };
+
+    std::vector<std::string> chave = colunas_chave(ds);
+    if (!chave.empty()) {
+        bool coberta = false;
+        for (const auto& i : indices) {
+            if (i.unico && i.nome != nome_chave && i.colunas == chave) {
+                coberta = true;
+                break;
+            }
+        }
+        if (coberta) {
+            if (existe(nome_chave)) executar_sql(conn, "DROP INDEX \"" + nome_chave + "\"");
+        } else {
+            garantir_indice(conn, nome_chave, tb, chave);
+        }
+    }
+
+    // A retomada filtra por data e lê as dimensões: um índice composto
+    // (data, dims...) atende o BETWEEN e evita ir à tabela (covering index).
+    std::vector<std::string> prog = colunas_progresso(ds, cols_tabela);
+    if (prog.empty()) {
+        if (existe(nome_prog)) executar_sql(conn, "DROP INDEX \"" + nome_prog + "\"");
+        if (existe(nome_data)) executar_sql(conn, "DROP INDEX \"" + nome_data + "\"");
+        return;
+    }
+    if (prog.size() > 1) {
+        garantir_indice(conn, nome_prog, tb, prog);
+        // Prefixo (data) já coberto pelo índice composto.
+        if (existe(nome_data)) executar_sql(conn, "DROP INDEX \"" + nome_data + "\"");
+    } else {
+        garantir_indice(conn, nome_data, tb, prog);
+        if (existe(nome_prog)) executar_sql(conn, "DROP INDEX \"" + nome_prog + "\"");
+    }
+}
+
 void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra) {
     sqlite3* conn = get_connection_para(ds.db);
     std::vector<std::string> ordem;
@@ -142,19 +306,25 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
 
     std::vector<std::string> existentes = colunas_da_tabela(conn, ds.tabela);
     if (existentes.empty()) {
-        std::string sql = "CREATE TABLE IF NOT EXISTS \"" + ds.tabela + "\" (\n";
-        bool prim = true;
+        // Sem colunas conhecidas (ex: API REST antes do primeiro download) nao
+        // ha o que criar; a tabela nasce quando os dados chegarem.
+        if (ordem.empty()) return;
+        std::vector<std::string> defs;
         for (const auto& col : ordem) {
             std::string decl = "auto";
             auto it = tipo_decl.find(col);
             if (it != tipo_decl.end()) decl = it->second;
-            sql += (prim ? "  \"" : ", \"") + col + "\" " + inferir_tipo_coluna(decl, amostra, col) + "\n";
-            prim = false;
+            defs.push_back("  \"" + col + "\" " + inferir_tipo_coluna(decl, amostra, col));
         }
-        sql += ", created_at TEXT";
+        defs.push_back("  created_at TEXT");
         std::vector<std::string> chave = colunas_chave(ds);
+        chave.erase(std::remove_if(chave.begin(), chave.end(),
+                                   [&](const std::string& c) {
+                                       return std::find(ordem.begin(), ordem.end(), c) == ordem.end();
+                                   }),
+                    chave.end());
         if (!chave.empty()) {
-            sql += ",\n  UNIQUE (\"" + juntar(chave, "\", \"") + "\")\n)";
+            defs.push_back("  UNIQUE (\"" + juntar(chave, "\", \"") + "\")");
         } else if (!ds.iterar_datas) {
             // Se for dataset de registros sem data (ex: API REST), tenta UNIQUE em 'name', 'id' ou 'url'
             std::string ucol;
@@ -164,11 +334,10 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
                     break;
                 }
             }
-            if (!ucol.empty()) sql += ",\n  UNIQUE (\"" + ucol + "\")\n)";
-            else sql += "\n)";
-        } else {
-            sql += "\n)";
+            if (!ucol.empty()) defs.push_back("  UNIQUE (\"" + ucol + "\")");
         }
+        std::string sql = "CREATE TABLE IF NOT EXISTS \"" + ds.tabela + "\" (\n" +
+                          juntar(defs, ",\n") + "\n)";
         executar_sql(conn, sql);
         log("[DB] Tabela criada: " + ds.db + "." + ds.tabela + " (" +
             std::to_string(ordem.size()) + " colunas)");
@@ -218,16 +387,7 @@ void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra)
             }
         }
     }
-    auto chave_idx = colunas_chave(ds);
-    if (!chave_idx.empty()) {
-        std::vector<std::string> cols_q;
-        for (const auto& c : chave_idx) cols_q.push_back("\"" + c + "\"");
-        executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_chave ON \"" +
-                               ds.tabela + "\"(" + juntar(cols_q, ", ") + ")");
-    }
-    if (!ds.chave_data.empty() && ds.iterar_datas)
-        executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_date ON \"" +
-                               ds.tabela + "\"(\"" + ds.chave_data + "\")");
+    garantir_indices(conn, ds, colunas_da_tabela(conn, ds.tabela));
 }
 
 void criar_tabelas_datasets() {
@@ -306,8 +466,16 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
         throw std::runtime_error("SQLite: " + err);
     }
     const std::string agora = agora_iso();
+
+    // Lock por database: escritas em bancos .db diferentes podem rodar em paralelo.
+    std::lock_guard<std::mutex> lk_db(*mutex_para_db(ds.db));
+
     executar_sql(conn, "BEGIN");
     size_t lote = 0;
+    // salvar_lote_tamanho controla quantos registros acumulam antes de COMMIT maior.
+    // Se salvar_lote_tamanho <= max_sql_dates_por_lote, usamos o valor do cfg original
+    // para evitar COMMITs muito pequenos que prejudicam performance.
+    size_t lote_alvo = static_cast<size_t>(std::max(CFG.max_sql_dates_por_lote, CFG.salvar_lote_tamanho));
     for (const auto& r : registros) {
         int idx = 1;
         for (const auto& c : campos) {
@@ -328,7 +496,7 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
             log("[ERROR] " + ds.tabela + ": " + sqlite3_errmsg(conn));
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
-        if (++lote >= static_cast<size_t>(CFG.max_sql_dates_por_lote)) {
+        if (++lote >= lote_alvo) {
             executar_sql(conn, "COMMIT");
             executar_sql(conn, "BEGIN");
             lote = 0;
@@ -336,6 +504,21 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
     }
     executar_sql(conn, "COMMIT");
     sqlite3_finalize(stmt);
+}
+
+// Verifica se uma tabela ja possui linhas (para evitar_download_se_no_banco).
+bool tabela_tem_dados(const DatasetCfg& ds) {
+    sqlite3* conn = get_connection_para(ds.db);
+    std::vector<std::string> cols = colunas_da_tabela(conn, ds.tabela);
+    if (cols.empty()) return false;
+    std::string sql = "SELECT COUNT(*) FROM \"" + ds.tabela + "\"";
+    sqlite3_stmt* st = nullptr;
+    long long n = 0;
+    if (sqlite3_prepare_v2(conn, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n > 0;
 }
 
 long long contar_linhas_tabela(const DatasetCfg& ds) {
@@ -359,6 +542,8 @@ ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas
         if (!dataset_generico(ds) || ds.so_fallback) continue;
         sqlite3* conn = get_connection_para(ds.db);
         std::vector<std::string> cols = colunas_da_tabela(conn, ds.tabela);
+        // Garante os índices no banco existente antes de qualquer consulta de retomada.
+        if (!cols.empty()) garantir_indices(conn, ds, cols);
         bool tem_data =
             !ds.chave_data.empty() &&
             std::find(cols.begin(), cols.end(), ds.chave_data) != cols.end();
@@ -370,20 +555,9 @@ ExistentesGen carregar_existentes_generico(const std::vector<std::string>& datas
 
         if (!tem_data || datas.empty()) continue;
 
-        std::vector<std::string> cols_dim;
-        if (ds.usar_coordenadas) {
-            if (std::find(cols.begin(), cols.end(), "latitude") == cols.end() ||
-                std::find(cols.begin(), cols.end(), "longitude") == cols.end())
-                continue;
-            cols_dim = {"latitude", "longitude"};
-        } else {
-            for (const auto& e : ds.eixos) {
-                std::string c = normalizar_nome(e);
-                if (std::find(cols.begin(), cols.end(), c) != cols.end() &&
-                    std::find(cols_dim.begin(), cols_dim.end(), c) == cols_dim.end())
-                    cols_dim.push_back(c);
-            }
-        }
+        // Mesma lista usada por garantir_indices, para o índice cobrir este SELECT.
+        std::vector<std::string> cols_dim = colunas_dimensao_progresso(ds, cols);
+        if (ds.usar_coordenadas && cols_dim.size() < 2) continue;
 
         auto chave_da_linha = [&](sqlite3_stmt* st, std::string& chave) {
             if (ds.usar_coordenadas) {
