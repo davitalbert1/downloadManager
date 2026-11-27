@@ -1,17 +1,3 @@
-"""
-Downloader Otimizado ERA5 Post-Processed Daily Statistics
-=========================================================
-Baixa TODAS as 261 variáveis do dataset derived-era5-single-levels-daily-statistics
-para as coordenadas do download.ini.
-
-Estratégia de otimização (3 eixos):
-  1. Agrupa coordenadas em regiões geográficas com bounding box compartilhado
-  2. Agrupa até 10 variáveis compatíveis por requisição
-  3. Pede o ano inteiro (12 meses) de uma vez
-
-Estimativa final: ~23.000 requisições (~4 dias de download contínuo)
-"""
-
 import os
 import sys
 import time
@@ -21,12 +7,8 @@ import re
 from datetime import datetime, timezone, timedelta
 import cdsapi
 
-# ==============================================================================
-# CONFIGURAÇÕES
-# ==============================================================================
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VARS_POR_REQUISICAO = 10  # Máximo de variáveis por chamada ao CDS
+VARS_POR_REQUISICAO = 4  # Máximo de variáveis por chamada ao CDS (reduzido para evitar "cost limits exceeded")
 
 url = "https://cds.climate.copernicus.eu/api"
 key = "6e77b6c5-0f56-4d72-8eca-c5d29fe017cd"
@@ -58,8 +40,7 @@ if os.path.exists(env_file):
 try:
     cdsapirc = os.path.expanduser("~/.cdsapirc")
     if not os.path.exists(cdsapirc):
-        with open(cdsapirc, "w", encoding="utf-8") as f:
-            f.write(f"url: {url}\nkey: {key}\n")
+        with open(cdsapirc, "w", encoding="utf-8") as f: f.write(f"url: {url}\nkey: {key}\n")
 except Exception:
     pass
 
@@ -76,20 +57,14 @@ def log(msg: str):
     linha = f"[{ts}] {msg}"
     print(linha, flush=True)
     try:
-        with open(arquivo_log, "a", encoding="utf-8") as lf:
-            lf.write(linha + "\n")
+        with open(arquivo_log, "a", encoding="utf-8") as lf: lf.write(linha + "\n")
     except Exception:
         pass
-
-# ==============================================================================
-# COORDENADAS
-# ==============================================================================
 
 def ler_coordenadas(ini_path: str) -> list[dict]:
     coords = []
     ini = os.path.join(SCRIPT_DIR, ini_path)
-    if not os.path.exists(ini):
-        return coords
+    if not os.path.exists(ini): return coords
     em_secao = False
     with open(ini, "r", encoding="utf-8") as f:
         for line in f:
@@ -97,12 +72,9 @@ def ler_coordenadas(ini_path: str) -> list[dict]:
             if line.lower().startswith("[coordenadas]"):
                 em_secao = True
                 continue
-            if em_secao and line.startswith("["):
-                break
-            if not em_secao or not line or line.startswith(";") or line.startswith("#"):
-                continue
-            if "latitude" in line.lower() and "longitude" in line.lower():
-                continue
+            if em_secao and line.startswith("["): break
+            if not em_secao or not line or line.startswith(";") or line.startswith("#"): continue
+            if "latitude" in line.lower() and "longitude" in line.lower(): continue
             parts = line.split(";", 1)
             ll = parts[0].strip()
             nome = parts[1].strip() if len(parts) > 1 else ""
@@ -119,20 +91,10 @@ if not coordenadas:
     sys.exit(1)
 
 def area_bbox(lat: float, lon: float) -> list[float]:
-    """[North, West, South, East] com ±0.25° (1 pixel ERA5 0.25°)."""
     m = 0.25
     return [round(lat + m, 4), round(lon - m, 4), round(lat - m, 4), round(lon + m, 4)]
 
-# ==============================================================================
-# AGRUPAMENTO DE COORDENADAS EM REGIÕES
-# ==============================================================================
-
 def agrupar_coordenadas_em_regioes(coords: list[dict], max_span_lat=30.0, max_span_lon=60.0) -> list[dict]:
-    """
-    Agrupa coordenadas próximas em regiões com bounding box compartilhado.
-    Cada região tem um bbox que cobre todas as suas coordenadas.
-    max_span: diferença máxima em graus para agrupar.
-    """
     restantes = list(coords)
     regioes = []
 
@@ -161,10 +123,10 @@ def agrupar_coordenadas_em_regioes(coords: list[dict], max_span_lat=30.0, max_sp
         # Bounding box com margem de 0.25° (1 pixel)
         m = 0.25
         bbox = [
-            round(lat_max + m, 4),  # North
-            round(lon_min - m, 4),  # West
-            round(lat_min - m, 4),  # South
-            round(lon_max + m, 4),  # East
+            round(lat_max + m, 4), # North
+            round(lon_min - m, 4), # West
+            round(lat_min - m, 4), # South
+            round(lon_max + m, 4), # East
         ]
         nomes = [c["nome"] for c in grupo]
         ids = [c["id"] for c in grupo]
@@ -179,10 +141,6 @@ def agrupar_coordenadas_em_regioes(coords: list[dict], max_span_lat=30.0, max_sp
     return regioes
 
 regioes = agrupar_coordenadas_em_regioes(coordenadas)
-
-# ==============================================================================
-# VARIÁVEIS (261 — catálogo completo)
-# ==============================================================================
 
 TODAS_VARIAVEIS = [
     # TEMPERATURA E PROPRIEDADES ATMOSFÉRICAS
@@ -364,10 +322,6 @@ TODAS_VARIAVEIS = [
 
 TODAS_VARIAVEIS = list(dict.fromkeys(TODAS_VARIAVEIS))
 
-# ==============================================================================
-# CLASSIFICAÇÃO DE ESTATÍSTICAS
-# ==============================================================================
-
 ACUMULADAS = {
     "convective_precipitation", "convective_rain_rate", "convective_snowfall",
     "convective_snowfall_rate_water_equivalent", "large_scale_precipitation",
@@ -419,53 +373,33 @@ ACUMULADAS = {
 }
 
 def stats_para_var(v: str) -> list[str]:
-    if v in ACUMULADAS:
-        return ["daily_mean", "daily_sum"]
+    if v in ACUMULADAS: return ["daily_mean", "daily_sum"]
     return ["daily_mean", "daily_max", "daily_min"]
 
-# ==============================================================================
-# AGRUPAMENTO DE VARIÁVEIS POR ESTATÍSTICA
-# ==============================================================================
-
 def agrupar_por_estatistica(variaveis: list[str]) -> dict[str, list[list[str]]]:
-    """
-    Agrupa variáveis por estatística compatível, em chunks de até VARS_POR_REQUISICAO.
-    Retorna: { "daily_mean": [[v1,v2,v3,v4,v5], [v6,v7,...]], "daily_max": [...], ... }
-    """
     por_stat: dict[str, list[str]] = {}
     for v in variaveis:
-        for s in stats_para_var(v):
-            por_stat.setdefault(s, []).append(v)
+        for s in stats_para_var(v): por_stat.setdefault(s, []).append(v)
 
     resultado: dict[str, list[list[str]]] = {}
     for stat, vars_list in por_stat.items():
         chunks = []
-        for i in range(0, len(vars_list), VARS_POR_REQUISICAO):
-            chunks.append(vars_list[i:i + VARS_POR_REQUISICAO])
+        for i in range(0, len(vars_list), VARS_POR_REQUISICAO): chunks.append(vars_list[i:i + VARS_POR_REQUISICAO])
         resultado[stat] = chunks
 
     return resultado
-
-# ==============================================================================
-# VALIDAÇÃO
-# ==============================================================================
 
 def arquivo_valido(caminho: str) -> bool:
     if not os.path.exists(caminho):
         return False
     try:
         tam = os.path.getsize(caminho)
-        if tam < 500:
-            return False
+        if tam < 500: return False
         with open(caminho, "rb") as f:
             cab = f.read(8)
             return cab.startswith(b"CDF") or cab.startswith(b"\x89HDF") or cab.startswith(b"PK")
     except Exception:
         return False
-
-# ==============================================================================
-# PERÍODO
-# ==============================================================================
 
 agora_utc = datetime.now(timezone.utc)
 limite_era5 = agora_utc - timedelta(days=5)
@@ -474,18 +408,20 @@ ano_fim = ano_final_cfg if ano_final_cfg is not None else limite_era5.year
 ano_fim = min(ano_fim, limite_era5.year)
 anos = list(range(ano_ini, ano_fim + 1))
 
-# ==============================================================================
-# LOOP PRINCIPAL
-# ==============================================================================
-
 def main():
     grupos = agrupar_por_estatistica(TODAS_VARIAVEIS)
     incompativeis: set[str] = set()  # grupo_key
 
-    # Conta total de tarefas para progresso
+    # Conta total de tarefas para progresso (um request por mes)
+    total_meses = 0
+    for ano in anos:
+        if ano == limite_era5.year:
+            total_meses += limite_era5.month
+        else:
+            total_meses += 12
     total_tarefas = 0
     for stat, chunks in grupos.items():
-        total_tarefas += len(chunks) * len(regioes) * len(anos)
+        total_tarefas += len(chunks) * len(regioes) * total_meses
 
     total_baixados = 0
     total_pulos = 0
@@ -494,17 +430,16 @@ def main():
 
     log("=" * 72)
     log("DOWNLOAD ERA5 POST-PROCESSED DAILY STATISTICS (OTIMIZADO)")
-    log(f"Dataset:          {DATASET}")
-    log(f"Variáveis:        {len(TODAS_VARIAVEIS)}")
-    log(f"Coordenadas:      {len(coordenadas)} -> {len(regioes)} regiões")
-    for r in regioes:
-        log(f"  • {r['id']}: {', '.join(r['nomes'])} | bbox={r['bbox']}")
-    log(f"Período:          {ano_ini}–{ano_fim} ({len(anos)} anos)")
-    log(f"Vars/requisição:  {VARS_POR_REQUISICAO}")
+    log(f"Dataset: {DATASET}")
+    log(f"Variáveis: {len(TODAS_VARIAVEIS)}")
+    log(f"Coordenadas: {len(coordenadas)} -> {len(regioes)} regiões")
+    for r in regioes: log(f"  • {r['id']}: {', '.join(r['nomes'])} | bbox={r['bbox']}")
+    log(f"Período: {ano_ini}–{ano_fim} ({len(anos)} anos)")
+    log(f"Vars/requisição: {VARS_POR_REQUISICAO}")
     log(f"Total requisições estimadas: ~{total_tarefas:,}")
-    est_horas = total_tarefas * 15 / 3600
-    log(f"Tempo estimado:   ~{est_horas:.0f}h (~{est_horas/24:.1f} dias)")
-    log(f"Destino:          {pasta_destino}")
+    est_horas = total_tarefas * 12 / 3600  # requests menores sao processados mais rapido
+    log(f"Tempo estimado: ~{est_horas:.0f}h (~{est_horas/24:.1f} dias) - pode requerer varias sessoes (resume automatico)")
+    log(f"Destino: {pasta_destino}")
     log("=" * 72)
 
     for stat, chunks in sorted(grupos.items()):
@@ -513,115 +448,116 @@ def main():
         for idx_chunk, var_grupo in enumerate(chunks, start=1):
             grupo_key = f"{stat}_{idx_chunk}"
 
-            if grupo_key in incompativeis:
-                continue
+            if grupo_key in incompativeis: continue
 
             for regiao in regioes:
                 pasta_regiao = os.path.join(pasta_destino, regiao["id"])
                 os.makedirs(pasta_regiao, exist_ok=True)
 
                 for ano in anos:
-                    tarefa_atual += 1
-
-                    # Meses e dias válidos
+                    # Meses válidos para este ano
                     if ano == limite_era5.year:
                         meses_v = list(range(1, limite_era5.month + 1))
                     else:
                         meses_v = list(range(1, 13))
-                    mes_strs = [f"{m:02d}" for m in meses_v]
 
-                    todos_dias = set()
-                    for m in meses_v:
-                        max_d = calendar.monthrange(ano, m)[1]
-                        if ano == limite_era5.year and m == limite_era5.month:
+                    for mes in meses_v:
+                        tarefa_atual += 1
+
+                        # Dias válidos para este mês
+                        max_d = calendar.monthrange(ano, mes)[1]
+                        if ano == limite_era5.year and mes == limite_era5.month:
                             max_d = min(max_d, limite_era5.day)
-                        for d in range(1, max_d + 1):
-                            todos_dias.add(f"{d:02d}")
-                    dias = sorted(todos_dias)
+                        dias = [f"{d:02d}" for d in range(1, max_d + 1)]
+                        mes_str = f"{mes:02d}"
 
-                    # Nome do arquivo
-                    vars_tag = "+".join(sorted(var_grupo))
-                    h = hashlib.md5(vars_tag.encode()).hexdigest()[:10]
-                    nome_base = f"{stat}_{ano}_g{idx_chunk}_{h}"
-                    nome_arquivo = os.path.join(pasta_regiao, nome_base + ".nc")
-                    arquivo_tmp = nome_arquivo + ".tmp"
+                        # Nome do arquivo (inclui mes para requests mensais)
+                        vars_tag = "+".join(sorted(var_grupo))
+                        h = hashlib.md5(vars_tag.encode()).hexdigest()[:10]
+                        nome_base = f"{stat}_{ano}{mes_str}_g{idx_chunk}_{h}"
+                        nome_arquivo = os.path.join(pasta_regiao, nome_base + ".nc")
+                        arquivo_tmp = nome_arquivo + ".tmp"
 
-                    if arquivo_valido(nome_arquivo):
-                        total_pulos += 1
-                        continue
-                    elif os.path.exists(nome_arquivo):
-                        try: os.remove(nome_arquivo)
-                        except Exception: pass
+                        if arquivo_valido(nome_arquivo):
+                            total_pulos += 1
+                            continue
+                        elif os.path.exists(nome_arquivo):
+                            try: os.remove(nome_arquivo)
+                            except Exception: pass
 
-                    pct = tarefa_atual / total_tarefas * 100
-                    tag = f"[{tarefa_atual}/{total_tarefas} {pct:.1f}%] {stat} | {ano} | {regiao['id']} | {len(var_grupo)} vars"
-                    log(f"[SOLICITANDO] {tag}")
+                        pct = tarefa_atual / total_tarefas * 100
+                        tag = f"[{tarefa_atual}/{total_tarefas} {pct:.1f}%] {stat} | {ano}-{mes_str} | {regiao['id']} | {len(var_grupo)} vars"
+                        log(f"[SOLICITANDO] {tag}")
 
-                    sucesso = False
-                    tentativas = 0
-                    max_tent = 4
-                    backoff = 15.0
+                        sucesso = False
+                        tentativas = 0
+                        max_tent = 6
+                        backoff = 30.0
 
-                    while not sucesso and tentativas < max_tent:
-                        try:
-                            t0 = time.time()
-                            if os.path.exists(arquivo_tmp):
-                                try: os.remove(arquivo_tmp)
-                                except Exception: pass
-
-                            cliente.retrieve(
-                                DATASET,
-                                {
-                                    "product_type": "reanalysis",
-                                    "variable": var_grupo,
-                                    "daily_statistic": stat,
-                                    "time_zone": "utc+00:00",
-                                    "frequency": "1_hourly",
-                                    "year": [str(ano)],
-                                    "month": mes_strs,
-                                    "day": dias,
-                                    "area": regiao["bbox"],
-                                    "data_format": "netcdf",
-                                },
-                                arquivo_tmp
-                            )
-
-                            if arquivo_valido(arquivo_tmp):
-                                if os.path.exists(nome_arquivo):
-                                    try: os.remove(nome_arquivo)
-                                    except Exception: pass
-                                os.rename(arquivo_tmp, nome_arquivo)
-                                dur = time.time() - t0
-                                tam_kb = os.path.getsize(nome_arquivo) / 1024
-                                log(f"[OK] {tag} -> {tam_kb:.1f} KB em {dur:.1f}s")
-                                sucesso = True
-                                total_baixados += 1
-                            else:
+                        while not sucesso and tentativas < max_tent:
+                            try:
+                                t0 = time.time()
                                 if os.path.exists(arquivo_tmp):
                                     try: os.remove(arquivo_tmp)
                                     except Exception: pass
-                                raise RuntimeError("Arquivo não passou na validação NetCDF")
 
-                        except Exception as e:
-                            tentativas += 1
-                            erro_str = str(e).lower()
-                            termos_fatal = [
-                                "not supported", "invalid statistic",
-                                "not applicable", "unknown variable",
-                                "not a valid variable", "is not allowed",
-                            ]
-                            if any(t in erro_str for t in termos_fatal):
-                                log(f"[INCOMPATÍVEL] {tag}: {e}")
-                                incompativeis.add(grupo_key)
-                                break
-                            log(f"[AVISO] Tentativa {tentativas}/{max_tent}: {e}")
-                            if tentativas < max_tent:
-                                log(f"[ESPERA] {backoff:.0f}s...")
-                                time.sleep(backoff)
-                                backoff = min(backoff * 2.0, 120.0)
-                            else:
-                                log(f"[FALHA] {tag}")
-                                total_erros += 1
+                                cliente.retrieve(
+                                    DATASET,
+                                    {
+                                        "product_type": "reanalysis",
+                                        "variable": var_grupo,
+                                        "daily_statistic": stat,
+                                        "time_zone": "utc+00:00",
+                                        "frequency": "1_hourly",
+                                        "year": [str(ano)],
+                                        "month": [mes_str],
+                                        "day": dias,
+                                        "area": regiao["bbox"],
+                                        "data_format": "netcdf",
+                                    },
+                                    arquivo_tmp
+                                )
+
+                                if arquivo_valido(arquivo_tmp):
+                                    if os.path.exists(nome_arquivo):
+                                        try: os.remove(nome_arquivo)
+                                        except Exception: pass
+                                    os.rename(arquivo_tmp, nome_arquivo)
+                                    dur = time.time() - t0
+                                    tam_kb = os.path.getsize(nome_arquivo) / 1024
+                                    log(f"[OK] {tag} -> {tam_kb:.1f} KB em {dur:.1f}s")
+                                    sucesso = True
+                                    total_baixados += 1
+                                else:
+                                    if os.path.exists(arquivo_tmp):
+                                        try: os.remove(arquivo_tmp)
+                                        except Exception: pass
+                                    raise RuntimeError("Arquivo não passou na validação NetCDF")
+
+                            except Exception as e:
+                                tentativas += 1
+                                erro_str = str(e).lower()
+                                termos_fatal = [
+                                    "not supported", "invalid statistic",
+                                    "not applicable", "unknown variable",
+                                    "not a valid variable", "is not allowed",
+                                ]
+                                if any(t in erro_str for t in termos_fatal):
+                                    log(f"[INCOMPATÍVEL] {tag}: {e}")
+                                    incompativeis.add(grupo_key)
+                                    break
+                                termos_custo = ["cost limit", "too large", "reduce your selection"]
+                                if any(t in erro_str for t in termos_custo):
+                                    log(f"[CUSTO_EXCEDIDO] {tag}: {e}")
+                                    log(f"    Dica: reduza VARS_POR_REQUISICAO (atual={VARS_POR_REQUISICAO}) ou o intervalo de datas no .env")
+                                log(f"[AVISO] Tentativa {tentativas}/{max_tent}: {e}")
+                                if tentativas < max_tent:
+                                    log(f"[ESPERA] {backoff:.0f}s...")
+                                    time.sleep(backoff)
+                                    backoff = min(backoff * 2.0, 180.0)
+                                else:
+                                    log(f"[FALHA] {tag}")
+                                    total_erros += 1
 
                     if grupo_key in incompativeis:
                         break  # sai do loop de anos
@@ -631,10 +567,8 @@ def main():
     log("=" * 72)
     log("DOWNLOAD FINALIZADO")
     log(f"Baixados: {total_baixados} | Já existiam: {total_pulos} | Falhas: {total_erros}")
-    if incompativeis:
-        log(f"Combinações incompatíveis: {len(incompativeis)}")
+    if incompativeis: log(f"Combinações incompatíveis: {len(incompativeis)}")
     log("=" * 72)
-
 
 if __name__ == "__main__":
     main()

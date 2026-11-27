@@ -64,7 +64,8 @@ static std::string checkpoint_path(const std::string& dataset_id) {
 }
 
 static void salvar_checkpoint(const std::string& dataset_id, long long concluidos,
-                              long long total, long long falhas) {
+                              long long total, long long falhas,
+                              const std::set<std::string>* tarefas_concluidas = nullptr) {
     if (CFG.checkpoint_tarefas <= 0) return;
     std::ofstream arq(checkpoint_path(dataset_id));
     if (!arq) return;
@@ -72,14 +73,25 @@ static void salvar_checkpoint(const std::string& dataset_id, long long concluido
     arq << "  \"concluidos\": " << concluidos << ",\n";
     arq << "  \"total\": " << total << ",\n";
     arq << "  \"falhas\": " << falhas << ",\n";
-    arq << "  \"timestamp\": \"" << agora_iso() << "\"\n";
+    arq << "  \"timestamp\": \"" << agora_iso() << "\",\n";
+    if (tarefas_concluidas && !tarefas_concluidas->empty()) {
+        arq << "  \"tarefas_concluidas\": [\n";
+        size_t i = 0;
+        for (const auto& t : *tarefas_concluidas) {
+            arq << "    \"" << t << "\"";
+            if (++i < tarefas_concluidas->size()) arq << ",";
+            arq << "\n";
+        }
+        arq << "  ],\n";
+    }
     arq << "}\n";
     arq.flush();
 }
 
 static bool carregar_checkpoint(const std::string& dataset_id,
                                 long long& concluidos_out, long long& total_out,
-                                long long& falhas_out) {
+                                long long& falhas_out,
+                                std::set<std::string>* tarefas_concluidas_out = nullptr) {
     if (CFG.checkpoint_tarefas <= 0) return false;
     std::ifstream arq(checkpoint_path(dataset_id));
     if (!arq) return false;
@@ -101,6 +113,24 @@ static bool carregar_checkpoint(const std::string& dataset_id,
         p = conteudo.find(':', p);
         if (p == std::string::npos) return false;
         falhas_out = para_int(conteudo.substr(p + 1), 0);
+        // Carrega o conjunto de tarefas concluídas, se presente no checkpoint.
+        if (tarefas_concluidas_out) {
+            size_t ta = conteudo.find("\"tarefas_concluidas\"");
+            if (ta != std::string::npos) {
+                size_t ini = conteudo.find('[', ta);
+                size_t fim = conteudo.find(']', ini);
+                if (ini != std::string::npos && fim != std::string::npos) {
+                    std::string lista = conteudo.substr(ini + 1, fim - ini - 1);
+                    size_t pos = 0;
+                    while ((pos = lista.find('"', pos)) != std::string::npos) {
+                        size_t f = lista.find('"', pos + 1);
+                        if (f == std::string::npos) break;
+                        tarefas_concluidas_out->insert(lista.substr(pos + 1, f - pos - 1));
+                        pos = f + 1;
+                    }
+                }
+            }
+        }
         return true;
     } catch (...) {
         return false;
@@ -504,10 +534,22 @@ int executar_generico(const std::vector<std::string>& datas,
                                        ? CFG.datasets[di_inicio].id
                                        : "todos";
 
+    // Conjunto de tarefas já concluídas (formato: "dataset_idx:chave:data1,data2,...").
+    // Usado para retomada precisa independente da ordem da lista de tarefas.
+    std::set<std::string> tarefas_concluidas;
+
     // Checkpoint: retomar de execução anterior se houver.
     long long checkpoint_concluidos = 0, checkpoint_total = 0, checkpoint_falhas = 0;
     bool tem_checkpoint = carregar_checkpoint(dataset_id, checkpoint_concluidos,
-                                              checkpoint_total, checkpoint_falhas);
+                                              checkpoint_total, checkpoint_falhas,
+                                              &tarefas_concluidas);
+    if (CFG.checkpoint_tarefas <= 0) {
+        log("[AVISO] checkpoint_tarefas = 0: retomada apos interrupcao nao eh "
+            "possivel via checkpoint. Confie em 'existentes' do banco SQLite.");
+    } else if (tem_checkpoint && !tarefas_concluidas.empty()) {
+        log("[CHECKPOINT] " + std::to_string(tarefas_concluidas.size()) +
+            " tarefa(s) previamente concluída(s) ser(ao) pulada(s).");
+    }
 
     // Chave = coordenada "lat,lon" ou combinação de eixos "k=v|k=v" (mesma
     // usada por storage_sqlite ao carregar o que já existe).
@@ -525,12 +567,16 @@ int executar_generico(const std::vector<std::string>& datas,
         for (const auto& d : pendentes)
             if (!tem || !tem->count(d)) f.push_back(d);
         if (f.empty()) return;
-        falt += (long long)f.size();
         const size_t chunk = (size_t)std::max(1, CFG.chunk_dias);
         for (size_t i = 0; i < f.size(); i += chunk) {
             size_t e = std::min(i + chunk, f.size());
-            tarefas.push_back({di, std::vector<std::string>(f.begin() + i, f.begin() + e), chave, ctx});
+            std::vector<std::string> bloco(f.begin() + i, f.begin() + e);
+            // Identificador da tarefa para checkpoint de retomada precisa.
+            std::string tid = std::to_string(di) + ":" + chave + ":" + juntar(bloco, ",");
+            if (tarefas_concluidas.count(tid)) continue; // ja concluida anteriormente
+            tarefas.push_back({di, std::move(bloco), chave, ctx});
             tarefa_status.push_back({});
+            falt += (long long)bloco.size();
         }
     };
 
@@ -618,19 +664,31 @@ int executar_generico(const std::vector<std::string>& datas,
                         log(std::string("[ERROR] Falha ao processar bloco: ") + e.what());
                     }
                     long long c = ++concluidos;
-                    // Atualiza status da tarefa para retry posterior
-                    {
+                    // Registra tarefa concluída para checkpoint de retomada precisa.
+                    if (ok) {
+                        std::string tid = std::to_string(r.dataset_idx) + ":" +
+                                          r.chave_existentes + ":" +
+                                          juntar(r.datas_pedidas, ",");
                         std::lock_guard<std::mutex> lk(g_stats_mtx);
+                        tarefas_concluidas.insert(std::move(tid));
                         if (r.dataset_idx < tarefa_status.size()) {
                             tarefa_status[r.dataset_idx].concluida = true;
                             if (!ok) tarefa_status[r.dataset_idx].falhou = true;
+                            tarefa_status[r.dataset_idx].tentativas++;
+                        }
+                    } else {
+                        std::lock_guard<std::mutex> lk(g_stats_mtx);
+                        if (r.dataset_idx < tarefa_status.size()) {
+                            tarefa_status[r.dataset_idx].concluida = true;
+                            tarefa_status[r.dataset_idx].falhou = true;
                             tarefa_status[r.dataset_idx].tentativas++;
                         }
                     }
                     // Checkpoint periodico
                     if (CFG.checkpoint_tarefas > 0 &&
                         c % (long long)CFG.checkpoint_tarefas == 0) {
-                        salvar_checkpoint(dataset_id, c, total, falhas.load());
+                        salvar_checkpoint(dataset_id, c, total, falhas.load(),
+                                          &tarefas_concluidas);
                     }
                     if (c % 5 == 0 || c == total) {
                         double pct = 100.0 * (double)c / (double)total;
@@ -710,8 +768,13 @@ int executar_generico(const std::vector<std::string>& datas,
                                        total_bytes);
                     ++concluidos;
                     --falhas;
+                    // Registra tarefa concluída no retry para checkpoint preciso.
                     {
+                        std::string tid = std::to_string(rt.ds) + ":" +
+                                          rt.chave_existentes + ":" +
+                                          juntar(rt.datas, ",");
                         std::lock_guard<std::mutex> lk(g_stats_mtx);
+                        tarefas_concluidas.insert(std::move(tid));
                         if (rt.ds < tarefa_status.size()) {
                             tarefa_status[rt.ds].falhou = false;
                             tarefa_status[rt.ds].concluida = true;
@@ -728,7 +791,8 @@ int executar_generico(const std::vector<std::string>& datas,
 
     // Salvar checkpoint final se houver
     if (CFG.checkpoint_tarefas > 0) {
-        salvar_checkpoint(dataset_id, concluidos.load(), total, falhas.load());
+        salvar_checkpoint(dataset_id, concluidos.load(), total, falhas.load(),
+                          &tarefas_concluidas);
     }
 
     double tt = std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();

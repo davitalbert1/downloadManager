@@ -503,6 +503,10 @@ void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros
         }
     }
     executar_sql(conn, "COMMIT");
+    // Garante que os dados estejam duráveis no disco (WAL checkpoint) para que
+    // carregar_existentes_generico os veja na próxima execução, mesmo se o
+    // programa for interrompido logo depois.
+    executar_sql(conn, "PRAGMA wal_checkpoint(TRUNCATE)");
     sqlite3_finalize(stmt);
 }
 
